@@ -255,6 +255,7 @@ mealsRouter.post("/nl-log", async (req, res) => {
       );
 
       const dbDaySummary: NutrientTotals = {
+        ...emptyTotals(),
         calories_kcal: Number(dayRows.rows[0]?.calories_kcal || 0),
         protein_g: Number(dayRows.rows[0]?.protein_g || 0),
         carbs_g: Number(dayRows.rows[0]?.carbs_g || 0),

@@ -21,7 +21,8 @@ import {
 } from "./mealIcons";
 
 const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:4000/v1";
+  process.env.EXPO_PUBLIC_API_BASE_URL ||
+  "https://meal-tracking-api.onrender.com/v1";
 
 type NutrientTotals = {
   calories_kcal: number;
