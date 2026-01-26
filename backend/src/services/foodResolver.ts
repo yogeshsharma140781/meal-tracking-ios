@@ -45,7 +45,9 @@ export const NUTRIENT_DB: Record<string, NutrientTotals> = {
     iron_mg: 4.7,
     vitamin_d_iu: 0,
     vitamin_b12_ug: 0,
-    magnesium_mg: 177
+    magnesium_mg: 177,
+    vitamin_c_mg: 0,
+    vitamin_a_mcg: 0
   },
   blueberry: {
     calories_kcal: 57,
@@ -62,7 +64,9 @@ export const NUTRIENT_DB: Record<string, NutrientTotals> = {
     iron_mg: 0.28,
     vitamin_d_iu: 0,
     vitamin_b12_ug: 0,
-    magnesium_mg: 6
+    magnesium_mg: 6,
+    vitamin_c_mg: 9.7,
+    vitamin_a_mcg: 3
   },
   "semi-skimmed milk": {
     calories_kcal: 50,
@@ -79,7 +83,9 @@ export const NUTRIENT_DB: Record<string, NutrientTotals> = {
     iron_mg: 0,
     vitamin_d_iu: 40,
     vitamin_b12_ug: 0.4,
-    magnesium_mg: 11
+    magnesium_mg: 11,
+    vitamin_c_mg: 0,
+    vitamin_a_mcg: 46
   }
 };
 

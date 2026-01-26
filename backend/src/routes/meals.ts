@@ -30,7 +30,9 @@ const sumTotals = (a: NutrientTotals, b: NutrientTotals): NutrientTotals => ({
   iron_mg: a.iron_mg + b.iron_mg,
   vitamin_d_iu: a.vitamin_d_iu + b.vitamin_d_iu,
   vitamin_b12_ug: a.vitamin_b12_ug + b.vitamin_b12_ug,
-  magnesium_mg: a.magnesium_mg + b.magnesium_mg
+  magnesium_mg: a.magnesium_mg + b.magnesium_mg,
+  vitamin_c_mg: a.vitamin_c_mg + b.vitamin_c_mg,
+  vitamin_a_mcg: a.vitamin_a_mcg + b.vitamin_a_mcg
 });
 
 const toLocalDay = (iso: string, tzOffsetMinutes?: number): string => {

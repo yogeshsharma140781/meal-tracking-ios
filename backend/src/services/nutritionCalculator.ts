@@ -21,7 +21,9 @@ export class NutritionCalculator {
       iron_mg: per100g.iron_mg * factor,
       vitamin_d_iu: per100g.vitamin_d_iu * factor,
       vitamin_b12_ug: per100g.vitamin_b12_ug * factor,
-      magnesium_mg: per100g.magnesium_mg * factor
+      magnesium_mg: per100g.magnesium_mg * factor,
+      vitamin_c_mg: per100g.vitamin_c_mg * factor,
+      vitamin_a_mcg: per100g.vitamin_a_mcg * factor
     };
   }
 }

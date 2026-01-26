@@ -53,7 +53,9 @@ const schema = {
               iron_mg: { type: "number" },
               vitamin_d_iu: { type: "number" },
               vitamin_b12_ug: { type: "number" },
-              magnesium_mg: { type: "number" }
+              magnesium_mg: { type: "number" },
+              vitamin_c_mg: { type: "number" },
+              vitamin_a_mcg: { type: "number" }
             },
             required: [
               "calories_kcal",
@@ -70,7 +72,9 @@ const schema = {
               "iron_mg",
               "vitamin_d_iu",
               "vitamin_b12_ug",
-              "magnesium_mg"
+              "magnesium_mg",
+              "vitamin_c_mg",
+              "vitamin_a_mcg"
             ]
           }
         },
@@ -98,9 +102,14 @@ export const parseMealWithAi = async (text: string): Promise<AiMealResult> => {
   const system = [
     "You are a nutrition assistant.",
     "Parse the user's meal text into structured ingredients with quantities, units, and grams.",
-    "Estimate nutrient totals for each ingredient (calories, macros, fiber, sodium, cholesterol, omega-3, omega-6, potassium, calcium, iron, vitamin D, vitamin B12, magnesium).",
+    "Estimate nutrient totals for each ingredient (calories, macros, fiber, sodium, cholesterol, omega-3, omega-6, potassium, calcium, iron, vitamin D, vitamin B12, magnesium, vitamin C, vitamin A).",
     "Use reasonable food defaults and common household conversions.",
-    "Do not decompose composite foods (e.g., cappuccino, burger, pizza) into sub-ingredients unless the user explicitly lists them.",
+    "",
+    "CRITICAL: Do NOT decompose composite foods into sub-ingredients. Treat composite foods as single items.",
+    "Examples of composite foods that should remain as single items: cappuccino, burger, pizza, chai, Indian chai, latte, smoothie, salad (unless ingredients are explicitly listed), sandwich, wrap, curry, stew, soup, pasta dish, etc.",
+    "Only break down foods into sub-ingredients if the user explicitly lists the individual ingredients (e.g., '2 eggs, 1 cup milk, 1 banana' should be parsed as separate items).",
+    "If the user enters a composite food name (e.g., 'Indian chai', 'cappuccino', 'chicken curry'), return it as a SINGLE item with estimated total nutrients for that composite food.",
+    "",
     "If ambiguous, include assumptionText and lower confidence.",
     "Return only JSON that matches the provided schema."
   ].join(" ");

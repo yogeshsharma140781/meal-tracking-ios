@@ -28,3 +28,5 @@ npm run start
 ```
 
 Update `API_BASE_URL` in `app/App.tsx` to point to your backend host.
+
+For **Xcode builds** (warnings, build time): see [docs/xcode-build.md](docs/xcode-build.md). Enable **ccache** (`brew install ccache`) and set `apple.ccacheEnabled` in `app/ios/Podfile.properties.json` to speed up native builds.

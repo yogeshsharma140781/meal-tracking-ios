@@ -14,6 +14,8 @@ export type NutrientTotals = {
   vitamin_d_iu: number;
   vitamin_b12_ug: number;
   magnesium_mg: number;
+  vitamin_c_mg: number;
+  vitamin_a_mcg: number;
 };
 
 export const emptyTotals = (): NutrientTotals => ({
@@ -31,5 +33,7 @@ export const emptyTotals = (): NutrientTotals => ({
   iron_mg: 0,
   vitamin_d_iu: 0,
   vitamin_b12_ug: 0,
-  magnesium_mg: 0
+  magnesium_mg: 0,
+  vitamin_c_mg: 0,
+  vitamin_a_mcg: 0
 });
