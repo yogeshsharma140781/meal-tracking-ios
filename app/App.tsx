@@ -658,19 +658,32 @@ export default function App() {
       const meal = currentMeals.find((m) => m.id === mealId);
       const mealType = meal?.label?.toLowerCase().replace(/\s+/g, "-") || undefined;
       
+      // Helper to clean food names for matching
+      const cleanFoodName = (name: string) => name.replace(/\s*\([^)]*\)\s*/g, " ").trim().toLowerCase();
+      
       // Get all other foods logged today (excluding current item)
+      // Include foods from the same meal AND other meals to check for pairings
       const allFoodsToday: Array<{ name: string; mealType?: string }> = [];
       for (const [mid, items] of Object.entries(currentMealItems)) {
         const mealLabel = currentMeals.find((m) => m.id === mid)?.label?.toLowerCase().replace(/\s+/g, "-");
         for (const foodItem of items) {
           if (foodItem.id !== item.id) {
+            // Clean the food name (remove parenthetical info) for better matching
+            const cleanName = cleanFoodName(foodItem.name);
             allFoodsToday.push({
-              name: foodItem.name,
+              name: cleanName,
               mealType: mealLabel
             });
           }
         }
       }
+      
+      // Also get foods from the same meal specifically for pairing suggestions
+      const sameMealFoods = mealId && currentMealItems[mealId]
+        ? currentMealItems[mealId]
+            .filter(f => f.id !== item.id)
+            .map(f => cleanFoodName(f.name))
+        : [];
       
       const url = `${API_BASE_URL}/meals/food-insights`;
       const res = await fetch(url, {
@@ -684,7 +697,8 @@ export default function App() {
           grams: item.grams,
           mealType: mealType,
           userGoal: "reduce_cholesterol_maintain_weight",
-          otherFoodsToday: allFoodsToday
+          otherFoodsToday: allFoodsToday,
+          sameMealFoods: sameMealFoods
         })
       });
       if (!res.ok) {

@@ -10,6 +10,7 @@ export type FoodInsightsRequest = {
   mealType?: string; // e.g., "breakfast", "lunch", "dinner", "snack"
   userGoal?: string; // e.g., "reduce_cholesterol_maintain_weight"
   otherFoodsToday?: Array<{ name: string; mealType?: string }>; // Other foods logged today
+  sameMealFoods?: string[]; // Foods from the same meal (for pairing checks)
 };
 
 export type FoodInsightsResponse = {
@@ -116,18 +117,25 @@ export const getFoodInsights = async (
     "IMPORTANT CONTEXT TO CONSIDER:",
     "- User's goal: reduce cholesterol and maintain weight (Male, 44 years, 73kg)",
     "- Meal timing: Consider when the food is being consumed (breakfast vs dinner matters)",
-    "- Other foods logged today: Check if the user has already paired foods well or needs suggestions",
+    "- Other foods logged today: A list of ALL other foods the user has logged today (check this list carefully!)",
+    "- Same meal foods: Foods from the SAME meal as the current food (especially important for pairing suggestions)",
+    "",
+    "CRITICAL: Before suggesting pairing a food with something (e.g., 'add berries' or 'pair with chia seeds'):",
+    "1. FIRST check the 'Other foods logged today' list to see if the user ALREADY logged that food",
+    "2. Check the 'Same meal foods' list - if the food is in the same meal, they've already paired it!",
+    "3. Use fuzzy matching - 'berries', 'berry', 'blueberries', 'strawberries' all count as berries",
+    "4. If the food is already logged, DO NOT suggest adding it - instead COMPLIMENT the user for the good pairing",
     "",
     "Tips should be specific and contextual:",
-    "- If the food is typically paired with something (e.g., oats with berries/chia), check if user already had those today. If yes, compliment them!",
+    "- If the food is typically paired with something (e.g., oats with berries/chia), FIRST check if user already had those in the same meal or today. If yes, compliment them!",
     "- For coffee/caffeine: Consider meal timing - 'Try not to drink after 2 pm' is more relevant for breakfast coffee than dinner",
     "- For cholesterol reduction goal: Suggest foods that help lower cholesterol, mention if current food supports this goal",
-    "- If user already paired foods well (e.g., oats + berries + chia), acknowledge and compliment their good choices",
+    "- If user already paired foods well (e.g., oats + berries + chia in same meal), acknowledge and compliment their good choices",
     "- Consider meal context: Breakfast foods vs dinner foods have different timing considerations",
     "",
     "Examples of contextual tips:",
-    "- 'Great choice pairing oats with berries and chia seeds - this combination provides fiber and omega-3s that support heart health!' (if user already had those)",
-    "- 'Oats pair well with berries and chia seeds for added fiber and omega-3s' (if user hasn't had those yet)",
+    "- 'Great choice pairing oats with berries and chia seeds - this combination provides fiber and omega-3s that support heart health!' (if berries/chia are in sameMealFoods or otherFoodsToday)",
+    "- 'Oats pair well with berries and chia seeds for added fiber and omega-3s' (ONLY if berries/chia are NOT in sameMealFoods or otherFoodsToday)",
     "- 'Since this is breakfast, try not to have coffee after 2 pm if you plan to have more later'",
     "- 'This food is low in saturated fat, which supports your goal of reducing cholesterol'",
     "",
@@ -161,9 +169,12 @@ export const getFoodInsights = async (
   if (request.userGoal) {
     contextParts.push(`User's goal: ${request.userGoal}`);
   }
+  if (request.sameMealFoods && request.sameMealFoods.length > 0) {
+    contextParts.push(`Foods in the SAME meal: ${request.sameMealFoods.join(", ")}`);
+  }
   if (request.otherFoodsToday && request.otherFoodsToday.length > 0) {
     const foodsList = request.otherFoodsToday.map(f => f.name).join(", ");
-    contextParts.push(`Other foods logged today: ${foodsList}`);
+    contextParts.push(`Other foods logged today (from other meals): ${foodsList}`);
   }
 
   const userMessage = `Food: ${request.foodName}
@@ -171,7 +182,11 @@ Quantity: ${request.quantity} ${request.unit} (${Math.round(request.grams)}g)
 Nutrition per serving: ${nutrientsSummary}
 ${contextParts.length > 0 ? `\nContext:\n${contextParts.join("\n")}` : ""}
 
-Provide insights, tips, and health quotient for this food item. Consider the context provided - if the user has already paired foods well, compliment them. If this is breakfast, consider timing tips. If the user's goal is to reduce cholesterol, mention how this food supports that goal.`;
+CRITICAL INSTRUCTIONS:
+- Before suggesting pairing this food with something (e.g., berries, chia seeds), CHECK the "Foods in the SAME meal" and "Other foods logged today" lists
+- If a suggested pairing food is already in those lists, DO NOT suggest adding it - instead COMPLIMENT the user for already pairing it well
+- Use fuzzy matching for food names (e.g., "berries", "berry", "blueberries" all match)
+- Provide insights, tips, and health quotient for this food item considering the context provided.`;
 
   try {
     const response = await client.responses.create({

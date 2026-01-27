@@ -419,7 +419,7 @@ mealsRouter.get("/days/:day/nutrients", async (req, res) => {
 
 mealsRouter.post("/food-insights", async (req, res) => {
   try {
-    const { foodName, nutrients, quantity, unit, grams, mealType, userGoal, otherFoodsToday } = req.body;
+    const { foodName, nutrients, quantity, unit, grams, mealType, userGoal, otherFoodsToday, sameMealFoods } = req.body;
 
     if (!foodName || !nutrients) {
       return res.status(400).json({ error: "foodName and nutrients are required" });
@@ -433,7 +433,8 @@ mealsRouter.post("/food-insights", async (req, res) => {
       grams: Number(grams) || 100,
       mealType: mealType ? String(mealType) : undefined,
       userGoal: userGoal ? String(userGoal) : "reduce_cholesterol_maintain_weight",
-      otherFoodsToday: Array.isArray(otherFoodsToday) ? otherFoodsToday : undefined
+      otherFoodsToday: Array.isArray(otherFoodsToday) ? otherFoodsToday : undefined,
+      sameMealFoods: Array.isArray(sameMealFoods) ? sameMealFoods : undefined
     });
 
     return res.json(insights);
