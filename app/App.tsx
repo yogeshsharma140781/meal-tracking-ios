@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   SafeAreaView,
   Text,
@@ -11,21 +11,19 @@ import {
   Platform,
   Keyboard,
   PanResponder,
-  Modal
+  Modal,
+  Image,
+  Animated,
+  Dimensions,
+  Easing
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { SvgXml } from "react-native-svg";
 import * as Print from "expo-print";
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
-import {
-  afternoonSnackIcon,
-  breakfastIcon,
-  dinnerIcon,
-  eveningSnackIcon,
-  lunchIcon
-} from "./mealIcons";
 
+// For local testing, use: http://YOUR_MAC_IP:4000/v1
+// For production, use: https://meal-tracking-api.onrender.com/v1
 const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL ||
   "https://meal-tracking-api.onrender.com/v1";
@@ -343,14 +341,11 @@ const getDefaultDayData = (): DayData => ({
   mealItems: {}
 });
 
-const mealIconById: Record<string, string> = {
-  breakfast: breakfastIcon,
-  lunch: lunchIcon,
-  "snack-afternoon": afternoonSnackIcon,
-  dinner: dinnerIcon,
-  "snack-evening": eveningSnackIcon
-};
+// Meal icons - colored for non-empty, grayscale for empty
+const MEAL_ICON_COLORED = require("./assets/meal-icon-colored.png");
+const MEAL_ICON_GRAYSCALE = require("./assets/meal-icon-grayscale.png");
 
+// Loading screen SVG - will be loaded from file
 type TabId = "meals" | "analysis" | "insights";
 
 const ANALYSIS_MACROS = [
@@ -490,6 +485,13 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>("meals");
   const [selectedNutrient, setSelectedNutrient] = useState<SelectedNutrient | null>(null);
   const [selectedMealId, setSelectedMealId] = useState<string | null>(null);
+  const [selectedFoodItem, setSelectedFoodItem] = useState<MealItem | null>(null);
+  const [foodInsights, setFoodInsights] = useState<{
+    insights: string;
+    tips: string[];
+    healthQuotient: number;
+  } | null>(null);
+  const [loadingInsights, setLoadingInsights] = useState(false);
   const [entryText, setEntryText] = useState("");
   const [dataByDate, setDataByDate] = useState<Record<string, DayData>>({});
   const [selectedDate, setSelectedDate] = useState<string>(() => toDateKey(new Date()));
@@ -522,8 +524,13 @@ export default function App() {
     } catch (_) {}
   }, []);
 
+  // Loading screen image is loaded via require() - no need for async loading
+
   useEffect(() => {
     let cancelled = false;
+    const startTime = Date.now();
+    const MIN_LOADING_TIME = 1500; // Minimum 1.5 seconds to show loading screen
+    
     (async () => {
       try {
         const raw = await AsyncStorage.getItem(STORAGE_KEY);
@@ -538,7 +545,16 @@ export default function App() {
           if (!cancelled) setDataByDate(migrated);
         }
       } catch (_) {}
-      if (!cancelled) setHydrated(true);
+      
+      // Ensure loading screen shows for at least MIN_LOADING_TIME
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, MIN_LOADING_TIME - elapsed);
+      
+      if (!cancelled) {
+        setTimeout(() => {
+          if (!cancelled) setHydrated(true);
+        }, remaining);
+      }
     })();
     return () => {
       cancelled = true;
@@ -550,29 +566,129 @@ export default function App() {
   const totals = meals.reduce((acc, meal) => sumTotals(acc, meal.nutrients), emptyTotals());
   const microTotals = getMicroTotalsFromItems(mealItems);
 
-  const goToPrevDay = () => setSelectedDate((prev) => addDays(prev, -1));
-  const goToNextDay = () => {
+  const slideAnim = useRef(new Animated.Value(0)).current;
+  const screenWidth = Dimensions.get("window").width;
+
+  // Reset animation when date changes
+  useEffect(() => {
+    slideAnim.setValue(0);
+  }, [selectedDate, slideAnim]);
+
+  const goToPrevDay = useCallback(() => {
+    Animated.timing(slideAnim, {
+      toValue: screenWidth,
+      duration: 300,
+      useNativeDriver: true,
+      easing: Easing.out(Easing.cubic),
+    }).start(() => {
+      setSelectedDate((prev) => addDays(prev, -1));
+    });
+  }, [slideAnim, screenWidth]);
+
+  const goToNextDay = useCallback(() => {
     const next = addDays(selectedDate, 1);
-    if (next <= todayKey) setSelectedDate(next);
-  };
+    if (next <= todayKey) {
+      Animated.timing(slideAnim, {
+        toValue: -screenWidth,
+        duration: 300,
+        useNativeDriver: true,
+        easing: Easing.out(Easing.cubic),
+      }).start(() => {
+        setSelectedDate(next);
+      });
+    }
+  }, [selectedDate, todayKey, slideAnim, screenWidth]);
+
   const canGoNext = addDays(selectedDate, 1) <= todayKey;
 
-  const SWIPE_THRESHOLD = 40;
+  const SWIPE_THRESHOLD = 50;
   const mealsSwipeResponder = useMemo(
     () =>
       PanResponder.create({
         onMoveShouldSetPanResponderCapture: (_, g) => {
           const { dx, dy } = g;
-          return Math.abs(dx) > 20 && Math.abs(dx) > Math.abs(dy);
+          return Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.5;
+        },
+        onPanResponderGrant: () => {
+          slideAnim.stopAnimation();
+        },
+        onPanResponderMove: (_, g) => {
+          const { dx } = g;
+          // Use a smoother, more responsive tracking with damping
+          const dampingFactor = 0.8;
+          const clampedDx = Math.max(-screenWidth * 0.4, Math.min(screenWidth * 0.4, dx * dampingFactor));
+          slideAnim.setValue(clampedDx);
         },
         onPanResponderRelease: (_, g) => {
-          const { dx } = g;
-          if (dx > SWIPE_THRESHOLD) goToPrevDay();
-          else if (dx < -SWIPE_THRESHOLD && canGoNext) goToNextDay();
-        }
+          const { dx, vx } = g;
+          const velocity = vx || 0;
+          const hasVelocity = Math.abs(velocity) > 0.3;
+          const hasDistance = Math.abs(dx) > SWIPE_THRESHOLD;
+          
+          if ((hasDistance && dx > 0) || (hasVelocity && velocity > 0.5)) {
+            goToPrevDay();
+          } else if ((hasDistance && dx < 0 && canGoNext) || (hasVelocity && velocity < -0.5 && canGoNext)) {
+            goToNextDay();
+          } else {
+            // Snap back smoothly if swipe wasn't strong enough
+            Animated.spring(slideAnim, {
+              toValue: 0,
+              useNativeDriver: true,
+              tension: 100,
+              friction: 8,
+              velocity: velocity,
+            }).start();
+          }
+        },
       }),
-    [goToPrevDay, goToNextDay, canGoNext]
+    [goToPrevDay, goToNextDay, canGoNext, slideAnim, screenWidth]
   );
+
+  const fetchFoodInsights = useCallback(async (item: MealItem) => {
+    try {
+      setLoadingInsights(true);
+      const url = `${API_BASE_URL}/meals/food-insights`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          foodName: item.name,
+          nutrients: item.nutrients,
+          quantity: item.quantity,
+          unit: item.unit,
+          grams: item.grams
+        })
+      });
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        throw new Error(errorData.error || `HTTP ${res.status}: Failed to fetch insights`);
+      }
+      const data = await res.json();
+      setFoodInsights({
+        insights: data.insights || "",
+        tips: data.tips || [],
+        healthQuotient: data.healthQuotient || 70
+      });
+    } catch (error) {
+      console.error("Failed to fetch food insights:", error);
+      // Set default insights if API fails
+      setFoodInsights({
+        insights: `${capitalizeFirst(stripParenthetical(item.name))} provides essential nutrients for your health.`,
+        tips: [],
+        healthQuotient: 70
+      });
+    } finally {
+      setLoadingInsights(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (selectedFoodItem) {
+      fetchFoodInsights(selectedFoodItem);
+    } else {
+      setFoodInsights(null);
+    }
+  }, [selectedFoodItem, fetchFoodInsights]);
 
   const openAdd = (mealId: string) => {
     setSelectedMealId(mealId);
@@ -735,7 +851,11 @@ export default function App() {
           </View>
 
           {selectedItems.map((item) => (
-            <View key={item.id} style={styles.itemCard}>
+            <TouchableOpacity
+              key={item.id}
+              style={styles.itemCard}
+              onPress={() => setSelectedFoodItem(item)}
+            >
               <View style={styles.itemHeaderRow}>
                 <View style={styles.itemHeaderText}>
                   <Text
@@ -754,7 +874,10 @@ export default function App() {
                 </View>
                 <TouchableOpacity
                   style={styles.itemRemove}
-                  onPress={() => handleDeleteItem(selectedMealId, item.id)}
+                  onPress={(e) => {
+                    e.stopPropagation();
+                    handleDeleteItem(selectedMealId, item.id);
+                  }}
                 >
                   <Text style={styles.itemRemoveText}>×</Text>
                 </TouchableOpacity>
@@ -779,7 +902,7 @@ export default function App() {
                   {Math.round(item.nutrients.calories_kcal)} Cal
                 </Text>
               </View>
-            </View>
+            </TouchableOpacity>
           ))}
 
           {selectedItems.length === 0 && (
@@ -840,16 +963,31 @@ export default function App() {
           <head>
             <meta charset="UTF-8">
             <style>
-              body { font-family: Arial, sans-serif; padding: 20px; }
-              h1 { color: #111827; margin-bottom: 10px; }
+              @page {
+                size: letter;
+                margin: 0;
+              }
+              body { 
+                font-family: Arial, sans-serif; 
+                padding: 0;
+                margin: 0;
+              }
+              .page {
+                width: 100%;
+                min-height: 792px;
+                padding: 40px 20px;
+                margin: 0;
+                page-break-after: always;
+                break-after: page;
+                box-sizing: border-box;
+              }
+              .page:last-child {
+                page-break-after: auto;
+                break-after: auto;
+              }
+              h1 { color: #111827; margin-bottom: 10px; margin-top: 0; }
               h2 { color: #1F2937; margin-top: 20px; margin-bottom: 10px; }
               .day-section { 
-                margin-bottom: 30px; 
-                border-bottom: 1px solid #E5E7EB; 
-                padding-bottom: 20px; 
-                page-break-before: always;
-              }
-              .day-section-first { 
                 margin-bottom: 30px; 
                 border-bottom: 1px solid #E5E7EB; 
                 padding-bottom: 20px; 
@@ -865,11 +1003,8 @@ export default function App() {
             </style>
           </head>
           <body>
-            <h1>Meal Tracking Export</h1>
-            <p class="summary">Date Range: ${formatHeaderLabel(exportStartDate)} to ${formatHeaderLabel(exportEndDate)}</p>
       `;
 
-      let isFirstDay = true;
       exportData.forEach(({ date, data }) => {
         const dayTotals = data.meals.reduce(
           (acc, meal) => sumTotals(acc, meal.nutrients),
@@ -878,10 +1013,14 @@ export default function App() {
 
         if (dayTotals.calories_kcal > 0) {
           const microTotals = getMicroTotalsFromItems(data.mealItems);
-          const pageBreakClass = isFirstDay ? 'day-section-first' : 'day-section';
+          
+          // Each date gets its own page
           htmlContent += `
-            <div class="${pageBreakClass}">
-              <h2>${formatHeaderLabel(date)}</h2>
+            <div class="page">
+              <h1>Meal Tracking Export</h1>
+              <p class="summary">Date Range: ${formatHeaderLabel(exportStartDate)} to ${formatHeaderLabel(exportEndDate)}</p>
+              <div class="day-section">
+                <h2>${formatHeaderLabel(date)}</h2>
               <div class="nutrition">
                 <table>
                   <tr><th>Nutrient</th><th>Value</th></tr>
@@ -918,8 +1057,10 @@ export default function App() {
             }
           });
 
-          htmlContent += `</div>`;
-          isFirstDay = false;
+          htmlContent += `
+              </div>
+            </div>
+          `;
         }
       });
 
@@ -931,7 +1072,9 @@ export default function App() {
       // Generate PDF
       const { uri } = await Print.printToFileAsync({
         html: htmlContent,
-        base64: false
+        base64: false,
+        width: 612, // US Letter width in points (8.5 inches)
+        height: 792, // US Letter height in points (11 inches)
       });
 
       // Generate filename with date range
@@ -1086,6 +1229,20 @@ export default function App() {
     );
   }
 
+  // Show loading screen while app is initializing
+  if (!hydrated) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.loadingContainer}>
+          <Image 
+            source={require("./assets/loading-screen.png")}
+            style={{ width: "100%", height: "100%", resizeMode: "contain" }}
+          />
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
@@ -1146,7 +1303,15 @@ export default function App() {
 
       <View style={styles.mealsSwipeArea} {...mealsSwipeResponder.panHandlers}>
         {activeTab === "meals" && (
-          <ScrollView contentContainerStyle={styles.content}>
+          <Animated.View
+            style={[
+              { flex: 1 },
+              {
+                transform: [{ translateX: slideAnim }],
+              },
+            ]}
+          >
+            <ScrollView contentContainerStyle={styles.content}>
             <Text style={styles.sectionLabel}>NUTRITION</Text>
             <View style={styles.nutritionCard}>
               {nutritionSummary.map((item) => (
@@ -1168,7 +1333,13 @@ export default function App() {
 
             <Text style={[styles.sectionLabel, styles.sectionSpacing]}>MEALS</Text>
             <View style={styles.mealsList}>
-              {meals.map((meal) => (
+              {meals.map((meal) => {
+                const mealItemsForMeal = mealItems[meal.id] || [];
+                const hasItems = mealItemsForMeal.length > 0 || meal.nutrients.calories_kcal > 0;
+                const iconSource = hasItems ? MEAL_ICON_COLORED : MEAL_ICON_GRAYSCALE;
+                const iconSize = meal.id === "snack-afternoon" || meal.id === "snack-evening" ? 36 : 40;
+                
+                return (
                 <TouchableOpacity
                   key={meal.id}
                   style={styles.mealCard}
@@ -1179,18 +1350,13 @@ export default function App() {
                   activeOpacity={0.9}
                 >
                   <View style={styles.mealIcon}>
-                    <SvgXml
-                      xml={mealIconById[meal.id] || breakfastIcon}
-                      width={
-                        meal.id === "snack-afternoon" || meal.id === "snack-evening"
-                          ? 36
-                          : 40
-                      }
-                      height={
-                        meal.id === "snack-afternoon" || meal.id === "snack-evening"
-                          ? 36
-                          : 40
-                      }
+                    <Image
+                      source={iconSource}
+                      style={{
+                        width: iconSize,
+                        height: iconSize,
+                        resizeMode: "contain"
+                      }}
                     />
                   </View>
                   <View style={styles.mealInfo}>
@@ -1208,9 +1374,11 @@ export default function App() {
                     <Text style={styles.addCircleText}>Add</Text>
                   </TouchableOpacity>
                 </TouchableOpacity>
-              ))}
+                );
+              })}
             </View>
           </ScrollView>
+          </Animated.View>
         )}
 
         {activeTab === "analysis" &&
@@ -1391,6 +1559,186 @@ export default function App() {
           </ScrollView>
         )}
 
+        {selectedFoodItem !== null && (
+          <ScrollView
+            style={{ flex: 1 }}
+            contentContainerStyle={styles.foodDetailContent}
+            showsVerticalScrollIndicator
+          >
+            <View style={styles.foodDetailHeader}>
+              <TouchableOpacity
+                style={styles.iconButton}
+                onPress={() => setSelectedFoodItem(null)}
+              >
+                <Text style={styles.iconText}>‹</Text>
+              </TouchableOpacity>
+              <Text style={styles.foodDetailTitle}>
+                {capitalizeFirst(stripParenthetical(selectedFoodItem.name)).toUpperCase()}
+              </Text>
+              <View style={styles.iconButton} />
+            </View>
+
+            <View style={styles.foodDetailSection}>
+              <Text style={styles.foodDetailSectionTitle}>Nutrition Facts</Text>
+              <View style={styles.foodDetailMacros}>
+                <View style={styles.foodDetailMacroCard}>
+                  <Text style={styles.foodDetailMacroValue}>
+                    {Math.round(selectedFoodItem.nutrients.calories_kcal)}
+                  </Text>
+                  <Text style={styles.foodDetailMacroLabel}>Calories</Text>
+                </View>
+                <View style={styles.foodDetailMacroCard}>
+                  <Text style={styles.foodDetailMacroValue}>
+                    {Math.round(selectedFoodItem.nutrients.protein_g)}g
+                  </Text>
+                  <Text style={styles.foodDetailMacroLabel}>Protein</Text>
+                </View>
+                <View style={styles.foodDetailMacroCard}>
+                  <Text style={styles.foodDetailMacroValue}>
+                    {Math.round(selectedFoodItem.nutrients.carbs_g)}g
+                  </Text>
+                  <Text style={styles.foodDetailMacroLabel}>Carbs</Text>
+                </View>
+                <View style={styles.foodDetailMacroCard}>
+                  <Text style={styles.foodDetailMacroValue}>
+                    {Math.round(selectedFoodItem.nutrients.fat_g)}g
+                  </Text>
+                  <Text style={styles.foodDetailMacroLabel}>Fat</Text>
+                </View>
+              </View>
+
+              <View style={styles.foodDetailMicros}>
+                {selectedFoodItem.nutrients.fiber_g > 0 && (
+                  <View style={styles.foodDetailMicroRow}>
+                    <Text style={styles.foodDetailMicroLabel}>Fiber</Text>
+                    <Text style={styles.foodDetailMicroValue}>
+                      {Math.round(selectedFoodItem.nutrients.fiber_g)}g
+                    </Text>
+                  </View>
+                )}
+                {selectedFoodItem.nutrients.sodium_mg > 0 && (
+                  <View style={styles.foodDetailMicroRow}>
+                    <Text style={styles.foodDetailMicroLabel}>Sodium</Text>
+                    <Text style={styles.foodDetailMicroValue}>
+                      {Math.round(selectedFoodItem.nutrients.sodium_mg)}mg
+                    </Text>
+                  </View>
+                )}
+                {selectedFoodItem.nutrients.cholesterol_mg > 0 && (
+                  <View style={styles.foodDetailMicroRow}>
+                    <Text style={styles.foodDetailMicroLabel}>Cholesterol</Text>
+                    <Text style={styles.foodDetailMicroValue}>
+                      {Math.round(selectedFoodItem.nutrients.cholesterol_mg)}mg
+                    </Text>
+                  </View>
+                )}
+                {selectedFoodItem.nutrients.potassium_mg > 0 && (
+                  <View style={styles.foodDetailMicroRow}>
+                    <Text style={styles.foodDetailMicroLabel}>Potassium</Text>
+                    <Text style={styles.foodDetailMicroValue}>
+                      {Math.round(selectedFoodItem.nutrients.potassium_mg)}mg
+                    </Text>
+                  </View>
+                )}
+                {selectedFoodItem.nutrients.vitamin_c_mg > 0 && (
+                  <View style={styles.foodDetailMicroRow}>
+                    <Text style={styles.foodDetailMicroLabel}>Vitamin C</Text>
+                    <Text style={styles.foodDetailMicroValue}>
+                      {Math.round(selectedFoodItem.nutrients.vitamin_c_mg)}mg
+                    </Text>
+                  </View>
+                )}
+                {selectedFoodItem.nutrients.vitamin_a_mcg > 0 && (
+                  <View style={styles.foodDetailMicroRow}>
+                    <Text style={styles.foodDetailMicroLabel}>Vitamin A</Text>
+                    <Text style={styles.foodDetailMicroValue}>
+                      {Math.round(selectedFoodItem.nutrients.vitamin_a_mcg)}mcg
+                    </Text>
+                  </View>
+                )}
+                {selectedFoodItem.nutrients.vitamin_d_iu > 0 && (
+                  <View style={styles.foodDetailMicroRow}>
+                    <Text style={styles.foodDetailMicroLabel}>Vitamin D</Text>
+                    <Text style={styles.foodDetailMicroValue}>
+                      {Math.round(selectedFoodItem.nutrients.vitamin_d_iu)}IU
+                    </Text>
+                  </View>
+                )}
+                {selectedFoodItem.nutrients.magnesium_mg > 0 && (
+                  <View style={styles.foodDetailMicroRow}>
+                    <Text style={styles.foodDetailMicroLabel}>Magnesium</Text>
+                    <Text style={styles.foodDetailMicroValue}>
+                      {Math.round(selectedFoodItem.nutrients.magnesium_mg)}mg
+                    </Text>
+                  </View>
+                )}
+                {selectedFoodItem.nutrients.omega_3_g > 0 && (
+                  <View style={styles.foodDetailMicroRow}>
+                    <Text style={styles.foodDetailMicroLabel}>Omega-3</Text>
+                    <Text style={styles.foodDetailMicroValue}>
+                      {Math.round(selectedFoodItem.nutrients.omega_3_g * 10) / 10}g
+                    </Text>
+                  </View>
+                )}
+              </View>
+            </View>
+
+            {loadingInsights ? (
+              <View style={styles.foodDetailLoading}>
+                <Text style={styles.foodDetailLoadingText}>Loading insights...</Text>
+              </View>
+            ) : foodInsights ? (
+              <>
+                {foodInsights.healthQuotient > 0 && (
+                  <View style={styles.foodDetailSection}>
+                    <Text style={styles.foodDetailSectionTitle}>Health Quotient</Text>
+                    <View style={styles.foodDetailHealthQuotient}>
+                      <Text style={styles.foodDetailHealthQuotientValue}>
+                        {foodInsights.healthQuotient}/100
+                      </Text>
+                      <View style={styles.foodDetailHealthQuotientBar}>
+                        <View
+                          style={[
+                            styles.foodDetailHealthQuotientFill,
+                            {
+                              width: `${foodInsights.healthQuotient}%`,
+                              backgroundColor:
+                                foodInsights.healthQuotient >= 80
+                                  ? "#4CAF50"
+                                  : foodInsights.healthQuotient >= 60
+                                    ? "#FFC107"
+                                    : "#FF5722"
+                            }
+                          ]}
+                        />
+                      </View>
+                    </View>
+                  </View>
+                )}
+
+                {foodInsights.insights && (
+                  <View style={styles.foodDetailSection}>
+                    <Text style={styles.foodDetailSectionTitle}>Insights</Text>
+                    <Text style={styles.foodDetailInsights}>{foodInsights.insights}</Text>
+                  </View>
+                )}
+
+                {foodInsights.tips && foodInsights.tips.length > 0 && (
+                  <View style={styles.foodDetailSection}>
+                    <Text style={styles.foodDetailSectionTitle}>Tips</Text>
+                    {foodInsights.tips.map((tip, idx) => (
+                      <View key={idx} style={styles.foodDetailTip}>
+                        <Text style={styles.foodDetailTipBullet}>•</Text>
+                        <Text style={styles.foodDetailTipText}>{tip}</Text>
+                      </View>
+                    ))}
+                  </View>
+                )}
+              </>
+            ) : null}
+          </ScrollView>
+        )}
+
         {activeTab === "insights" && (
           <View style={styles.insightsPlaceholder}>
             <Text style={styles.insightsPlaceholderText}>Insights coming soon.</Text>
@@ -1445,6 +1793,14 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#F5F5F7",
     paddingTop: 24
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    width: "100%",
+    height: "100%"
   },
   header: {
     flexDirection: "row",
@@ -2135,5 +2491,162 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontSize: 16,
     fontWeight: "600"
+  },
+  foodDetailContent: {
+    paddingTop: 8,
+    paddingBottom: 120,
+    paddingHorizontal: 28
+  },
+  foodDetailHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: HEADER_TO_CONTENT_GAP,
+    paddingHorizontal: 0
+  },
+  foodDetailTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#1F2937",
+    letterSpacing: 0.5
+  },
+  foodDetailSection: {
+    marginBottom: 32
+  },
+  foodDetailSectionTitle: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#6B7280",
+    marginBottom: 16,
+    letterSpacing: 0.5
+  },
+  foodDetailMacros: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 12,
+    marginBottom: 24
+  },
+  foodDetailMacroCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 16,
+    minWidth: "45%",
+    alignItems: "center",
+    shadowColor: "#000",
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2
+  },
+  foodDetailMacroValue: {
+    fontSize: 24,
+    fontWeight: "700",
+    color: "#111827",
+    marginBottom: 4
+  },
+  foodDetailMacroLabel: {
+    fontSize: 12,
+    color: "#6B7280",
+    fontWeight: "500"
+  },
+  foodDetailMicros: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    overflow: "hidden",
+    shadowColor: "#000",
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2
+  },
+  foodDetailMicroRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E5E7EB"
+  },
+  foodDetailMicroLabel: {
+    fontSize: 14,
+    color: "#374151"
+  },
+  foodDetailMicroValue: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#111827"
+  },
+  foodDetailLoading: {
+    padding: 24,
+    alignItems: "center"
+  },
+  foodDetailLoadingText: {
+    fontSize: 14,
+    color: "#6B7280"
+  },
+  foodDetailHealthQuotient: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 20,
+    shadowColor: "#000",
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2
+  },
+  foodDetailHealthQuotientValue: {
+    fontSize: 32,
+    fontWeight: "700",
+    color: "#111827",
+    marginBottom: 12,
+    textAlign: "center"
+  },
+  foodDetailHealthQuotientBar: {
+    height: 8,
+    backgroundColor: "#E5E7EB",
+    borderRadius: 4,
+    overflow: "hidden"
+  },
+  foodDetailHealthQuotientFill: {
+    height: "100%",
+    borderRadius: 4
+  },
+  foodDetailInsights: {
+    fontSize: 16,
+    color: "#374151",
+    lineHeight: 24,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 16,
+    shadowColor: "#000",
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2
+  },
+  foodDetailTip: {
+    flexDirection: "row",
+    marginBottom: 12,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 16,
+    shadowColor: "#000",
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2
+  },
+  foodDetailTipBullet: {
+    fontSize: 20,
+    color: "#2563EB",
+    marginRight: 12,
+    fontWeight: "700"
+  },
+  foodDetailTipText: {
+    fontSize: 14,
+    color: "#374151",
+    lineHeight: 20,
+    flex: 1
   }
 });
