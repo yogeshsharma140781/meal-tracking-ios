@@ -561,8 +561,9 @@ export default function App() {
     };
   }, []);
 
-  const meals = getDayData(selectedDate).meals;
-  const mealItems = getDayData(selectedDate).mealItems;
+  const dayData = getDayData(selectedDate);
+  const meals = dayData.meals;
+  const mealItems = dayData.mealItems;
   const totals = meals.reduce((acc, meal) => sumTotals(acc, meal.nutrients), emptyTotals());
   const microTotals = getMicroTotalsFromItems(mealItems);
 
@@ -644,9 +645,33 @@ export default function App() {
     [goToPrevDay, goToNextDay, canGoNext, slideAnim, screenWidth]
   );
 
-  const fetchFoodInsights = useCallback(async (item: MealItem) => {
+  const fetchFoodInsights = useCallback(async (item: MealItem, mealId?: string | null) => {
     try {
       setLoadingInsights(true);
+      
+      // Get current day's data for context
+      const currentDayData = getDayData(selectedDate);
+      const currentMeals = currentDayData.meals;
+      const currentMealItems = currentDayData.mealItems;
+      
+      // Get meal type from mealId
+      const meal = currentMeals.find((m) => m.id === mealId);
+      const mealType = meal?.label?.toLowerCase().replace(/\s+/g, "-") || undefined;
+      
+      // Get all other foods logged today (excluding current item)
+      const allFoodsToday: Array<{ name: string; mealType?: string }> = [];
+      for (const [mid, items] of Object.entries(currentMealItems)) {
+        const mealLabel = currentMeals.find((m) => m.id === mid)?.label?.toLowerCase().replace(/\s+/g, "-");
+        for (const foodItem of items) {
+          if (foodItem.id !== item.id) {
+            allFoodsToday.push({
+              name: foodItem.name,
+              mealType: mealLabel
+            });
+          }
+        }
+      }
+      
       const url = `${API_BASE_URL}/meals/food-insights`;
       const res = await fetch(url, {
         method: "POST",
@@ -656,7 +681,10 @@ export default function App() {
           nutrients: item.nutrients,
           quantity: item.quantity,
           unit: item.unit,
-          grams: item.grams
+          grams: item.grams,
+          mealType: mealType,
+          userGoal: "reduce_cholesterol_maintain_weight",
+          otherFoodsToday: allFoodsToday
         })
       });
       if (!res.ok) {
@@ -680,15 +708,15 @@ export default function App() {
     } finally {
       setLoadingInsights(false);
     }
-  }, []);
+  }, [selectedDate, getDayData]);
 
+  // Note: fetchFoodInsights is now called directly when item is tapped
+  // This useEffect is kept for cleanup
   useEffect(() => {
-    if (selectedFoodItem) {
-      fetchFoodInsights(selectedFoodItem);
-    } else {
+    if (!selectedFoodItem) {
       setFoodInsights(null);
     }
-  }, [selectedFoodItem, fetchFoodInsights]);
+  }, [selectedFoodItem]);
 
   const openAdd = (mealId: string) => {
     setSelectedMealId(mealId);
@@ -832,6 +860,191 @@ export default function App() {
     );
   }
 
+  // Show food detail screen if a food item is selected
+  if (selectedFoodItem !== null) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={styles.foodDetailContent}
+          showsVerticalScrollIndicator
+        >
+          <View style={styles.foodDetailHeader}>
+            <TouchableOpacity
+              style={styles.iconButton}
+              onPress={() => setSelectedFoodItem(null)}
+            >
+              <Text style={styles.iconText}>‹</Text>
+            </TouchableOpacity>
+            <Text style={styles.foodDetailTitle}>
+              {capitalizeFirst(stripParenthetical(selectedFoodItem.name)).toUpperCase()}
+            </Text>
+            <View style={styles.iconButton} />
+          </View>
+
+          <View style={styles.foodDetailSection}>
+            <Text style={styles.foodDetailSectionTitle}>Nutrition Facts</Text>
+            <View style={styles.foodDetailMacros}>
+              <View style={styles.foodDetailMacroCard}>
+                <Text style={styles.foodDetailMacroValue}>
+                  {Math.round(selectedFoodItem.nutrients.calories_kcal)}
+                </Text>
+                <Text style={styles.foodDetailMacroLabel}>Calories</Text>
+              </View>
+              <View style={styles.foodDetailMacroCard}>
+                <Text style={styles.foodDetailMacroValue}>
+                  {Math.round(selectedFoodItem.nutrients.protein_g)}g
+                </Text>
+                <Text style={styles.foodDetailMacroLabel}>Protein</Text>
+              </View>
+              <View style={styles.foodDetailMacroCard}>
+                <Text style={styles.foodDetailMacroValue}>
+                  {Math.round(selectedFoodItem.nutrients.carbs_g)}g
+                </Text>
+                <Text style={styles.foodDetailMacroLabel}>Carbs</Text>
+              </View>
+              <View style={styles.foodDetailMacroCard}>
+                <Text style={styles.foodDetailMacroValue}>
+                  {Math.round(selectedFoodItem.nutrients.fat_g)}g
+                </Text>
+                <Text style={styles.foodDetailMacroLabel}>Fat</Text>
+              </View>
+            </View>
+
+            <View style={styles.foodDetailMicros}>
+              {selectedFoodItem.nutrients.fiber_g > 0 && (
+                <View style={styles.foodDetailMicroRow}>
+                  <Text style={styles.foodDetailMicroLabel}>Fiber</Text>
+                  <Text style={styles.foodDetailMicroValue}>
+                    {Math.round(selectedFoodItem.nutrients.fiber_g)}g
+                  </Text>
+                </View>
+              )}
+              {selectedFoodItem.nutrients.sodium_mg > 0 && (
+                <View style={styles.foodDetailMicroRow}>
+                  <Text style={styles.foodDetailMicroLabel}>Sodium</Text>
+                  <Text style={styles.foodDetailMicroValue}>
+                    {Math.round(selectedFoodItem.nutrients.sodium_mg)}mg
+                  </Text>
+                </View>
+              )}
+              {selectedFoodItem.nutrients.cholesterol_mg > 0 && (
+                <View style={styles.foodDetailMicroRow}>
+                  <Text style={styles.foodDetailMicroLabel}>Cholesterol</Text>
+                  <Text style={styles.foodDetailMicroValue}>
+                    {Math.round(selectedFoodItem.nutrients.cholesterol_mg)}mg
+                  </Text>
+                </View>
+              )}
+              {selectedFoodItem.nutrients.potassium_mg > 0 && (
+                <View style={styles.foodDetailMicroRow}>
+                  <Text style={styles.foodDetailMicroLabel}>Potassium</Text>
+                  <Text style={styles.foodDetailMicroValue}>
+                    {Math.round(selectedFoodItem.nutrients.potassium_mg)}mg
+                  </Text>
+                </View>
+              )}
+              {selectedFoodItem.nutrients.vitamin_c_mg > 0 && (
+                <View style={styles.foodDetailMicroRow}>
+                  <Text style={styles.foodDetailMicroLabel}>Vitamin C</Text>
+                  <Text style={styles.foodDetailMicroValue}>
+                    {Math.round(selectedFoodItem.nutrients.vitamin_c_mg)}mg
+                  </Text>
+                </View>
+              )}
+              {selectedFoodItem.nutrients.vitamin_a_mcg > 0 && (
+                <View style={styles.foodDetailMicroRow}>
+                  <Text style={styles.foodDetailMicroLabel}>Vitamin A</Text>
+                  <Text style={styles.foodDetailMicroValue}>
+                    {Math.round(selectedFoodItem.nutrients.vitamin_a_mcg)}mcg
+                  </Text>
+                </View>
+              )}
+              {selectedFoodItem.nutrients.vitamin_d_iu > 0 && (
+                <View style={styles.foodDetailMicroRow}>
+                  <Text style={styles.foodDetailMicroLabel}>Vitamin D</Text>
+                  <Text style={styles.foodDetailMicroValue}>
+                    {Math.round(selectedFoodItem.nutrients.vitamin_d_iu)}IU
+                  </Text>
+                </View>
+              )}
+              {selectedFoodItem.nutrients.magnesium_mg > 0 && (
+                <View style={styles.foodDetailMicroRow}>
+                  <Text style={styles.foodDetailMicroLabel}>Magnesium</Text>
+                  <Text style={styles.foodDetailMicroValue}>
+                    {Math.round(selectedFoodItem.nutrients.magnesium_mg)}mg
+                  </Text>
+                </View>
+              )}
+              {selectedFoodItem.nutrients.omega_3_g > 0 && (
+                <View style={styles.foodDetailMicroRow}>
+                  <Text style={styles.foodDetailMicroLabel}>Omega-3</Text>
+                  <Text style={styles.foodDetailMicroValue}>
+                    {Math.round(selectedFoodItem.nutrients.omega_3_g * 10) / 10}g
+                  </Text>
+                </View>
+              )}
+            </View>
+          </View>
+
+          {loadingInsights ? (
+            <View style={styles.foodDetailLoading}>
+              <Text style={styles.foodDetailLoadingText}>Loading insights...</Text>
+            </View>
+          ) : foodInsights ? (
+            <>
+              {foodInsights.healthQuotient > 0 && (
+                <View style={styles.foodDetailSection}>
+                  <Text style={styles.foodDetailSectionTitle}>Health Quotient</Text>
+                  <View style={styles.foodDetailHealthQuotient}>
+                    <Text style={styles.foodDetailHealthQuotientValue}>
+                      {foodInsights.healthQuotient}/100
+                    </Text>
+                    <View style={styles.foodDetailHealthQuotientBar}>
+                      <View
+                        style={[
+                          styles.foodDetailHealthQuotientFill,
+                          {
+                            width: `${foodInsights.healthQuotient}%`,
+                            backgroundColor:
+                              foodInsights.healthQuotient >= 80
+                                ? "#4CAF50"
+                                : foodInsights.healthQuotient >= 60
+                                  ? "#FFC107"
+                                  : "#FF5722"
+                          }
+                        ]}
+                      />
+                    </View>
+                  </View>
+                </View>
+              )}
+
+              {foodInsights.insights && (
+                <View style={styles.foodDetailSection}>
+                  <Text style={styles.foodDetailSectionTitle}>Insights</Text>
+                  <Text style={styles.foodDetailInsights}>{foodInsights.insights}</Text>
+                </View>
+              )}
+
+              {foodInsights.tips && foodInsights.tips.length > 0 && (
+                <View style={styles.foodDetailSection}>
+                  <Text style={styles.foodDetailSectionTitle}>Tips</Text>
+                  {foodInsights.tips.map((tip, idx) => (
+                    <View key={idx} style={styles.foodDetailTip}>
+                      <Text style={styles.foodDetailTipBullet}>•</Text>
+                      <Text style={styles.foodDetailTipText}>{tip}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </>
+          ) : null}
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
   if (view === "meal" && selectedMealId) {
     const totalCalories = Math.round(
       selectedItems.reduce((sum, item) => sum + item.nutrients.calories_kcal, 0)
@@ -854,7 +1067,10 @@ export default function App() {
             <TouchableOpacity
               key={item.id}
               style={styles.itemCard}
-              onPress={() => setSelectedFoodItem(item)}
+              onPress={() => {
+                setSelectedFoodItem(item);
+                fetchFoodInsights(item, selectedMealId);
+              }}
             >
               <View style={styles.itemHeaderRow}>
                 <View style={styles.itemHeaderText}>
@@ -1559,185 +1775,6 @@ export default function App() {
           </ScrollView>
         )}
 
-        {selectedFoodItem !== null && (
-          <ScrollView
-            style={{ flex: 1 }}
-            contentContainerStyle={styles.foodDetailContent}
-            showsVerticalScrollIndicator
-          >
-            <View style={styles.foodDetailHeader}>
-              <TouchableOpacity
-                style={styles.iconButton}
-                onPress={() => setSelectedFoodItem(null)}
-              >
-                <Text style={styles.iconText}>‹</Text>
-              </TouchableOpacity>
-              <Text style={styles.foodDetailTitle}>
-                {capitalizeFirst(stripParenthetical(selectedFoodItem.name)).toUpperCase()}
-              </Text>
-              <View style={styles.iconButton} />
-            </View>
-
-            <View style={styles.foodDetailSection}>
-              <Text style={styles.foodDetailSectionTitle}>Nutrition Facts</Text>
-              <View style={styles.foodDetailMacros}>
-                <View style={styles.foodDetailMacroCard}>
-                  <Text style={styles.foodDetailMacroValue}>
-                    {Math.round(selectedFoodItem.nutrients.calories_kcal)}
-                  </Text>
-                  <Text style={styles.foodDetailMacroLabel}>Calories</Text>
-                </View>
-                <View style={styles.foodDetailMacroCard}>
-                  <Text style={styles.foodDetailMacroValue}>
-                    {Math.round(selectedFoodItem.nutrients.protein_g)}g
-                  </Text>
-                  <Text style={styles.foodDetailMacroLabel}>Protein</Text>
-                </View>
-                <View style={styles.foodDetailMacroCard}>
-                  <Text style={styles.foodDetailMacroValue}>
-                    {Math.round(selectedFoodItem.nutrients.carbs_g)}g
-                  </Text>
-                  <Text style={styles.foodDetailMacroLabel}>Carbs</Text>
-                </View>
-                <View style={styles.foodDetailMacroCard}>
-                  <Text style={styles.foodDetailMacroValue}>
-                    {Math.round(selectedFoodItem.nutrients.fat_g)}g
-                  </Text>
-                  <Text style={styles.foodDetailMacroLabel}>Fat</Text>
-                </View>
-              </View>
-
-              <View style={styles.foodDetailMicros}>
-                {selectedFoodItem.nutrients.fiber_g > 0 && (
-                  <View style={styles.foodDetailMicroRow}>
-                    <Text style={styles.foodDetailMicroLabel}>Fiber</Text>
-                    <Text style={styles.foodDetailMicroValue}>
-                      {Math.round(selectedFoodItem.nutrients.fiber_g)}g
-                    </Text>
-                  </View>
-                )}
-                {selectedFoodItem.nutrients.sodium_mg > 0 && (
-                  <View style={styles.foodDetailMicroRow}>
-                    <Text style={styles.foodDetailMicroLabel}>Sodium</Text>
-                    <Text style={styles.foodDetailMicroValue}>
-                      {Math.round(selectedFoodItem.nutrients.sodium_mg)}mg
-                    </Text>
-                  </View>
-                )}
-                {selectedFoodItem.nutrients.cholesterol_mg > 0 && (
-                  <View style={styles.foodDetailMicroRow}>
-                    <Text style={styles.foodDetailMicroLabel}>Cholesterol</Text>
-                    <Text style={styles.foodDetailMicroValue}>
-                      {Math.round(selectedFoodItem.nutrients.cholesterol_mg)}mg
-                    </Text>
-                  </View>
-                )}
-                {selectedFoodItem.nutrients.potassium_mg > 0 && (
-                  <View style={styles.foodDetailMicroRow}>
-                    <Text style={styles.foodDetailMicroLabel}>Potassium</Text>
-                    <Text style={styles.foodDetailMicroValue}>
-                      {Math.round(selectedFoodItem.nutrients.potassium_mg)}mg
-                    </Text>
-                  </View>
-                )}
-                {selectedFoodItem.nutrients.vitamin_c_mg > 0 && (
-                  <View style={styles.foodDetailMicroRow}>
-                    <Text style={styles.foodDetailMicroLabel}>Vitamin C</Text>
-                    <Text style={styles.foodDetailMicroValue}>
-                      {Math.round(selectedFoodItem.nutrients.vitamin_c_mg)}mg
-                    </Text>
-                  </View>
-                )}
-                {selectedFoodItem.nutrients.vitamin_a_mcg > 0 && (
-                  <View style={styles.foodDetailMicroRow}>
-                    <Text style={styles.foodDetailMicroLabel}>Vitamin A</Text>
-                    <Text style={styles.foodDetailMicroValue}>
-                      {Math.round(selectedFoodItem.nutrients.vitamin_a_mcg)}mcg
-                    </Text>
-                  </View>
-                )}
-                {selectedFoodItem.nutrients.vitamin_d_iu > 0 && (
-                  <View style={styles.foodDetailMicroRow}>
-                    <Text style={styles.foodDetailMicroLabel}>Vitamin D</Text>
-                    <Text style={styles.foodDetailMicroValue}>
-                      {Math.round(selectedFoodItem.nutrients.vitamin_d_iu)}IU
-                    </Text>
-                  </View>
-                )}
-                {selectedFoodItem.nutrients.magnesium_mg > 0 && (
-                  <View style={styles.foodDetailMicroRow}>
-                    <Text style={styles.foodDetailMicroLabel}>Magnesium</Text>
-                    <Text style={styles.foodDetailMicroValue}>
-                      {Math.round(selectedFoodItem.nutrients.magnesium_mg)}mg
-                    </Text>
-                  </View>
-                )}
-                {selectedFoodItem.nutrients.omega_3_g > 0 && (
-                  <View style={styles.foodDetailMicroRow}>
-                    <Text style={styles.foodDetailMicroLabel}>Omega-3</Text>
-                    <Text style={styles.foodDetailMicroValue}>
-                      {Math.round(selectedFoodItem.nutrients.omega_3_g * 10) / 10}g
-                    </Text>
-                  </View>
-                )}
-              </View>
-            </View>
-
-            {loadingInsights ? (
-              <View style={styles.foodDetailLoading}>
-                <Text style={styles.foodDetailLoadingText}>Loading insights...</Text>
-              </View>
-            ) : foodInsights ? (
-              <>
-                {foodInsights.healthQuotient > 0 && (
-                  <View style={styles.foodDetailSection}>
-                    <Text style={styles.foodDetailSectionTitle}>Health Quotient</Text>
-                    <View style={styles.foodDetailHealthQuotient}>
-                      <Text style={styles.foodDetailHealthQuotientValue}>
-                        {foodInsights.healthQuotient}/100
-                      </Text>
-                      <View style={styles.foodDetailHealthQuotientBar}>
-                        <View
-                          style={[
-                            styles.foodDetailHealthQuotientFill,
-                            {
-                              width: `${foodInsights.healthQuotient}%`,
-                              backgroundColor:
-                                foodInsights.healthQuotient >= 80
-                                  ? "#4CAF50"
-                                  : foodInsights.healthQuotient >= 60
-                                    ? "#FFC107"
-                                    : "#FF5722"
-                            }
-                          ]}
-                        />
-                      </View>
-                    </View>
-                  </View>
-                )}
-
-                {foodInsights.insights && (
-                  <View style={styles.foodDetailSection}>
-                    <Text style={styles.foodDetailSectionTitle}>Insights</Text>
-                    <Text style={styles.foodDetailInsights}>{foodInsights.insights}</Text>
-                  </View>
-                )}
-
-                {foodInsights.tips && foodInsights.tips.length > 0 && (
-                  <View style={styles.foodDetailSection}>
-                    <Text style={styles.foodDetailSectionTitle}>Tips</Text>
-                    {foodInsights.tips.map((tip, idx) => (
-                      <View key={idx} style={styles.foodDetailTip}>
-                        <Text style={styles.foodDetailTipBullet}>•</Text>
-                        <Text style={styles.foodDetailTipText}>{tip}</Text>
-                      </View>
-                    ))}
-                  </View>
-                )}
-              </>
-            ) : null}
-          </ScrollView>
-        )}
 
         {activeTab === "insights" && (
           <View style={styles.insightsPlaceholder}>

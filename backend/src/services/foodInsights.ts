@@ -7,6 +7,9 @@ export type FoodInsightsRequest = {
   quantity: number;
   unit: string;
   grams: number;
+  mealType?: string; // e.g., "breakfast", "lunch", "dinner", "snack"
+  userGoal?: string; // e.g., "reduce_cholesterol_maintain_weight"
+  otherFoodsToday?: Array<{ name: string; mealType?: string }>; // Other foods logged today
 };
 
 export type FoodInsightsResponse = {
@@ -110,11 +113,23 @@ export const getFoodInsights = async (
     "2. 1-5 actionable tips specific to this food (e.g., timing, pairing, preparation, portion control)",
     "3. A health quotient score (0-100) based on nutritional density, processing level, and overall healthfulness",
     "",
-    "Tips should be specific and actionable. Examples:",
-    "- For coffee: 'Try not to drink after 2 pm to avoid sleep disruption'",
-    "- For iron-rich foods: 'Pair with vitamin C sources for better absorption'",
-    "- For high-fiber foods: 'Drink plenty of water to aid digestion'",
-    "- For high-sodium foods: 'Balance with potassium-rich foods throughout the day'",
+    "IMPORTANT CONTEXT TO CONSIDER:",
+    "- User's goal: reduce cholesterol and maintain weight (Male, 44 years, 73kg)",
+    "- Meal timing: Consider when the food is being consumed (breakfast vs dinner matters)",
+    "- Other foods logged today: Check if the user has already paired foods well or needs suggestions",
+    "",
+    "Tips should be specific and contextual:",
+    "- If the food is typically paired with something (e.g., oats with berries/chia), check if user already had those today. If yes, compliment them!",
+    "- For coffee/caffeine: Consider meal timing - 'Try not to drink after 2 pm' is more relevant for breakfast coffee than dinner",
+    "- For cholesterol reduction goal: Suggest foods that help lower cholesterol, mention if current food supports this goal",
+    "- If user already paired foods well (e.g., oats + berries + chia), acknowledge and compliment their good choices",
+    "- Consider meal context: Breakfast foods vs dinner foods have different timing considerations",
+    "",
+    "Examples of contextual tips:",
+    "- 'Great choice pairing oats with berries and chia seeds - this combination provides fiber and omega-3s that support heart health!' (if user already had those)",
+    "- 'Oats pair well with berries and chia seeds for added fiber and omega-3s' (if user hasn't had those yet)",
+    "- 'Since this is breakfast, try not to have coffee after 2 pm if you plan to have more later'",
+    "- 'This food is low in saturated fat, which supports your goal of reducing cholesterol'",
     "",
     "Health quotient guidelines:",
     "- 80-100: Excellent nutritional profile, whole/unprocessed foods",
@@ -122,7 +137,6 @@ export const getFoodInsights = async (
     "- 40-59: Moderate nutritional value, may be processed or high in certain nutrients",
     "- 0-39: Lower nutritional value, highly processed, or high in negative factors",
     "",
-    "Consider the user's profile: Male, 44 years, 73kg, goal: reduce cholesterol and maintain weight.",
     "Return only JSON that matches the provided schema."
   ].join(" ");
 
@@ -140,11 +154,24 @@ export const getFoodInsights = async (
     request.nutrients.magnesium_mg > 0 ? `Magnesium: ${Math.round(request.nutrients.magnesium_mg)}mg` : null,
   ].filter(Boolean).join(", ");
 
+  const contextParts = [];
+  if (request.mealType) {
+    contextParts.push(`Meal: ${request.mealType}`);
+  }
+  if (request.userGoal) {
+    contextParts.push(`User's goal: ${request.userGoal}`);
+  }
+  if (request.otherFoodsToday && request.otherFoodsToday.length > 0) {
+    const foodsList = request.otherFoodsToday.map(f => f.name).join(", ");
+    contextParts.push(`Other foods logged today: ${foodsList}`);
+  }
+
   const userMessage = `Food: ${request.foodName}
 Quantity: ${request.quantity} ${request.unit} (${Math.round(request.grams)}g)
 Nutrition per serving: ${nutrientsSummary}
+${contextParts.length > 0 ? `\nContext:\n${contextParts.join("\n")}` : ""}
 
-Provide insights, tips, and health quotient for this food item.`;
+Provide insights, tips, and health quotient for this food item. Consider the context provided - if the user has already paired foods well, compliment them. If this is breakfast, consider timing tips. If the user's goal is to reduce cholesterol, mention how this food supports that goal.`;
 
   try {
     const response = await client.responses.create({
