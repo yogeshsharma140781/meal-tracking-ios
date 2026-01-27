@@ -6,6 +6,7 @@ import { hasOpenAi, parseMealWithAi } from "../services/aiNutrition";
 import { NutritionCalculator } from "../services/nutritionCalculator";
 import { AttributionEngine } from "../services/attributionEngine";
 import { NutrientTotals, emptyTotals } from "../utils/types";
+import { getFoodInsights } from "../services/foodInsights";
 
 export const mealsRouter = Router();
 
@@ -414,4 +415,27 @@ mealsRouter.get("/days/:day/nutrients", async (req, res) => {
     nutrients: dayRes.rows[0] || emptyTotals(),
     attribution: attributionRes.rows
   });
+});
+
+mealsRouter.post("/food-insights", async (req, res) => {
+  try {
+    const { foodName, nutrients, quantity, unit, grams } = req.body;
+
+    if (!foodName || !nutrients) {
+      return res.status(400).json({ error: "foodName and nutrients are required" });
+    }
+
+    const insights = await getFoodInsights({
+      foodName: String(foodName),
+      nutrients: nutrients as NutrientTotals,
+      quantity: Number(quantity) || 1,
+      unit: String(unit) || "serving",
+      grams: Number(grams) || 100
+    });
+
+    return res.json(insights);
+  } catch (error) {
+    console.error("Failed to get food insights:", error);
+    return res.status(500).json({ error: "failed to get food insights" });
+  }
 });
