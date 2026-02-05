@@ -117,3 +117,10 @@ create table if not exists nutrient_attribution (
   meal_item_id uuid references meal_items(id),
   amount numeric not null
 );
+
+create table if not exists feedback (
+  id uuid primary key,
+  rating smallint not null check (rating >= 1 and rating <= 5),
+  text text,
+  created_at timestamptz not null default now()
+);

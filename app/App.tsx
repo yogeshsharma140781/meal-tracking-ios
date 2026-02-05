@@ -18,9 +18,223 @@ import {
   Easing
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import * as Print from "expo-print";
-import * as FileSystem from "expo-file-system/legacy";
-import * as Sharing from "expo-sharing";
+import { SubscriptionProvider, useSubscription } from "./SubscriptionContext";
+
+// Lazy-load Skia only when Analysis tab is shown (avoids "App entry not found" at startup)
+const RING_SIZE = 112;
+const RING_STROKE = 8;
+
+function CircularProgressRing({ progress, value }: { progress: number; value: number }) {
+  const [SkiaModule, setSkiaModule] = useState<{
+    Canvas: React.ComponentType<any>;
+    Path: React.ComponentType<any>;
+    Group: React.ComponentType<any>;
+    ringPath: unknown;
+  } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    import("@shopify/react-native-skia").then((mod) => {
+      if (cancelled) return;
+      const oval = mod.Skia.XYWHRect(RING_STROKE / 2, RING_STROKE / 2, RING_SIZE - RING_STROKE, RING_SIZE - RING_STROKE);
+      const p = mod.Skia.Path.Make();
+      p.addArc(oval, -90, 360);
+      setSkiaModule({ Canvas: mod.Canvas, Path: mod.Path, Group: mod.Group, ringPath: p });
+    }).catch(() => {
+      if (!cancelled) setSkiaModule(null);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const safeProgress = Math.min(1, Math.max(0, Number.isFinite(progress) ? progress : 0));
+  const displayValue = Math.round(Number.isFinite(value) ? value : 0);
+
+  if (SkiaModule) {
+    const { Canvas, Path, Group, ringPath } = SkiaModule;
+    return (
+      <View
+        style={{ width: RING_SIZE, height: RING_SIZE, position: "relative" }}
+        pointerEvents="none"
+      >
+        <Canvas style={{ width: RING_SIZE, height: RING_SIZE }}>
+          <Group style="stroke" strokeWidth={RING_STROKE} color="#E5E7EB">
+            <Path path={ringPath} />
+          </Group>
+          {safeProgress > 0.001 && (
+            <Group style="stroke" strokeWidth={RING_STROKE} color="#2563EB" strokeCap="round">
+              <Path path={ringPath} start={0} end={safeProgress} />
+            </Group>
+          )}
+        </Canvas>
+        <View style={[StyleSheet.absoluteFillObject, { justifyContent: "center", alignItems: "center" }]} pointerEvents="none">
+          <Text style={{ fontSize: 15, fontWeight: "800", color: "#111827" }}>{displayValue}</Text>
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.analysisMacroRingWrap} pointerEvents="none">
+      <View style={styles.analysisMacroProgressBar}>
+        <View style={[styles.analysisMacroProgressFill, { width: `${Math.min(100, safeProgress * 100)}%` }]} />
+      </View>
+      <View style={styles.analysisMacroRingCenter}>
+        <Text style={styles.analysisMacroRingValue}>{displayValue}</Text>
+      </View>
+    </View>
+  );
+}
+
+// Wheel Picker Component
+const ITEM_HEIGHT = 50;
+const VISIBLE_ITEMS = 5;
+
+type WheelPickerProps = {
+  items: Array<{ label: string; value: string }>;
+  selectedValue: string;
+  onValueChange: (value: string) => void;
+  style?: any;
+};
+
+const WheelPicker: React.FC<WheelPickerProps> = ({
+  items,
+  selectedValue,
+  onValueChange,
+  style
+}) => {
+  const scrollViewRef = useRef<ScrollView>(null);
+  const [selectedIndex, setSelectedIndex] = useState(() => {
+    const index = items.findIndex((item) => item.value === selectedValue);
+    return index >= 0 ? index : 0;
+  });
+
+  useEffect(() => {
+    const index = items.findIndex((item) => item.value === selectedValue);
+    if (index >= 0) {
+      setSelectedIndex(index);
+      // Use setTimeout to ensure ScrollView is rendered
+      setTimeout(() => {
+        scrollViewRef.current?.scrollTo({
+          y: index * ITEM_HEIGHT,
+          animated: false
+        });
+      }, 100);
+    }
+  }, [selectedValue, items]);
+
+  // Initial scroll on mount
+  useEffect(() => {
+    const index = items.findIndex((item) => item.value === selectedValue);
+    if (index >= 0) {
+      setTimeout(() => {
+        scrollViewRef.current?.scrollTo({
+          y: index * ITEM_HEIGHT,
+          animated: false
+        });
+      }, 200);
+    }
+  }, []);
+
+  const handleScroll = (event: any) => {
+    const y = event.nativeEvent.contentOffset.y;
+    const index = Math.round(y / ITEM_HEIGHT);
+    const clampedIndex = Math.max(0, Math.min(index, items.length - 1));
+    if (clampedIndex !== selectedIndex) {
+      setSelectedIndex(clampedIndex);
+      onValueChange(items[clampedIndex].value);
+    }
+  };
+
+  const handleMomentumScrollEnd = (event: any) => {
+    const y = event.nativeEvent.contentOffset.y;
+    const index = Math.round(y / ITEM_HEIGHT);
+    const clampedIndex = Math.max(0, Math.min(index, items.length - 1));
+    const targetY = clampedIndex * ITEM_HEIGHT;
+    
+    // Only snap if we're not already at the target position
+    if (Math.abs(y - targetY) > 1) {
+      scrollViewRef.current?.scrollTo({
+        y: targetY,
+        animated: true
+      });
+    }
+    
+    if (clampedIndex !== selectedIndex) {
+      setSelectedIndex(clampedIndex);
+      onValueChange(items[clampedIndex].value);
+    }
+  };
+
+  return (
+    <View style={[styles.wheelPickerContainer, style]}>
+      <View style={styles.wheelPickerSelection} pointerEvents="none" />
+      <ScrollView
+        ref={scrollViewRef}
+        style={styles.wheelPickerScroll}
+        contentContainerStyle={styles.wheelPickerContent}
+        showsVerticalScrollIndicator={false}
+        snapToInterval={ITEM_HEIGHT}
+        decelerationRate="fast"
+        onScroll={handleScroll}
+        onMomentumScrollEnd={handleMomentumScrollEnd}
+        scrollEventThrottle={16}
+        nestedScrollEnabled={true}
+        bounces={false}
+        scrollEnabled={true}
+      >
+        {items.map((item, index) => {
+          const distance = Math.abs(index - selectedIndex);
+          const opacity = distance === 0 ? 1 : Math.max(0.3, 1 - distance * 0.2);
+          const scale = distance === 0 ? 1 : Math.max(0.8, 1 - distance * 0.1);
+          return (
+            <View
+              key={item.value}
+              style={[
+                styles.wheelPickerItem,
+                { opacity, transform: [{ scale }] }
+              ]}
+            >
+              <Text style={styles.wheelPickerItemText}>{item.label}</Text>
+            </View>
+          );
+        })}
+      </ScrollView>
+    </View>
+  );
+};
+
+// Collapsible Field Component
+type CollapsibleFieldProps = {
+  label: string;
+  value: string;
+  isExpanded: boolean;
+  onPress: () => void;
+  children: React.ReactNode;
+};
+
+const CollapsibleField: React.FC<CollapsibleFieldProps> = ({
+  label,
+  value,
+  isExpanded,
+  onPress,
+  children
+}) => {
+  return (
+    <View style={styles.collapsibleFieldContainer}>
+      <View style={styles.collapsibleFieldRow}>
+        <Text style={styles.collapsibleFieldLabel}>{label}</Text>
+        <TouchableOpacity style={styles.collapsibleFieldValue} onPress={onPress}>
+          <Text style={styles.collapsibleFieldValueText}>{value}</Text>
+        </TouchableOpacity>
+      </View>
+      {isExpanded && (
+        <View style={styles.collapsibleFieldExpanded}>
+          {children}
+        </View>
+      )}
+    </View>
+  );
+};
 
 // For local testing, use: http://YOUR_MAC_IP:4000/v1
 // For production, use: https://meal-tracking-api.onrender.com/v1
@@ -45,10 +259,13 @@ type NutrientTotals = {
 };
 
 type UserProfile = {
-  sex: "male" | "female";
-  age: number;
-  weightKg: number;
-  goal: "reduce_cholesterol_maintain_weight";
+  dateOfBirth: string | null; // YYYY-MM-DD format
+  genderAtBirth: "male" | "female" | null;
+  heightCm: number | null;
+  heightUnit: "cm" | "in";
+  weightKg: number | null;
+  goal: string | null;
+  activityLevel: "low" | "medium" | "high" | null;
 };
 
 type MealResponse = {
@@ -93,6 +310,22 @@ const sumTotals = (a: NutrientTotals, b: NutrientTotals): NutrientTotals => ({
   vitamin_a_mcg: (a.vitamin_a_mcg ?? 0) + (b.vitamin_a_mcg ?? 0)
 });
 
+const scaleTotals = (t: NutrientTotals, factor: number): NutrientTotals => ({
+  calories_kcal: t.calories_kcal * factor,
+  protein_g: t.protein_g * factor,
+  carbs_g: t.carbs_g * factor,
+  fat_g: t.fat_g * factor,
+  fiber_g: (t.fiber_g ?? 0) * factor,
+  sodium_mg: (t.sodium_mg ?? 0) * factor,
+  cholesterol_mg: (t.cholesterol_mg ?? 0) * factor,
+  omega_3_g: (t.omega_3_g ?? 0) * factor,
+  potassium_mg: (t.potassium_mg ?? 0) * factor,
+  vitamin_d_iu: (t.vitamin_d_iu ?? 0) * factor,
+  magnesium_mg: (t.magnesium_mg ?? 0) * factor,
+  vitamin_c_mg: (t.vitamin_c_mg ?? 0) * factor,
+  vitamin_a_mcg: (t.vitamin_a_mcg ?? 0) * factor
+});
+
 const subtractTotals = (
   a: NutrientTotals,
   b: NutrientTotals
@@ -117,26 +350,369 @@ const stripParenthetical = (value: string) => value.replace(/\s*\([^)]*\)\s*/g, 
 const capitalizeFirst = (value: string) =>
   value.length === 0 ? "" : value.charAt(0).toUpperCase() + value.slice(1);
 
+/** Convert health quotient (0-100) to descriptive level and color */
+const getHealthQuotientLevel = (score: number): { label: string; color: string } => {
+  if (score >= 80) return { label: "Excellent", color: "#22C55E" };
+  if (score >= 65) return { label: "Very Good", color: "#84CC16" };
+  if (score >= 50) return { label: "Good", color: "#EAB308" };
+  if (score >= 35) return { label: "Fair", color: "#F97316" };
+  return { label: "Poor", color: "#EF4444" };
+};
+const normalizeFoodNameForKey = (name: string) =>
+  stripParenthetical(name).trim().toLowerCase();
+
+// Normalize plural/singular forms to singular for deduplication
+const normalizePlural = (text: string): string => {
+  // Common plural endings: s, es, ies, ves
+  // Convert to singular
+  if (text.endsWith("ies") && text.length > 3) {
+    // e.g., "berries" -> "berry"
+    return text.slice(0, -3) + "y";
+  }
+  if (text.endsWith("ves") && text.length > 3) {
+    // e.g., "leaves" -> "leaf"
+    const exceptions: Record<string, string> = {
+      leaves: "leaf",
+      knives: "knife",
+      lives: "life",
+      halves: "half",
+    };
+    if (exceptions[text]) return exceptions[text];
+  }
+  if (text.endsWith("es") && text.length > 2) {
+    const beforeEs = text.slice(0, -2);
+    // Only remove "es" if the word before it ends in ch, sh, s, x, z, or o
+    // These are words that genuinely add "es" for plural (e.g., "dishes", "boxes", "potatoes")
+    if (beforeEs.match(/[chshsxz]$/) || beforeEs.endsWith("o")) {
+      return beforeEs;
+    }
+    // For other words ending in "es", they might just be regular "s" plurals
+    // (e.g., "apples" -> "apple", not "appl"), so fall through to "s" removal
+  }
+  // Simple "s" ending: remove it (handles most regular plurals)
+  if (text.endsWith("s") && text.length > 1) {
+    return text.slice(0, -1);
+  }
+  return text;
+};
+
+// Normalize food name for deduplication: lowercase, trim, normalize spaces, handle plurals
+const normalizeFoodNameForDedup = (name: string): string => {
+  const cleaned = stripParenthetical(name)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " "); // Normalize multiple spaces to single space
+  
+  // Split into words and normalize each word's plural form
+  const words = cleaned.split(" ");
+  const normalizedWords = words.map((word) => normalizePlural(word));
+  return normalizedWords.join(" ");
+};
+
+// Get canonical version (properly capitalized) from normalized key
+const getCanonicalFoodName = (name: string): string => {
+  return capitalizeFirst(stripParenthetical(name).trim());
+};
+
+/** Unit to grams for volume measures (approximate) */
+const UNIT_TO_GRAMS: Record<string, number> = {
+  cup: 240, cups: 240,
+  tbsp: 15, tablespoon: 15, tablespoons: 15,
+  tsp: 5, teaspoon: 5, teaspoons: 5,
+  ml: 1, mls: 1, milliliter: 1, milliliters: 1,
+  l: 1000, liter: 1000, liters: 1000,
+  oz: 30, floz: 30,
+  piece: 50, pieces: 50, serving: 100, servings: 100,
+  slice: 30, slices: 30
+};
+
+/**
+ * Calculate similarity score between two strings (0-1, higher = more similar).
+ * Uses a simple approach: checks word overlap and string containment.
+ */
+function calculateSimilarity(input: string, candidate: string): number {
+  const inputWords = input.toLowerCase().split(/\s+/);
+  const candidateWords = candidate.toLowerCase().split(/\s+/);
+  
+  // Exact match gets highest score
+  if (input.toLowerCase() === candidate.toLowerCase()) return 1.0;
+  
+  // Check if input is contained in candidate or vice versa
+  if (candidate.toLowerCase().includes(input.toLowerCase())) return 0.9;
+  if (input.toLowerCase().includes(candidate.toLowerCase())) return 0.85;
+  
+  // Calculate word overlap
+  const inputSet = new Set(inputWords);
+  const candidateSet = new Set(candidateWords);
+  let matchingWords = 0;
+  inputSet.forEach(word => {
+    if (candidateSet.has(word)) matchingWords++;
+  });
+  
+  // Score based on proportion of matching words
+  const overlapRatio = matchingWords / Math.max(inputWords.length, candidateWords.length);
+  return overlapRatio * 0.8; // Cap at 0.8 for word-based matching
+}
+
+/**
+ * Find best fuzzy match for a food name in known foods.
+ * Returns the canonical name if similarity > threshold, otherwise null.
+ */
+function findFuzzyMatch(
+  foodName: string,
+  nameToCanonical: Map<string, string>,
+  threshold: number = 0.7
+): string | null {
+  let bestMatch: string | null = null;
+  let bestScore = threshold;
+  
+  // First try exact normalized match
+  const normalizedInput = normalizeFoodNameForDedup(foodName);
+  if (normalizedInput && nameToCanonical.has(normalizedInput)) {
+    return nameToCanonical.get(normalizedInput) || null;
+  }
+  
+  // Fuzzy search through all candidates
+  for (const [normalizedKey, canonical] of nameToCanonical.entries()) {
+    const score = calculateSimilarity(foodName, canonical);
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = canonical;
+    }
+  }
+  
+  return bestMatch;
+}
+
+/**
+ * Try to resolve food text from known foods + nutrients cache.
+ * Returns MealItem[] if all lines can be resolved, null otherwise.
+ */
+function resolveFromKnownFoods(
+  text: string,
+  knownFoods: string[],
+  foodNutrients: Record<string, NutrientTotals>
+): MealItem[] | null {
+  const lines = text.split(/[\n,]/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return null;
+  const nameToCanonical = new Map<string, string>();
+  knownFoods.forEach((name) => {
+    const key = normalizeFoodNameForDedup(name);
+    if (key) nameToCanonical.set(key, name);
+  });
+  const items: MealItem[] = [];
+  for (const line of lines) {
+    const parsed = parseFoodLine(line, nameToCanonical, foodNutrients);
+    if (!parsed) return null;
+    items.push(parsed);
+  }
+  return items.length > 0 ? items : null;
+}
+
+function parseFoodLine(
+  line: string,
+  nameToCanonical: Map<string, string>,
+  foodNutrients: Record<string, NutrientTotals>
+): MealItem | null {
+  const lower = line.trim().toLowerCase();
+  if (!lower) return null;
+  let grams = 0;
+  let unit = "g";
+  let foodPart = lower;
+  // Match "50g oatmeal" or "oatmeal 50g" or "50 g oatmeal" or "oatmeal 50 g"
+  const gMatch = lower.match(/^(\d+(?:\.\d+)?)\s*g\s+(.+)$|^(.+?)\s+(\d+(?:\.\d+)?)\s*g\s*$/i);
+  if (gMatch) {
+    const num = parseFloat(gMatch[1] || gMatch[4]);
+    foodPart = (gMatch[2] || gMatch[3] || "").trim();
+    if (foodPart && !Number.isNaN(num) && num > 0) {
+      grams = num;
+      unit = "g";
+    }
+  } else {
+    const mlMatch = lower.match(/^(\d+(?:\.\d+)?)\s*ml\s+(.+)$|^(.+?)\s+(\d+(?:\.\d+)?)\s*ml\s*$/i);
+    if (mlMatch) {
+      const num = parseFloat(mlMatch[1] || mlMatch[4]);
+      foodPart = (mlMatch[2] || mlMatch[3] || "").trim();
+      if (foodPart && !Number.isNaN(num) && num > 0) {
+        grams = num;
+        unit = "ml";
+      }
+    } else {
+      const numUnitMatch = lower.match(/^(\d+(?:\.\d+)?)\s*(\w+)\s+(.+)$|^(.+?)\s+(\d+(?:\.\d+)?)\s*(\w+)\s*$/i);
+      if (numUnitMatch) {
+        const num = parseFloat(numUnitMatch[1] || numUnitMatch[5]);
+        const u = (numUnitMatch[2] || numUnitMatch[6] || "").toLowerCase();
+        foodPart = (numUnitMatch[3] || numUnitMatch[4] || "").trim();
+        const conv = UNIT_TO_GRAMS[u];
+        if (foodPart && !Number.isNaN(num) && num > 0 && conv !== undefined) {
+          grams = num * conv;
+          unit = u;
+        }
+      } else {
+        const numOnlyMatch = lower.match(/^(\d+(?:\.\d+)?)\s+(.+)$|^(.+?)\s+(\d+(?:\.\d+)?)\s*$/);
+        if (numOnlyMatch) {
+          const num = parseFloat(numOnlyMatch[1] || numOnlyMatch[4]);
+          foodPart = (numOnlyMatch[2] || numOnlyMatch[3] || "").trim();
+          if (foodPart && !Number.isNaN(num) && num > 0) {
+            if (num < 10) {
+              grams = num * 50;
+              unit = num === 1 ? "piece" : "pieces";
+            } else {
+              grams = num;
+              unit = "g";
+            }
+          }
+        }
+      }
+    }
+  }
+  // If no explicit quantity was parsed, choose a reasonable default.
+  // For supplements (tablet, capsule, pill), assume ~1 piece instead of 100 g.
+  if (!grams || grams <= 0) {
+    const isSupplement = /\b(tablet|tab|capsule|caps|pill|softgel)\b/i.test(foodPart);
+    if (isSupplement) {
+      grams = 1;
+      unit = "piece";
+    } else {
+      grams = 100;
+      unit = "g";
+    }
+  }
+
+  // Try exact match first
+  let normalizedKey = normalizeFoodNameForDedup(foodPart);
+  let canonical = normalizedKey ? nameToCanonical.get(normalizedKey) : null;
+  
+  // If no exact match, try fuzzy matching
+  if (!canonical) {
+    canonical = findFuzzyMatch(foodPart, nameToCanonical, 0.7);
+    if (canonical) {
+      normalizedKey = normalizeFoodNameForDedup(canonical);
+    }
+  }
+  
+  if (!canonical || !normalizedKey) return null;
+  const nutrientsPer100g = foodNutrients[normalizedKey];
+  if (!nutrientsPer100g) return null;
+  const scale = grams / 100;
+  const nutrients = scaleTotals(nutrientsPer100g, scale);
+  const quantity = unit === "g" || unit === "ml" ? grams : Math.round(grams / (UNIT_TO_GRAMS[unit] ?? 100));
+  return {
+    id: `cache-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    name: canonical,
+    quantity,
+    unit,
+    grams,
+    nutrients
+  };
+}
+
 /** Fixed spacing between top header and content on all screens */
 const HEADER_TO_CONTENT_GAP = 24;
 
 const defaultProfile: UserProfile = {
-  sex: "male",
-  age: 44,
-  weightKg: 73,
-  goal: "reduce_cholesterol_maintain_weight"
+  dateOfBirth: null,
+  genderAtBirth: null,
+  heightCm: null,
+  heightUnit: "cm",
+  weightKg: null,
+  goal: null,
+  activityLevel: null
+};
+
+const getAgeFromDOB = (dob: string | null): number | null => {
+  if (!dob) return null;
+  const birthDate = new Date(dob);
+  const today = new Date();
+  let age = today.getFullYear() - birthDate.getFullYear();
+  const monthDiff = today.getMonth() - birthDate.getMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+    age--;
+  }
+  return age;
 };
 
 const getMacroTargets = (profile: UserProfile) => {
-  if (profile.sex === "male" && profile.age === 44 && profile.weightKg === 73) {
+  // Calculate BMR using Mifflin-St Jeor Equation
+  const calculateBMR = (weightKg: number, heightCm: number, age: number, isMale: boolean): number => {
+    if (isMale) {
+      return 10 * weightKg + 6.25 * heightCm - 5 * age + 5;
+    } else {
+      return 10 * weightKg + 6.25 * heightCm - 5 * age - 161;
+    }
+  };
+
+  // Activity multipliers: use mid-range, not upper end (so targets aren't at the high end)
+  const activityMultipliers = {
+    low: 1.1,      // mid of sedentary range (1.0–1.2)
+    medium: 1.4,   // mid of moderately active (1.3–1.55)
+    high: 1.6     // mid of very active (1.55–1.725)
+  };
+
+  // Default values if profile incomplete
+  const age = profile.dateOfBirth ? getAgeFromDOB(profile.dateOfBirth) : 44;
+  const weightKg = profile.weightKg ?? 73;
+  const heightCm = profile.heightCm ?? 175;
+  const isMale = profile.genderAtBirth === "male";
+  const activityLevel = profile.activityLevel ?? "medium";
+  const multiplier = activityMultipliers[activityLevel] ?? 1.4;
+
+  if (age && weightKg && heightCm) {
+    const bmr = calculateBMR(weightKg, heightCm, age, isMale);
+    let tdee = bmr * multiplier;
+
+    // Adjust calories based on goal
+    if (profile.goal === "weight_loss") {
+      tdee = tdee * 0.85; // 15% deficit
+    } else if (profile.goal === "weight_gain") {
+      tdee = tdee * 1.15; // 15% surplus
+    } else if (profile.goal === "muscle_gain") {
+      tdee = tdee * 1.1; // 10% surplus
+    } else if (
+      profile.goal === "maintain_weight" ||
+      profile.goal === "reduce_cholesterol" ||
+      profile.goal === "reduce_cholesterol_maintain_weight"
+    ) {
+      // Use the middle of the recommended range instead of the upper end
+      // Slight 10% reduction keeps calories on the lower / mid side
+      tdee = tdee * 0.9;
+    }
+
+    // Round calories to the nearest 100 (e.g. 2297 → 2300)
+    const calories = Math.round(tdee / 100) * 100;
+
+    // Protein: use slightly lower target for maintenance / health‑focused goals,
+    // higher for muscle gain or weight loss.
+    let proteinPerKg: number;
+    if (profile.goal === "muscle_gain") {
+      proteinPerKg = 2.0;          // higher end for building muscle
+    } else if (profile.goal === "weight_loss") {
+      proteinPerKg = 1.6;          // support satiety and lean mass
+    } else {
+      // maintain_weight, reduce_cholesterol, reduce_cholesterol_maintain_weight,
+      // heart_health, diabetes_management, or unspecified
+      proteinPerKg = 1.3;          // mid‑range, not the high end
+    }
+
+    let protein_g = weightKg * proteinPerKg;
+    let fat_g = calories * 0.25 / 9; // 25% of calories from fat
+    let carbs_g = (calories - (protein_g * 4) - (fat_g * 9)) / 4;
+
+    // Round macros to practical numbers (nearest 5 g)
+    const roundTo5 = (x: number) => Math.max(0, Math.round(x / 5) * 5);
+    protein_g = roundTo5(protein_g);
+    fat_g = roundTo5(fat_g);
+    carbs_g = roundTo5(carbs_g);
+
     return {
-      calories_kcal: 2600,
-      protein_g: 90,
-      carbs_g: 100,
-      fat_g: 85
+      calories_kcal: calories,
+      protein_g: protein_g,
+      carbs_g: carbs_g,
+      fat_g: fat_g
     };
   }
 
+  // Fallback to defaults
   return {
     calories_kcal: 2400,
     protein_g: 80,
@@ -145,16 +721,21 @@ const getMacroTargets = (profile: UserProfile) => {
   };
 };
 
-const macroTargets = getMacroTargets(defaultProfile);
-
-const nutritionSummary = [
-  { label: "Calories", target: `(${macroTargets.calories_kcal})` },
-  { label: "Proteins", target: `(${macroTargets.protein_g}g)` },
-  { label: "Carbs", target: `(${macroTargets.carbs_g}g)` },
-  { label: "Fats", target: `(${macroTargets.fat_g}g)` }
-];
+// nutritionSummary and macroNutrients are now computed dynamically based on userProfile
 
 const STORAGE_KEY = "@mealtracking_dataByDate";
+const PROFILE_STORAGE_KEY = "@mealtracking_userProfile";
+const YESTERDAY_INSIGHT_DISMISSED_KEY = "@mealtracking_yesterdayInsightDismissed";
+const FOOD_SUGGESTIONS_KEY = "@mealtracking_foodSuggestions";
+const FOOD_NUTRIENTS_KEY = "@mealtracking_foodNutrients";
+const FOOD_OVERRIDES_KEY = "@mealtracking_foodOverrides";
+const MEAL_TEMPLATES_KEY = "@mealtracking_mealTemplates";
+
+type MealTemplate = {
+  id: string;
+  name: string;
+  items: string[]; // Array of food item names
+};
 
 // Estimate Vitamin C and A based on item name (for migration of existing data)
 const estimateVitaminsFromName = (
@@ -314,6 +895,44 @@ const formatHeaderLabel = (dateKey: string): string => {
   return `${mon}, ${jan} ${d.getDate()}`;
 };
 
+const INSIGHT_TIP_BAR_COLORS = { positive: "#00C853", improvement: "#FF9800" } as const;
+
+/** Renders a tip with a colored vertical bar (green = positive, orange = improvement) and bold first phrase. */
+const renderInsightTip = (tip: InsightTip, key: number, itemStyle: object) => {
+  const { text, type } = tip;
+  const barColor = INSIGHT_TIP_BAR_COLORS[type];
+  const emDash = text.indexOf("—");
+  const spaceHyphen = text.indexOf(" - ");
+  let splitAt = -1;
+  let sepLen = 0;
+  if (emDash >= 0 && (spaceHyphen < 0 || emDash < spaceHyphen)) {
+    splitAt = emDash;
+    sepLen = 1;
+  } else if (spaceHyphen >= 0) {
+    splitAt = spaceHyphen;
+    sepLen = 3;
+  }
+  const beforeHyphen = splitAt >= 0 ? text.slice(0, splitAt).trim() : "";
+  const afterHyphen = splitAt >= 0 ? text.slice(splitAt + sepLen).trim() : "";
+  const separator = sepLen === 1 ? "— " : " - ";
+  const textContent = splitAt < 0
+    ? <Text style={itemStyle} selectable>{text}</Text>
+    : (
+        <Text style={itemStyle} selectable>
+          <Text style={[itemStyle, { fontWeight: "bold" }]} selectable>{beforeHyphen}</Text>
+          {afterHyphen ? separator + afterHyphen : ""}
+        </Text>
+      );
+  return (
+    <View key={key} style={styles.insightsTipRow}>
+      <View style={[styles.insightsTipBar, { backgroundColor: barColor }]} />
+      <View style={styles.insightsTipTextWrap}>
+        {textContent}
+      </View>
+    </View>
+  );
+};
+
 type MealItem = {
   id: string;
   name: string;
@@ -348,11 +967,7 @@ const MEAL_ICON_GRAYSCALE = require("./assets/meal-icon-grayscale.png");
 // Loading screen SVG - will be loaded from file
 type TabId = "meals" | "analysis" | "insights";
 
-const ANALYSIS_MACROS = [
-  { key: "protein_g" as const, label: "Protein", unit: "g", target: macroTargets.protein_g },
-  { key: "carbs_g" as const, label: "Carbs", unit: "g", target: macroTargets.carbs_g },
-  { key: "fat_g" as const, label: "Fat", unit: "g", target: macroTargets.fat_g }
-];
+// ANALYSIS_MACROS is now computed dynamically based on userProfile
 
 type MicroKey =
   | "fiber_g"
@@ -452,6 +1067,440 @@ function getMicroTotalsFromItems(
   return out;
 }
 
+/**
+ * Convert stored micro value to display unit for UI/target comparison.
+ * Only omega_3_g is stored in g but displayed in mg; all others use same unit.
+ */
+function microDisplayValue(key: MicroKey | undefined, value: number, unit: string): number {
+  if (!key) return value;
+  switch (key) {
+    case "omega_3_g":
+      return unit === "mg" ? value * 1000 : value;
+    case "fiber_g":
+    case "sodium_mg":
+    case "cholesterol_mg":
+    case "potassium_mg":
+    case "vitamin_d_iu":
+    case "magnesium_mg":
+    case "vitamin_c_mg":
+    case "vitamin_a_mcg":
+    default:
+      return value;
+  }
+}
+
+function dayHasMeals(dayData: DayData): boolean {
+  const { meals, mealItems } = dayData;
+  for (const meal of meals) {
+    if (meal.nutrients.calories_kcal > 0) return true;
+    const items = mealItems[meal.id] ?? [];
+    if (items.length > 0) return true;
+  }
+  return false;
+}
+
+function getPastDatesWithMeals(
+  dataByDate: Record<string, DayData>,
+  todayKey: string
+): string[] {
+  const out: string[] = [];
+  for (const dateKey of Object.keys(dataByDate)) {
+    if (dateKey >= todayKey) continue;
+    const d = dataByDate[dateKey];
+    if (d && dayHasMeals(d)) out.push(dateKey);
+  }
+  out.sort((a, b) => b.localeCompare(a));
+  return out;
+}
+
+type InsightTip = { text: string; type: "positive" | "improvement" };
+type InsightResult = { summary: string; tips: InsightTip[] };
+
+function getDayInsights(
+  dayData: DayData,
+  userProfile: UserProfile
+): InsightResult {
+  const { meals, mealItems } = dayData;
+  const totals = meals.reduce((acc, m) => sumTotals(acc, m.nutrients), emptyTotals());
+  const microTotals = getMicroTotalsFromItems(mealItems);
+  const targets = getMacroTargets(userProfile);
+  const mealsLogged: string[] = [];
+  for (const meal of meals) {
+    const items = mealItems[meal.id] ?? [];
+    if (items.length > 0 || meal.nutrients.calories_kcal > 0) {
+      mealsLogged.push(meal.label);
+    }
+  }
+  const fiber = microTotals.fiber_g ?? 0;
+  const sodium = microTotals.sodium_mg ?? 0;
+  const omega3Mg = (microTotals.omega_3_g ?? 0) * 1000;
+
+  // Build concise, high-level summary (no detailed numbers, date-agnostic)
+  let summary = "";
+  if (mealsLogged.length > 0) {
+    summary = `You logged ${mealsLogged.length} meal${mealsLogged.length !== 1 ? "s" : ""} (${mealsLogged.join(", ")}).`;
+  } else {
+    summary = "You started tracking—nice first step.";
+  }
+
+  // Add qualitative assessment without repeating exact numbers
+  if (targets.calories_kcal > 0 && totals.calories_kcal > 0) {
+    const calRatio = totals.calories_kcal / targets.calories_kcal;
+    if (calRatio >= 0.85 && calRatio <= 1.15) {
+      summary += " Your overall calories were close to your daily target—great balance.";
+    } else if (calRatio > 1.15) {
+      summary += " Calories were a bit above your usual target.";
+    } else {
+      summary += " Calories were somewhat below your usual target.";
+    }
+  }
+
+  if (targets.protein_g > 0 && totals.protein_g > 0) {
+    const proteinRatio = totals.protein_g / targets.protein_g;
+    if (proteinRatio >= 0.9) {
+      summary += " Protein intake was strong for supporting your goals.";
+    } else if (proteinRatio >= 0.6) {
+      summary += " Protein was decent but could be a bit higher.";
+    }
+  }
+
+  // Tips with positive reinforcement (green) and constructive suggestions (orange)
+  const tips: InsightTip[] = [];
+
+  // Always start with positive reinforcement
+  tips.push({ text: "Great job logging your meals—this kind of consistency really helps long-term progress.", type: "positive" });
+
+  // Protein tips
+  if (targets.protein_g > 0 && totals.protein_g > 0) {
+    const proteinRatio = totals.protein_g / targets.protein_g;
+    if (proteinRatio >= 0.9) {
+      tips.push({ text: "Excellent protein intake today—keep including protein in each meal to support satiety and muscle maintenance.", type: "positive" });
+    } else if (proteinRatio >= 0.6) {
+      tips.push({ text: "You could add a small protein source (yogurt, eggs, lentils, nuts) to one of your meals for better balance.", type: "improvement" });
+    } else {
+      tips.push({ text: "Try anchoring each meal with a clear protein source (beans, tofu, fish, eggs, yogurt) for better satiety.", type: "improvement" });
+    }
+  }
+
+  // Calorie tips
+  if (targets.calories_kcal > 0 && totals.calories_kcal > 0) {
+    const calRatio = totals.calories_kcal / targets.calories_kcal;
+    if (calRatio > 1.15) {
+      tips.push({ text: "On higher-calorie days, balance things out with a lighter meal or extra movement tomorrow.", type: "improvement" });
+    } else if (calRatio < 0.7) {
+      tips.push({ text: "If you often eat below target, consider adding a balanced snack so energy stays steady throughout the day.", type: "improvement" });
+    }
+  }
+
+  // Fiber tips
+  if (fiber >= 20) {
+    tips.push({ text: "Nice fiber intake today—keep including fruits, veggies, and whole grains for gut and heart health.", type: "positive" });
+  } else if (fiber > 0 && fiber < 15 && totals.calories_kcal > 0) {
+    tips.push({ text: "Fiber was a bit low—more vegetables, fruits, beans, or whole grains would help gut and heart health.", type: "improvement" });
+  }
+
+  // Sodium tips
+  if (sodium > 2300) {
+    tips.push({ text: "Sodium leaned high today; using fewer packaged foods and more home-cooked meals can bring this down.", type: "improvement" });
+  }
+
+  // Omega-3 tips
+  if (omega3Mg > 0) {
+    tips.push({ text: "Good job adding some omega-3–rich foods or supplements today; they support heart and brain health.", type: "positive" });
+  }
+
+  // Goal-specific tips
+  const goal = userProfile.goal ?? "";
+  if ((goal.includes("cholesterol") || goal.includes("heart")) && totals.fat_g > 0) {
+    if (totals.fat_g > (targets.fat_g ?? 0) * 1.2) {
+      tips.push({ text: "For heart and cholesterol health, keep favoring unsaturated fats (nuts, seeds, fish, olive oil) over deep-fried or very creamy foods.", type: "improvement" });
+    } else {
+      tips.push({ text: "Your fat choices today look good for heart health—keep leaning on unsaturated fat sources.", type: "positive" });
+    }
+  }
+
+  // Meal timing tips
+  if (mealsLogged.length === 1) {
+    tips.push({ text: "Spreading intake across breakfast, lunch, and dinner can help keep energy and hunger more stable.", type: "improvement" });
+  }
+  if (!mealsLogged.some((m) => /breakfast/i.test(m))) {
+    tips.push({ text: "If mornings allow, a simple breakfast (fruit + yogurt, oats, eggs) can support focus and appetite control.", type: "improvement" });
+  }
+
+  // De-duplicate by text and limit
+  const seen = new Set<string>();
+  const uniqueTips = tips.filter((t) => {
+    if (seen.has(t.text)) return false;
+    seen.add(t.text);
+    return true;
+  }).slice(0, 6);
+
+  return { summary, tips: uniqueTips };
+}
+
+type BestInsight = {
+  affirmation: string;
+  category: string;
+  value: string;
+  message: string;
+} | null;
+
+function getBestInsightFromYesterday(
+  yesterdayData: DayData,
+  userProfile: UserProfile
+): BestInsight {
+  const { meals, mealItems } = yesterdayData;
+  const totals = meals.reduce((acc, m) => sumTotals(acc, m.nutrients), emptyTotals());
+  const microTotals = getMicroTotalsFromItems(mealItems);
+  const targets = getMacroTargets(userProfile);
+  
+  // Check if there are any meals logged
+  const mealsLogged: string[] = [];
+  for (const meal of meals) {
+    const items = mealItems[meal.id] ?? [];
+    if (items.length > 0 || meal.nutrients.calories_kcal > 0) {
+      mealsLogged.push(meal.label);
+    }
+  }
+  
+  if (mealsLogged.length === 0) {
+    return null; // No meals logged yesterday
+  }
+
+  // Priority: Protein > Calories on target > Fiber > Meal consistency
+  const insights: BestInsight[] = [];
+
+  // 1. Protein achievement (highest priority)
+  if (targets.protein_g > 0 && totals.protein_g > 0) {
+    const proteinRatio = totals.protein_g / targets.protein_g;
+    if (proteinRatio >= 0.9) {
+      insights.push({
+        affirmation: "Well done!",
+        category: "PROTEIN",
+        value: `${Math.round(totals.protein_g)}g`,
+        message: "EXCELLENT PROTEIN INTAKE! Keep including protein in each meal to support satiety and muscle maintenance."
+      });
+    } else if (proteinRatio >= 0.7) {
+      insights.push({
+        affirmation: "Making progress!",
+        category: "PROTEIN",
+        value: `${Math.round(totals.protein_g)}g`,
+        message: "Good protein intake yesterday. Adding a bit more protein to your meals can help with satiety and energy."
+      });
+    }
+  }
+
+  // 2. Calories on target
+  if (targets.calories_kcal > 0 && totals.calories_kcal > 0) {
+    const calRatio = totals.calories_kcal / targets.calories_kcal;
+    if (calRatio >= 0.85 && calRatio <= 1.15) {
+      insights.push({
+        affirmation: "Great balance!",
+        category: "CALORIES",
+        value: `${Math.round(totals.calories_kcal)}`,
+        message: "Your calories were right on target yesterday—this kind of consistency supports your goals."
+      });
+    }
+  }
+
+  // 3. Fiber achievement
+  const fiber = microTotals.fiber_g ?? 0;
+  if (fiber >= 20) {
+    insights.push({
+      affirmation: "Nice work!",
+      category: "FIBER",
+      value: `${Math.round(fiber)}g`,
+      message: "Excellent fiber intake yesterday! Keep including fruits, veggies, and whole grains for gut and heart health."
+    });
+  }
+
+  // 4. Meal consistency
+  if (mealsLogged.length >= 3) {
+    insights.push({
+      affirmation: "Consistency wins!",
+      category: "MEALS",
+      value: `${mealsLogged.length}`,
+      message: `You logged ${mealsLogged.length} meals yesterday—this kind of consistency really helps long-term progress.`
+    });
+  }
+
+  // Return the first (highest priority) insight, or a general encouraging one
+  if (insights.length > 0) {
+    return insights[0];
+  }
+
+  // Fallback: general encouragement
+  return {
+    affirmation: "Keep going!",
+    category: "TRACKING",
+    value: `${mealsLogged.length}`,
+    message: `You logged ${mealsLogged.length} meal${mealsLogged.length !== 1 ? "s" : ""} yesterday. Every day of tracking brings you closer to your goals.`
+  };
+}
+
+function aggregateWeekData(
+  dataByDate: Record<string, DayData>,
+  todayKey: string
+): { totals: NutrientTotals; microTotals: Record<MicroKey, number>; foods: string[]; mealsLogged: Set<string>; daysWithMeals: number } {
+  let totals = emptyTotals();
+  const microTotals = {} as Record<MicroKey, number>;
+  for (const k of MICRO_KEYS) microTotals[k] = 0;
+  const foods: string[] = [];
+  const mealsLogged = new Set<string>();
+  let daysWithMeals = 0;
+  for (let i = 1; i <= 7; i++) {
+    const dk = addDays(todayKey, -i);
+    const day = dataByDate[dk];
+    if (!day || !dayHasMeals(day)) continue;
+    daysWithMeals += 1;
+    const dayTotals = day.meals.reduce((acc, m) => sumTotals(acc, m.nutrients), emptyTotals());
+    totals = sumTotals(totals, dayTotals);
+    const mt = getMicroTotalsFromItems(day.mealItems);
+    for (const k of MICRO_KEYS) microTotals[k] += mt[k] ?? 0;
+    for (const meal of day.meals) {
+      const items = day.mealItems[meal.id] ?? [];
+      if (items.length > 0 || meal.nutrients.calories_kcal > 0) {
+        mealsLogged.add(meal.label);
+        for (const it of items) {
+          const n = capitalizeFirst(stripParenthetical(it.name));
+          if (n && !foods.includes(n)) foods.push(n);
+        }
+      }
+    }
+  }
+  return { totals, microTotals, foods, mealsLogged, daysWithMeals };
+}
+
+function getWeekInsights(
+  dataByDate: Record<string, DayData>,
+  todayKey: string,
+  userProfile: UserProfile
+): InsightResult {
+  const { totals, microTotals, foods, mealsLogged, daysWithMeals } = aggregateWeekData(dataByDate, todayKey);
+  const targets = getMacroTargets(userProfile);
+  const avgCal = daysWithMeals > 0 ? Math.round(totals.calories_kcal / daysWithMeals) : 0;
+  const calPct = targets.calories_kcal > 0 && daysWithMeals > 0
+    ? Math.round((totals.calories_kcal / (targets.calories_kcal * daysWithMeals)) * 100)
+    : 0;
+  const proteinPct = targets.protein_g > 0 && daysWithMeals > 0
+    ? Math.round((totals.protein_g / (targets.protein_g * daysWithMeals)) * 100)
+    : 0;
+  const fiber = microTotals.fiber_g ?? 0;
+  const sodium = microTotals.sodium_mg ?? 0;
+  const omega3Mg = (microTotals.omega_3_g ?? 0) * 1000;
+
+  // Build concise, pattern-focused summary (no detailed numbers)
+  let summary = "";
+  if (daysWithMeals > 0) {
+    summary = `Over the past 7 days you logged meals on ${daysWithMeals} day${daysWithMeals !== 1 ? "s" : ""}, which is a solid foundation.`;
+    if (mealsLogged.size > 0) {
+      summary += ` You covered meal types like ${Array.from(mealsLogged).join(", ")}.`;
+    }
+  } else {
+    summary = "Once you've logged for a few days in a row, this section will show patterns across your week.";
+  }
+
+  // Add qualitative weekly assessment
+  if (daysWithMeals > 0 && targets.calories_kcal > 0) {
+    const calPct = targets.calories_kcal > 0 && daysWithMeals > 0
+      ? Math.round((totals.calories_kcal / (targets.calories_kcal * daysWithMeals)) * 100)
+      : 0;
+    if (calPct >= 90 && calPct <= 110) {
+      summary += " Average daily calories were close to your weekly target—nice consistency.";
+    } else if (calPct > 110) {
+      summary += " Average calories were a bit above target; a couple of lighter days could balance things out.";
+    } else {
+      summary += " Average calories were somewhat below target; make sure energy and recovery still feel good.";
+    }
+  }
+
+  if (daysWithMeals > 0 && targets.protein_g > 0) {
+    const proteinPct = targets.protein_g > 0 && daysWithMeals > 0
+      ? Math.round((totals.protein_g / (targets.protein_g * daysWithMeals)) * 100)
+      : 0;
+    if (proteinPct >= 90) {
+      summary += " Weekly protein intake has been strong overall—great for satiety and muscle maintenance.";
+    } else if (proteinPct >= 70) {
+      summary += " Protein has been okay across the week, but there's room to add a bit more on some days.";
+    }
+  }
+
+  // Tips with positive reinforcement (green) and constructive suggestions (orange)
+  const tips: InsightTip[] = [];
+
+  // Always start with positive reinforcement
+  tips.push({ text: "You're building a useful record of your eating patterns—keep going, even on less-perfect days.", type: "positive" });
+
+  // Consistency tips
+  if (daysWithMeals >= 5) {
+    tips.push({ text: "Excellent consistency logging this week—tracking regularly helps you spot patterns and make informed choices.", type: "positive" });
+  } else if (daysWithMeals >= 3) {
+    tips.push({ text: "Good start logging this week—try to log at least 4–5 days next week to spot clearer trends.", type: "improvement" });
+  } else if (daysWithMeals > 0) {
+    tips.push({ text: "Try logging at least 3–4 days this coming week to spot clearer trends and opportunities.", type: "improvement" });
+  }
+
+  // Calorie tips
+  if (daysWithMeals >= 5 && targets.calories_kcal > 0) {
+    const calPct = Math.round((totals.calories_kcal / (targets.calories_kcal * daysWithMeals)) * 100);
+    if (calPct > 110) {
+      tips.push({ text: "Since weekly calories trended high, you might balance heavier meals with lighter, veggie-rich ones.", type: "improvement" });
+    } else if (calPct < 85) {
+      tips.push({ text: "If energy ever feels low, experiment with slightly larger portions or an extra nutritious snack.", type: "improvement" });
+    }
+  }
+
+  // Protein tips
+  if (daysWithMeals > 0 && targets.protein_g > 0) {
+    const proteinPct = Math.round((totals.protein_g / (targets.protein_g * daysWithMeals)) * 100);
+    if (proteinPct >= 90) {
+      tips.push({ text: "Your weekly protein intake has been excellent—this supports satiety, muscle maintenance, and overall health.", type: "positive" });
+    } else if (proteinPct >= 70) {
+      tips.push({ text: "Protein intake has been decent—adding a protein source to one extra meal each day would boost it nicely.", type: "improvement" });
+    }
+  }
+
+  // Sodium tips
+  const avgSodium = daysWithMeals > 0 ? sodium / daysWithMeals : 0;
+  if (avgSodium > 2300) {
+    tips.push({ text: "Across the week, sodium was on the higher side—cooking more at home and tasting before salting can help.", type: "improvement" });
+  }
+
+  // Fiber tips
+  const avgFiber = daysWithMeals > 0 ? fiber / daysWithMeals : 0;
+  if (avgFiber >= 20) {
+    tips.push({ text: "Great fiber intake across the week—keep prioritizing fruits, vegetables, and whole grains.", type: "positive" });
+  } else if (avgFiber < 20 && daysWithMeals > 0) {
+    tips.push({ text: "Most days could use a bit more fiber—aim to add a fruit or veggie to one extra meal each day.", type: "improvement" });
+  }
+
+  // Omega-3 tips
+  if (omega3Mg > 0 && daysWithMeals > 0) {
+    tips.push({ text: "Nice job including omega-3 sources this week—they support heart and brain health.", type: "positive" });
+  }
+
+  // Goal-specific tips
+  const goal = userProfile.goal ?? "";
+  if ((goal.includes("cholesterol") || goal.includes("heart")) && daysWithMeals > 0) {
+    const avgFat = totals.fat_g / Math.max(1, daysWithMeals);
+    if (avgFat > (targets.fat_g ?? 0) * 1.15) {
+      tips.push({ text: "For your heart and cholesterol goals, emphasizing fish, nuts, seeds, and olive oil over deep-fried foods will pay off.", type: "improvement" });
+    } else {
+      tips.push({ text: "Your weekly fat intake looks reasonable for heart health—keep leaning on unsaturated fat sources.", type: "positive" });
+    }
+  }
+
+  // De-duplicate by text and limit
+  const seen = new Set<string>();
+  const uniqueTips = tips.filter((t) => {
+    if (seen.has(t.text)) return false;
+    seen.add(t.text);
+    return true;
+  }).slice(0, 6);
+
+  return { summary, tips: uniqueTips };
+}
+
 function getContributors(
   sel: SelectedNutrient,
   items: Record<string, MealItem[]>,
@@ -480,12 +1529,24 @@ function getContributors(
   return out;
 }
 
-export default function App() {
-  const [view, setView] = useState<"home" | "add" | "meal" | "export">("home");
+function AppContent() {
+  const { isPro, isLoading: subscriptionLoading, presentPaywall, presentCustomerCenter, resetSubscriptionForTesting } = useSubscription();
+  const [view, setView] = useState<"home" | "add" | "meal" | "export" | "personal">("home");
   const [activeTab, setActiveTab] = useState<TabId>("meals");
   const [selectedNutrient, setSelectedNutrient] = useState<SelectedNutrient | null>(null);
   const [selectedMealId, setSelectedMealId] = useState<string | null>(null);
   const [selectedFoodItem, setSelectedFoodItem] = useState<MealItem | null>(null);
+  const [editableFoodNutrients, setEditableFoodNutrients] = useState<NutrientTotals | null>(null);
+  const [originalFoodNutrients, setOriginalFoodNutrients] = useState<NutrientTotals | null>(null);
+  const [foodSaveMessage, setFoodSaveMessage] = useState<string | null>(null);
+  const [foodSaving, setFoodSaving] = useState(false);
+  const [knownFoods, setKnownFoods] = useState<string[]>([]);
+  const [foodNutrients, setFoodNutrients] = useState<Record<string, NutrientTotals>>({});
+  const [foodOverrides, setFoodOverrides] = useState<Record<string, NutrientTotals>>({});
+  const [mealTemplates, setMealTemplates] = useState<MealTemplate[]>([]);
+  const [templateName, setTemplateName] = useState("");
+  const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
+  const [isTemplateMode, setIsTemplateMode] = useState(false);
   const [foodInsights, setFoodInsights] = useState<{
     insights: string;
     tips: string[];
@@ -499,6 +1560,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [menuVisible, setMenuVisible] = useState(false);
+  const [insightsSubTab, setInsightsSubTab] = useState<"day" | "week">("day");
   const [exportRange, setExportRange] = useState<"7" | "30" | "custom">("7");
   const [exportStartDate, setExportStartDate] = useState<string>(() => {
     const d = new Date();
@@ -506,8 +1568,27 @@ export default function App() {
     return toDateKey(d);
   });
   const [exportEndDate, setExportEndDate] = useState<string>(() => toDateKey(new Date()));
+  const [userProfile, setUserProfile] = useState<UserProfile>(defaultProfile);
+  const [heightUnit, setHeightUnit] = useState<"cm" | "in">("cm");
+  const [heightValue, setHeightValue] = useState<string>("");
+  const [weightValue, setWeightValue] = useState<string>("");
+  const [dobValue, setDobValue] = useState<string>("");
+  const [dobDay, setDobDay] = useState<string>("14");
+  const [dobMonth, setDobMonth] = useState<string>("Jul");
+  const [dobYear, setDobYear] = useState<string>("1981");
+  const [showGenderDropdown, setShowGenderDropdown] = useState(false);
+  const [showHeightUnitDropdown, setShowHeightUnitDropdown] = useState(false);
+  const [showWeightUnitDropdown, setShowWeightUnitDropdown] = useState(false);
+  const [showGoalDropdown, setShowGoalDropdown] = useState(false);
+  const [showActivityDropdown, setShowActivityDropdown] = useState(false);
+  const [weightUnit, setWeightUnit] = useState<"kg" | "lbs">("kg");
+  const [yesterdayInsightDismissed, setYesterdayInsightDismissed] = useState<string>("");
+  const [feedbackModalVisible, setFeedbackModalVisible] = useState(false);
+  const [feedbackRating, setFeedbackRating] = useState<number>(0);
+  const [feedbackText, setFeedbackText] = useState("");
 
   const todayKey = toDateKey(new Date());
+  const yesterdayKey = addDays(todayKey, -1);
 
   const getDayData = useCallback(
     (dateKey: string): DayData => {
@@ -520,9 +1601,145 @@ export default function App() {
 
   const persistData = useCallback(async (next: Record<string, DayData>) => {
     try {
-      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      // Only persist last 90 days to reduce storage size, but be more lenient
+      const today = toDateKey(new Date());
+      const toPersist: Record<string, DayData> = {};
+      const todayDate = new Date();
+      todayDate.setHours(0, 0, 0, 0);
+      
+      for (const [date, data] of Object.entries(next)) {
+        // Parse date string (format: YYYY-MM-DD)
+        const dateParts = date.split("-");
+        if (dateParts.length === 3) {
+          try {
+            const dateObj = new Date(parseInt(dateParts[0]), parseInt(dateParts[1]) - 1, parseInt(dateParts[2]));
+            dateObj.setHours(0, 0, 0, 0);
+            const daysDiff = Math.floor((dateObj.getTime() - todayDate.getTime()) / (1000 * 60 * 60 * 24));
+            // Keep data from last 90 days and future dates (up to 7 days ahead)
+            // Also keep today's data even if calculation is off
+            if (daysDiff >= -90 && daysDiff <= 7) {
+              toPersist[date] = data;
+            } else if (date === today) {
+              // Always keep today's data
+              toPersist[date] = data;
+            }
+          } catch (e) {
+            // If date parsing fails, keep the data to prevent loss
+            console.warn(`Failed to parse date ${date}, keeping data anyway`);
+            toPersist[date] = data;
+          }
+        } else {
+          // If date format is invalid, keep the data anyway to prevent loss
+          console.warn(`Invalid date format: ${date}, keeping data anyway`);
+          toPersist[date] = data;
+        }
+      }
+      
+      const persistedCount = Object.keys(toPersist).length;
+      const totalCount = Object.keys(next).length;
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(toPersist));
+      if (persistedCount < totalCount) {
+        console.log(`Persisted ${persistedCount} of ${totalCount} days (filtered ${totalCount - persistedCount} days older than 90 days)`);
+      } else {
+        console.log(`Persisted ${persistedCount} days of data`);
+      }
+    } catch (err) {
+      console.error("Error persisting data:", err);
+      // Try to save at least today's data as fallback
+      try {
+        const today = toDateKey(new Date());
+        const todayData = next[today];
+        if (todayData) {
+          await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify({ [today]: todayData }));
+          console.log("Saved at least today's data as fallback");
+        }
+      } catch (fallbackErr) {
+        console.error("Failed to save fallback data:", fallbackErr);
+      }
+    }
+  }, []);
+
+  const persistProfile = useCallback(async (profile: UserProfile) => {
+    try {
+      await AsyncStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profile));
     } catch (_) {}
   }, []);
+
+  const persistKnownFoods = useCallback(
+    async (foods: string[]) => {
+      try {
+        await AsyncStorage.setItem(FOOD_SUGGESTIONS_KEY, JSON.stringify(foods));
+      } catch (_) {}
+    },
+    []
+  );
+
+  const persistFoodNutrients = useCallback(
+    async (nutrients: Record<string, NutrientTotals>) => {
+      try {
+        await AsyncStorage.setItem(FOOD_NUTRIENTS_KEY, JSON.stringify(nutrients));
+      } catch (_) {}
+    },
+    []
+  );
+
+  const persistFoodOverrides = useCallback(
+    async (overrides: Record<string, NutrientTotals>) => {
+      try {
+        await AsyncStorage.setItem(FOOD_OVERRIDES_KEY, JSON.stringify(overrides));
+      } catch (_) {}
+    },
+    []
+  );
+
+  const persistMealTemplates = useCallback(
+    async (templates: MealTemplate[]) => {
+      try {
+        await AsyncStorage.setItem(MEAL_TEMPLATES_KEY, JSON.stringify(templates));
+      } catch (_) {}
+    },
+    []
+  );
+
+  const buildKnownFoodsFromData = useCallback(
+    async (allData: Record<string, DayData>) => {
+      try {
+        // If we've already built/saved suggestions before, don't overwrite them
+        const existing = await AsyncStorage.getItem(FOOD_SUGGESTIONS_KEY);
+        if (existing) return;
+
+        // Use Map with normalized key -> canonical name for case-insensitive deduplication
+        const nameMap = new Map<string, string>();
+        for (const day of Object.values(allData)) {
+          if (!day || !day.mealItems) continue;
+          for (const items of Object.values(day.mealItems)) {
+            (items || []).forEach((item) => {
+              if (item && item.name) {
+                const normalizedKey = normalizeFoodNameForDedup(item.name);
+                const canonical = getCanonicalFoodName(item.name);
+                if (normalizedKey && canonical) {
+                  // Keep the first occurrence's capitalization, or prefer shorter canonical name
+                  const existing = nameMap.get(normalizedKey);
+                  if (!existing || canonical.length < existing.length) {
+                    nameMap.set(normalizedKey, canonical);
+                  }
+                }
+              }
+            });
+          }
+        }
+
+        const list = Array.from(nameMap.values()).sort((a, b) => a.localeCompare(b));
+        setKnownFoods(list);
+        if (list.length) {
+          await persistKnownFoods(list);
+        }
+      } catch (err) {
+        console.warn("Failed to build known foods from existing data:", err);
+      }
+    },
+    []
+  );
 
   // Loading screen image is loaded via require() - no need for async loading
 
@@ -533,18 +1750,286 @@ export default function App() {
     
     (async () => {
       try {
-        const raw = await AsyncStorage.getItem(STORAGE_KEY);
+        // First, check all keys to see what's available
+        const allKeys = await AsyncStorage.getAllKeys();
+        console.log("All AsyncStorage keys:", allKeys);
+        
+        // Try to find data with various possible keys (in case key changed)
+        const possibleKeys = [
+          STORAGE_KEY,
+          "@mealtracking_dataByDate",
+          "mealtracking_dataByDate",
+          "dataByDate",
+          "@meal_tracking_data",
+          "meal_tracking_data"
+        ];
+        
+        let foundData = null;
+        let foundKey = null;
+        
+        for (const key of possibleKeys) {
+          try {
+            const raw = await AsyncStorage.getItem(key);
+            if (raw && raw.length > 10) { // Minimum data check
+              console.log(`Found data in key: ${key} (${raw.length} characters)`);
+              try {
+                const parsed = JSON.parse(raw);
+                if (typeof parsed === "object" && parsed !== null && Object.keys(parsed).length > 0) {
+                  foundData = parsed;
+                  foundKey = key;
+                  console.log(`Recovered ${Object.keys(parsed).length} days from key: ${key}`);
+                  break;
+                }
+              } catch (parseErr) {
+                console.warn(`Failed to parse data from ${key}:`, parseErr);
+              }
+            }
+          } catch (keyErr) {
+            // Continue checking other keys
+          }
+        }
+        
         if (cancelled) return;
-        const parsed = raw ? JSON.parse(raw) : {};
-        if (typeof parsed === "object" && parsed !== null) {
-          const migrated = migrateDataForVitamins(parsed);
-          if (migrated !== parsed) {
+        
+        if (foundData) {
+          console.log(`Successfully recovered data from key: ${foundKey}`);
+          const migrated = migrateDataForVitamins(foundData);
+          const dayCount = Object.keys(migrated).length;
+          console.log(`Loaded ${dayCount} days of meal data`);
+          
+          // Save to the current key if it was found in a different key
+          if (foundKey !== STORAGE_KEY) {
+            console.log(`Migrating data from ${foundKey} to ${STORAGE_KEY}`);
+            await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+          } else if (migrated !== foundData) {
             // Save migrated data back
             await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
           }
-          if (!cancelled) setDataByDate(migrated);
+          
+          if (!cancelled) {
+            setDataByDate(migrated);
+            await buildKnownFoodsFromData(migrated);
+          }
+        } else {
+          // Try the primary key as fallback
+          const raw = await AsyncStorage.getItem(STORAGE_KEY);
+          if (cancelled) return;
+          if (raw) {
+            console.log(`Loaded data from storage: ${raw.length} characters`);
+            const parsed = JSON.parse(raw);
+            if (typeof parsed === "object" && parsed !== null) {
+              const migrated = migrateDataForVitamins(parsed);
+              const dayCount = Object.keys(migrated).length;
+              console.log(`Loaded ${dayCount} days of meal data`);
+              if (migrated !== parsed) {
+                // Save migrated data back
+                await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+              }
+              if (!cancelled) {
+                setDataByDate(migrated);
+                await buildKnownFoodsFromData(migrated);
+              }
+            } else {
+              console.warn("Parsed data is not an object:", typeof parsed);
+            }
+          } else {
+            console.log("No data found in storage - checking for backups...");
+            
+            // Try to find any JSON data that might be meal data
+            for (const key of allKeys) {
+              if (key.includes("meal") || key.includes("data") || key.includes("tracking")) {
+                try {
+                  const value = await AsyncStorage.getItem(key);
+                  if (value && value.length > 50) {
+                    try {
+                      const testParsed = JSON.parse(value);
+                      if (typeof testParsed === "object" && testParsed !== null) {
+                        // Check if it looks like meal data (has date keys or meal structure)
+                        const keys = Object.keys(testParsed);
+                        if (keys.length > 0 && (keys[0].match(/^\d{4}-\d{2}-\d{2}$/) || testParsed.meals || testParsed.mealItems)) {
+                          console.log(`Found potential meal data in key: ${key}`);
+                          console.log(`Attempting recovery from: ${key}`);
+                          const migrated = migrateDataForVitamins(testParsed);
+                          await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+                          if (!cancelled) {
+                            setDataByDate(migrated);
+                            await buildKnownFoodsFromData(migrated);
+                          }
+                          console.log(`Recovered ${Object.keys(migrated).length} days of data!`);
+                          break;
+                        }
+                      }
+                    } catch (e) {
+                      // Not JSON or not meal data
+                    }
+                  }
+                } catch (e) {
+                  // Continue checking
+                }
+              }
+            }
+          }
         }
-      } catch (_) {}
+      } catch (err) {
+        console.error("Error loading data:", err);
+      }
+      
+      // Load user profile
+      try {
+        const profileRaw = await AsyncStorage.getItem(PROFILE_STORAGE_KEY);
+        if (!cancelled) {
+          if (profileRaw) {
+            const profileParsed = JSON.parse(profileRaw);
+            setUserProfile(profileParsed);
+            if (profileParsed.dateOfBirth) {
+              const dateParts = profileParsed.dateOfBirth.split("-");
+              if (dateParts.length === 3) {
+                const [y, m, d] = dateParts;
+                const day = parseInt(d, 10) || 1;
+                const month = parseInt(m, 10) || 1;
+                const year = y || "";
+                const monthMap: Record<string, string> = {
+                  "01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun",
+                  "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"
+                };
+                setDobValue(`${day}/${month}/${year}`);
+                setDobYear(year);
+                setDobMonth(monthMap[m] || "Jan");
+                setDobDay(String(day));
+              }
+            }
+            if (profileParsed.heightCm) {
+              const heightVal = profileParsed.heightUnit === "in" 
+                ? Math.round(profileParsed.heightCm / 2.54).toString()
+                : Math.round(profileParsed.heightCm).toString();
+              const clampedVal = profileParsed.heightUnit === "in"
+                ? Math.max(36, Math.min(85, parseInt(heightVal) || 68)).toString()
+                : Math.max(100, Math.min(220, parseInt(heightVal) || 173)).toString();
+              setHeightValue(clampedVal);
+              setHeightUnit(profileParsed.heightUnit);
+            }
+            if (profileParsed.weightKg) {
+              setWeightValue(Math.round(profileParsed.weightKg).toString());
+            }
+          } else {
+            // First‑time user: no profile saved yet — open Personal Details screen
+            console.log("No existing user profile found; opening personal details on first launch");
+            setView("personal");
+          }
+        }
+      } catch (err) {
+        console.error("Error loading profile:", err);
+      }
+
+      // Load known foods for autocomplete
+      try {
+        const foodsRaw = await AsyncStorage.getItem(FOOD_SUGGESTIONS_KEY);
+        if (!cancelled && foodsRaw) {
+          const parsed = JSON.parse(foodsRaw);
+          if (Array.isArray(parsed)) {
+            const validFoods = parsed.filter((f) => typeof f === "string");
+            // Deduplicate when loading (case-insensitive)
+            const nameMap = new Map<string, string>();
+            validFoods.forEach((name: string) => {
+              const normalizedKey = normalizeFoodNameForDedup(name);
+              const canonical = getCanonicalFoodName(name);
+              if (normalizedKey && canonical) {
+                // Keep first occurrence or prefer shorter name
+                const existing = nameMap.get(normalizedKey);
+                if (!existing || canonical.length < existing.length) {
+                  nameMap.set(normalizedKey, canonical);
+                }
+              }
+            });
+            const deduplicated = Array.from(nameMap.values()).sort((a, b) => a.localeCompare(b));
+            setKnownFoods(deduplicated);
+            // Persist deduplicated version back if it changed
+            if (deduplicated.length !== validFoods.length) {
+              await persistKnownFoods(deduplicated);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("Error loading known foods:", err);
+      }
+
+      // Load yesterday insight dismissed state
+      try {
+        const dismissedRaw = await AsyncStorage.getItem(YESTERDAY_INSIGHT_DISMISSED_KEY);
+        if (!cancelled && dismissedRaw) {
+          setYesterdayInsightDismissed(dismissedRaw);
+        }
+      } catch (err) {
+        console.warn("Error loading yesterday insight dismissed state:", err);
+      }
+
+      // Load per‑food nutrient overrides
+      try {
+        const overridesRaw = await AsyncStorage.getItem(FOOD_OVERRIDES_KEY);
+        if (!cancelled && overridesRaw) {
+          const parsed = JSON.parse(overridesRaw);
+          if (parsed && typeof parsed === "object") {
+            setFoodOverrides(parsed as Record<string, NutrientTotals>);
+          }
+        }
+      } catch (err) {
+        console.warn("Error loading food overrides:", err);
+      }
+
+      // Load cached food nutrients (for known-foods reuse)
+      try {
+        const nutrientsRaw = await AsyncStorage.getItem(FOOD_NUTRIENTS_KEY);
+        let nutrients: Record<string, NutrientTotals> = {};
+        if (nutrientsRaw) {
+          const parsed = JSON.parse(nutrientsRaw);
+          if (parsed && typeof parsed === "object") {
+            nutrients = parsed as Record<string, NutrientTotals>;
+          }
+        }
+        const initialCount = Object.keys(nutrients).length;
+        const dataRaw = await AsyncStorage.getItem(STORAGE_KEY);
+        if (dataRaw && !cancelled) {
+          try {
+            const data = JSON.parse(dataRaw) as Record<string, DayData>;
+            if (data && typeof data === "object") {
+              for (const day of Object.values(data)) {
+                if (!day?.mealItems) continue;
+                for (const items of Object.values(day.mealItems)) {
+                  for (const item of items || []) {
+                    if (item?.name && item.grams > 0 && item.nutrients) {
+                      const key = normalizeFoodNameForDedup(item.name);
+                      if (key && !nutrients[key]) {
+                        nutrients[key] = scaleTotals(item.nutrients, 100 / item.grams);
+                      }
+                    }
+                  }
+                }
+              }
+              if (Object.keys(nutrients).length > initialCount) {
+                await AsyncStorage.setItem(FOOD_NUTRIENTS_KEY, JSON.stringify(nutrients));
+              }
+            }
+          } catch (_) {}
+        }
+        if (!cancelled) {
+          setFoodNutrients(nutrients);
+        }
+      } catch (err) {
+        console.warn("Error loading food nutrients cache:", err);
+      }
+
+      // Load meal templates
+      try {
+        const templatesRaw = await AsyncStorage.getItem(MEAL_TEMPLATES_KEY);
+        if (!cancelled && templatesRaw) {
+          const parsed = JSON.parse(templatesRaw);
+          if (Array.isArray(parsed)) {
+            setMealTemplates(parsed.filter((t) => t && t.id && t.name && Array.isArray(t.items)));
+          }
+        }
+      } catch (err) {
+        console.warn("Error loading meal templates:", err);
+      }
       
       // Ensure loading screen shows for at least MIN_LOADING_TIME
       const elapsed = Date.now() - startTime;
@@ -561,14 +2046,70 @@ export default function App() {
     };
   }, []);
 
+  // Debug: Log view changes
+  useEffect(() => {
+    console.log("View changed to:", view);
+  }, [view]);
+
   const dayData = getDayData(selectedDate);
   const meals = dayData.meals;
   const mealItems = dayData.mealItems;
   const totals = meals.reduce((acc, meal) => sumTotals(acc, meal.nutrients), emptyTotals());
   const microTotals = getMicroTotalsFromItems(mealItems);
 
+  // Yesterday's insight card logic
+  const yesterdayData = getDayData(yesterdayKey);
+  const bestInsight = useMemo(() => getBestInsightFromYesterday(yesterdayData, userProfile), [yesterdayData, userProfile]);
+  const isMorning = new Date().getHours() < 12; // Before noon
+  const shouldShowInsight = useMemo(() => {
+    if (!bestInsight) return false;
+    if (!isMorning) return false;
+    if (selectedDate !== todayKey) return false; // Only show when viewing today
+    if (yesterdayInsightDismissed === todayKey) return false; // Already dismissed today
+    return true;
+  }, [bestInsight, isMorning, selectedDate, todayKey, yesterdayInsightDismissed]);
+
+  const handleDismissInsight = useCallback(async () => {
+    setYesterdayInsightDismissed(todayKey);
+    try {
+      await AsyncStorage.setItem(YESTERDAY_INSIGHT_DISMISSED_KEY, todayKey);
+    } catch (err) {
+      console.warn("Error saving dismissed insight:", err);
+    }
+  }, [todayKey]);
+
+  // Analysis tab uses the same date as MEALS page
+  const analysisDayData = getDayData(selectedDate);
+  const analysisMeals = analysisDayData?.meals ?? [];
+  const analysisMealItems = analysisDayData?.mealItems ?? {};
+  const analysisTotals = analysisMeals.reduce((acc, meal) => sumTotals(acc, meal?.nutrients ?? emptyTotals()), emptyTotals());
+  const analysisMicroTotals = getMicroTotalsFromItems(analysisMealItems);
+
   const slideAnim = useRef(new Animated.Value(0)).current;
   const screenWidth = Dimensions.get("window").width;
+  const SIDEBAR_WIDTH = Math.min(280, screenWidth * 0.78);
+  const sidebarAnim = useRef(new Animated.Value(-SIDEBAR_WIDTH)).current;
+
+  useEffect(() => {
+    if (menuVisible) {
+      sidebarAnim.setValue(-SIDEBAR_WIDTH);
+      Animated.timing(sidebarAnim, {
+        toValue: 0,
+        duration: 250,
+        useNativeDriver: true,
+        easing: Easing.out(Easing.cubic),
+      }).start();
+    }
+  }, [menuVisible, sidebarAnim, SIDEBAR_WIDTH]);
+
+  const closeSidebar = useCallback(() => {
+    Animated.timing(sidebarAnim, {
+      toValue: -SIDEBAR_WIDTH,
+      duration: 200,
+      useNativeDriver: true,
+      easing: Easing.in(Easing.cubic),
+    }).start(() => setMenuVisible(false));
+  }, [sidebarAnim, SIDEBAR_WIDTH]);
 
   // Reset animation when date changes
   useEffect(() => {
@@ -684,6 +2225,23 @@ export default function App() {
             .filter(f => f.id !== item.id)
             .map(f => cleanFoodName(f.name))
         : [];
+
+      // Build userContext from profile (goal, age, weight, height, gender, activity, BMI)
+      const age = userProfile.dateOfBirth ? getAgeFromDOB(userProfile.dateOfBirth) : null;
+      const weightKg = userProfile.weightKg ?? null;
+      const heightCm = userProfile.heightCm ?? null;
+      const bmi = weightKg != null && heightCm != null && heightCm > 0
+        ? weightKg / Math.pow(heightCm / 100, 2)
+        : null;
+      const userContext = {
+        goal: userProfile.goal ?? undefined,
+        age: age ?? undefined,
+        weightKg: weightKg ?? undefined,
+        heightCm: heightCm ?? undefined,
+        genderAtBirth: userProfile.genderAtBirth ?? undefined,
+        activityLevel: userProfile.activityLevel ?? undefined,
+        bmi: bmi ?? undefined
+      };
       
       const url = `${API_BASE_URL}/meals/food-insights`;
       const res = await fetch(url, {
@@ -696,7 +2254,7 @@ export default function App() {
           unit: item.unit,
           grams: item.grams,
           mealType: mealType,
-          userGoal: "reduce_cholesterol_maintain_weight",
+          userContext,
           otherFoodsToday: allFoodsToday,
           sameMealFoods: sameMealFoods
         })
@@ -722,7 +2280,7 @@ export default function App() {
     } finally {
       setLoadingInsights(false);
     }
-  }, [selectedDate, getDayData]);
+  }, [selectedDate, getDayData, userProfile]);
 
   // Note: fetchFoodInsights is now called directly when item is tapped
   // This useEffect is kept for cleanup
@@ -735,49 +2293,168 @@ export default function App() {
   const openAdd = (mealId: string) => {
     setSelectedMealId(mealId);
     setError(null);
+    setIsTemplateMode(false);
+    setEditingTemplateId(null);
     setView("add");
   };
 
   const handleAdd = async () => {
+    if (isTemplateMode) return; // Don't add meals when editing template mode
     if (!selectedMealId || !entryText.trim()) return;
     try {
       Keyboard.dismiss();
       setLoading(true);
       setError(null);
-      const res = await fetch(`${API_BASE_URL}/meals/nl-log`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: entryText,
-          startedAt: `${selectedDate}T12:00:00.000Z`,
-          tzOffsetMinutes: new Date().getTimezoneOffset()
-        })
-      });
-      if (!res.ok) {
-        const payload = await res.json();
-        throw new Error(payload?.error || "Failed to log meal.");
+      let resolvedItems: MealItem[];
+      const cached = resolveFromKnownFoods(entryText, knownFoods, foodNutrients);
+      if (cached && cached.length > 0) {
+        resolvedItems = cached;
+      } else {
+        const res = await fetch(`${API_BASE_URL}/meals/nl-log`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: entryText,
+            startedAt: `${selectedDate}T12:00:00.000Z`,
+            tzOffsetMinutes: new Date().getTimezoneOffset()
+          })
+        });
+        if (!res.ok) {
+          const payload = await res.json();
+          throw new Error(payload?.error || "Failed to log meal.");
+        }
+        const data = (await res.json()) as MealResponse & { items?: MealItem[] };
+        const apiItems = data.items || [];
+        resolvedItems = apiItems;
+        if (apiItems.length > 0) {
+          const nextNutrients = { ...foodNutrients };
+          for (const item of apiItems) {
+            if (item && item.name && item.grams > 0 && item.nutrients) {
+              const key = normalizeFoodNameForDedup(item.name);
+              if (key) {
+                const nutrientsPer100g = scaleTotals(item.nutrients, 100 / item.grams);
+                nextNutrients[key] = nutrientsPer100g;
+              }
+            }
+          }
+          setFoodNutrients(nextNutrients);
+          await persistFoodNutrients(nextNutrients);
+        }
       }
-      const data = (await res.json()) as MealResponse & { items?: MealItem[] };
+
+      // Apply any saved per‑food overrides to incoming items
+      const finalItems: MealItem[] = resolvedItems.map((item) => {
+        const key = normalizeFoodNameForKey(item.name);
+        const override = foodOverrides[key];
+        return override ? { ...item, nutrients: override } : item;
+      });
+
+      // Recompute total nutrients from (possibly overridden) items
+      const resolvedTotals = finalItems.reduce(
+        (acc, item) => sumTotals(acc, item.nutrients),
+        emptyTotals()
+      );
+
       const day = getDayData(selectedDate);
       const nextMeals = day.meals.map((meal) =>
         meal.id === selectedMealId
-          ? { ...meal, nutrients: sumTotals(meal.nutrients, data.nutrients) }
+          ? { ...meal, nutrients: sumTotals(meal.nutrients, resolvedTotals) }
           : meal
       );
       const nextItems = {
         ...day.mealItems,
-        [selectedMealId]: [...(day.mealItems[selectedMealId] || []), ...(data.items || [])]
+        [selectedMealId]: [...(day.mealItems[selectedMealId] || []), ...finalItems]
       };
       const next = { ...dataByDate, [selectedDate]: { meals: nextMeals, mealItems: nextItems } };
       setDataByDate(next);
+
+      // Update known foods from new items (with case-insensitive deduplication)
+      if (finalItems.length > 0) {
+        const nameMap = new Map<string, string>();
+        knownFoods.forEach((name) => {
+          const key = normalizeFoodNameForDedup(name);
+          if (key) nameMap.set(key, name);
+        });
+        finalItems.forEach((item) => {
+          if (item && item.name) {
+            const normalizedKey = normalizeFoodNameForDedup(item.name);
+            const canonical = getCanonicalFoodName(item.name);
+            if (normalizedKey && canonical) {
+              if (!nameMap.has(normalizedKey)) {
+                nameMap.set(normalizedKey, canonical);
+              } else {
+                const existing = nameMap.get(normalizedKey);
+                if (existing && canonical.length < existing.length) {
+                  nameMap.set(normalizedKey, canonical);
+                }
+              }
+            }
+          }
+        });
+        const mergedList = Array.from(nameMap.values()).sort((a, b) => a.localeCompare(b));
+        setKnownFoods(mergedList);
+        await persistKnownFoods(mergedList);
+      }
+
       await persistData(next);
       setEntryText("");
       setView("home");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
+      let message = "Unknown error";
+      if (err instanceof Error) {
+        if (err.message.includes("Network request failed")) {
+          message =
+            "Could not reach the server. Your meal text is still here; please tap Add again when you’re back in the app.";
+        } else {
+          message = err.message;
+        }
+      }
+      setError(message);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSaveTemplate = () => {
+    if (!templateName.trim() || !entryText.trim()) {
+      setError("Template name and items are required");
+      return;
+    }
+
+    const items = entryText.split("\n").filter(Boolean);
+    if (items.length === 0) {
+      setError("At least one food item is required");
+      return;
+    }
+
+    if (editingTemplateId) {
+      // Update existing template
+      const updated = mealTemplates.map((t) =>
+        t.id === editingTemplateId
+          ? { ...t, name: templateName.trim(), items }
+          : t
+      );
+      setMealTemplates(updated);
+      persistMealTemplates(updated);
+    } else {
+      // Create new template
+      const newTemplate: MealTemplate = {
+        id: Date.now().toString(),
+        name: templateName.trim(),
+        items
+      };
+      const updated = [...mealTemplates, newTemplate];
+      setMealTemplates(updated);
+      persistMealTemplates(updated);
+    }
+
+    // Reset and go back
+    setEditingTemplateId(null);
+    setIsTemplateMode(false);
+    setTemplateName("");
+    setEntryText("");
+    setView("home");
+    setError(null);
   };
 
   const handleDeleteItem = (mealId: string, itemId: string) => {
@@ -802,9 +2479,535 @@ export default function App() {
   const selectedItems =
     (selectedMealId && mealItems[selectedMealId]) || [];
 
-  if (view === "add") {
+  const attemptDataRecovery = useCallback(async () => {
+    try {
+      console.log("=== Starting data recovery ===");
+      const allKeys = await AsyncStorage.getAllKeys();
+      console.log("All AsyncStorage keys:", allKeys);
+      
+      const possibleKeys = [
+        STORAGE_KEY,
+        "@mealtracking_dataByDate",
+        "mealtracking_dataByDate",
+        "dataByDate",
+        "@meal_tracking_data",
+        "meal_tracking_data",
+        ...allKeys.filter(k => k.includes("meal") || k.includes("data") || k.includes("tracking"))
+      ];
+      
+      let recoveredData = null;
+      let recoveredKey = null;
+      
+      for (const key of possibleKeys) {
+        try {
+          const raw = await AsyncStorage.getItem(key);
+          if (raw && raw.length > 10) {
+            try {
+              const parsed = JSON.parse(raw);
+              if (typeof parsed === "object" && parsed !== null) {
+                // Check if it looks like meal data
+                const keys = Object.keys(parsed);
+                const hasDateKeys = keys.some(k => k.match(/^\d{4}-\d{2}-\d{2}$/));
+                const hasMealStructure = keys.some(k => {
+                  const val = parsed[k];
+                  return val && (val.meals || val.mealItems);
+                });
+                
+                if (hasDateKeys || hasMealStructure) {
+                  console.log(`Found meal data in key: ${key} (${keys.length} entries)`);
+                  recoveredData = parsed;
+                  recoveredKey = key;
+                  break;
+                }
+              }
+            } catch (e) {
+              // Not valid JSON
+            }
+          }
+        } catch (e) {
+          // Continue
+        }
+      }
+      
+      if (recoveredData) {
+        const migrated = migrateDataForVitamins(recoveredData);
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+        setDataByDate(migrated);
+        console.log(`=== Recovery successful! Restored ${Object.keys(migrated).length} days ===`);
+        return true;
+      } else {
+        console.log("=== No recoverable data found ===");
+        return false;
+      }
+    } catch (err) {
+      console.error("Recovery error:", err);
+      return false;
+    }
+  }, []);
+
+  const handleSaveProfile = async () => {
+    const heightNum = heightValue ? parseFloat(heightValue) : null;
+    const heightInCm = heightNum 
+      ? (heightUnit === "in" ? heightNum * 2.54 : heightNum)
+      : null;
+    
+    const weightNum = weightValue ? parseFloat(weightValue) : null;
+    const weightInKg = weightNum
+      ? (weightUnit === "lbs" ? weightNum / 2.20462 : weightNum)
+      : null;
+    
+    // Parse DOB from dd/mm/yyyy to ISO yyyy-mm-dd
+    let formattedDate: string | null = null;
+    if (dobValue) {
+      const match = dobValue.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (match) {
+        const [, d, m, y] = match;
+        const day = parseInt(d, 10);
+        const month = parseInt(m, 10);
+        const year = parseInt(y, 10);
+        if (!isNaN(day) && !isNaN(month) && !isNaN(year)) {
+          formattedDate = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+        }
+      }
+    }
+    
+    const updatedProfile: UserProfile = {
+      dateOfBirth: formattedDate,
+      genderAtBirth: userProfile.genderAtBirth,
+      heightCm: heightInCm,
+      heightUnit: heightUnit,
+      weightKg: weightInKg,
+      goal: userProfile.goal,
+      activityLevel: userProfile.activityLevel
+    };
+    
+    setUserProfile(updatedProfile);
+    await persistProfile(updatedProfile);
+    setView("home");
+  };
+
+  // Show personal details screen - CHECK THIS FIRST BEFORE ANY OTHER VIEWS
+  if (view === "personal") {
+    console.log("Rendering personal details screen");
+    const goals = [
+      { id: "weight_loss", label: "Weight Loss" },
+      { id: "weight_gain", label: "Weight Gain" },
+      { id: "maintain_weight", label: "Maintain Weight" },
+      { id: "reduce_cholesterol", label: "Reduce Cholesterol" },
+      { id: "reduce_cholesterol_maintain_weight", label: "Reduce Cholesterol & Maintain Weight" },
+      { id: "muscle_gain", label: "Muscle Gain" },
+      { id: "heart_health", label: "Heart Health" },
+      { id: "diabetes_management", label: "Diabetes Management" }
+    ];
+
+    const activityLevels = [
+      { 
+        id: "low", 
+        label: "Low", 
+        description: "Little to no exercise, desk job" 
+      },
+      { 
+        id: "medium", 
+        label: "Medium", 
+        description: "Light exercise 1-3 days/week" 
+      },
+      { 
+        id: "high", 
+        label: "High", 
+        description: "Moderate to intense exercise 4+ days/week" 
+      }
+    ];
+
+    // Generate date picker items
+    const days = Array.from({ length: 31 }, (_, i) => ({
+      label: String(i + 1),
+      value: String(i + 1)
+    }));
+    const months = [
+      { label: "Jan", value: "Jan" },
+      { label: "Feb", value: "Feb" },
+      { label: "Mar", value: "Mar" },
+      { label: "Apr", value: "Apr" },
+      { label: "May", value: "May" },
+      { label: "Jun", value: "Jun" },
+      { label: "Jul", value: "Jul" },
+      { label: "Aug", value: "Aug" },
+      { label: "Sep", value: "Sep" },
+      { label: "Oct", value: "Oct" },
+      { label: "Nov", value: "Nov" },
+      { label: "Dec", value: "Dec" }
+    ];
+    const currentYear = new Date().getFullYear();
+    const years = Array.from({ length: 100 }, (_, i) => ({
+      label: String(currentYear - i),
+      value: String(currentYear - i)
+    }));
+
+    // Generate height values
+    const heightValuesCm = Array.from({ length: 100 }, (_, i) => ({
+      label: `${i + 100} cm`,
+      value: String(i + 100)
+    }));
+    const heightValuesIn = Array.from({ length: 50 }, (_, i) => ({
+      label: `${i + 36} in`,
+      value: String(i + 36)
+    }));
+
+    // Generate weight values
+    const weightValues = Array.from({ length: 150 }, (_, i) => ({
+      label: `${i + 30} kg`,
+      value: String(i + 30)
+    }));
+
+    const genderOptions = [
+      { label: "Male", value: "male" },
+      { label: "Female", value: "female" }
+    ];
+
+    const goalOptions = goals.map((g) => ({ label: g.label, value: g.id }));
+    const activityOptions = activityLevels.map((a) => ({ label: a.label, value: a.id }));
+
     return (
       <SafeAreaView style={styles.container}>
+        <View style={styles.personalHeader}>
+          <TouchableOpacity style={styles.iconButton} onPress={() => setView("home")}>
+            <Text style={styles.iconText}>‹</Text>
+          </TouchableOpacity>
+          <Text style={styles.headerTitle} numberOfLines={1} ellipsizeMode="tail">
+            Personal Details
+          </Text>
+          <TouchableOpacity style={styles.personalSaveButton} onPress={handleSaveProfile}>
+            <Text style={styles.saveButtonText}>Save</Text>
+          </TouchableOpacity>
+        </View>
+
+        <ScrollView 
+          contentContainerStyle={styles.personalDetailsContent}
+          scrollEnabled={true}
+        >
+          {/* SUBSCRIPTION */}
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>SUBSCRIPTION</Text>
+            <TouchableOpacity
+              style={styles.fieldValue}
+              onPress={() => presentCustomerCenter()}
+            >
+              <Text style={styles.fieldValueText}>
+                {subscriptionLoading ? "Loading..." : isPro ? "Pro" : "Free"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+          <TouchableOpacity
+            style={styles.manageSubscriptionButton}
+            onPress={() => presentCustomerCenter()}
+          >
+            <Text style={styles.manageSubscriptionButtonText}>Manage Subscription</Text>
+          </TouchableOpacity>
+
+          {/* DATE OF BIRTH */}
+          {(() => {
+            let isValidDob = true;
+            if (dobValue) {
+              const match = dobValue.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+              if (!match) {
+                isValidDob = false;
+              } else {
+                const [, d, m, y] = match;
+                const day = parseInt(d, 10);
+                const month = parseInt(m, 10);
+                const year = parseInt(y, 10);
+                if (
+                  isNaN(day) ||
+                  isNaN(month) ||
+                  isNaN(year) ||
+                  day < 1 ||
+                  day > 31 ||
+                  month < 1 ||
+                  month > 12
+                ) {
+                  isValidDob = false;
+                }
+              }
+            }
+
+            const renderAge = () => {
+              if (!dobValue || !isValidDob) return null;
+              const [d, m, y] = dobValue.split("/");
+              const day = parseInt(d, 10);
+              const month = parseInt(m, 10);
+              const year = parseInt(y, 10);
+              if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+              const iso = `${year}-${String(month).padStart(2, "0")}-${String(
+                day
+              ).padStart(2, "0")}`;
+              const age = getAgeFromDOB(iso);
+              return age ? <Text style={styles.helperText}>Age: {age} years</Text> : null;
+            };
+
+            return (
+              <>
+                <View style={styles.fieldRow}>
+                  <Text style={styles.fieldLabel}>DATE OF BIRTH</Text>
+                  <TextInput
+                    style={[
+                      styles.fieldValue,
+                      styles.fieldValueInput,
+                      !isValidDob && styles.fieldValueError
+                    ]}
+                    value={dobValue}
+                    onChangeText={setDobValue}
+                    placeholder="dd/mm/yyyy"
+                    keyboardType="numbers-and-punctuation"
+                  />
+                </View>
+                {renderAge()}
+              </>
+            );
+          })()}
+
+          {/* GENDER */}
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>GENDER AT BIRTH</Text>
+            <TouchableOpacity 
+              style={styles.fieldValue}
+              onPress={() => setShowGenderDropdown(!showGenderDropdown)}
+            >
+              <Text style={styles.fieldValueText}>
+                {userProfile.genderAtBirth
+                  ? userProfile.genderAtBirth === "male"
+                    ? "Male"
+                    : "Female"
+                  : "Select gender"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+          {showGenderDropdown && (
+            <Modal visible={showGenderDropdown} transparent animationType="fade">
+              <TouchableOpacity 
+                style={styles.modalOverlay}
+                activeOpacity={1}
+                onPress={() => setShowGenderDropdown(false)}
+              >
+                <View style={styles.dropdownContent}>
+                  {genderOptions.map((option) => (
+                    <TouchableOpacity
+                      key={option.value}
+                      style={styles.dropdownItem}
+                      onPress={() => {
+                        setUserProfile({ ...userProfile, genderAtBirth: option.value as "male" | "female" });
+                        setShowGenderDropdown(false);
+                      }}
+                    >
+                      <Text style={styles.dropdownItemText}>{option.label}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </TouchableOpacity>
+            </Modal>
+          )}
+
+          {/* HEIGHT */}
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>HEIGHT</Text>
+            <View style={styles.heightInputRow}>
+              <TextInput
+                style={styles.heightInput}
+                value={heightValue}
+                onChangeText={setHeightValue}
+                placeholder="Enter height"
+                keyboardType="decimal-pad"
+              />
+              <TouchableOpacity 
+                style={styles.unitDropdown}
+                onPress={() => setShowHeightUnitDropdown(!showHeightUnitDropdown)}
+              >
+                <Text style={styles.fieldValueText}>{heightUnit}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+          {showHeightUnitDropdown && (
+            <Modal visible={showHeightUnitDropdown} transparent animationType="fade">
+              <TouchableOpacity 
+                style={styles.modalOverlay}
+                activeOpacity={1}
+                onPress={() => setShowHeightUnitDropdown(false)}
+              >
+                <View style={styles.dropdownContent}>
+                  {["cm", "in"].map((unit) => (
+                    <TouchableOpacity
+                      key={unit}
+                      style={styles.dropdownItem}
+                      onPress={() => {
+                        if (heightValue) {
+                          const num = parseFloat(heightValue);
+                          if (heightUnit === "cm" && unit === "in") {
+                            setHeightValue((num / 2.54).toFixed(1));
+                          } else if (heightUnit === "in" && unit === "cm") {
+                            setHeightValue((num * 2.54).toFixed(1));
+                          }
+                        }
+                        setHeightUnit(unit as "cm" | "in");
+                        setShowHeightUnitDropdown(false);
+                      }}
+                    >
+                      <Text style={styles.dropdownItemText}>{unit}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </TouchableOpacity>
+            </Modal>
+          )}
+
+          {/* WEIGHT */}
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>WEIGHT</Text>
+            <View style={styles.heightInputRow}>
+              <TextInput
+                style={styles.heightInput}
+                value={weightValue}
+                onChangeText={setWeightValue}
+                placeholder="Enter weight"
+                keyboardType="decimal-pad"
+              />
+              <TouchableOpacity 
+                style={styles.unitDropdown}
+                onPress={() => setShowWeightUnitDropdown(!showWeightUnitDropdown)}
+              >
+                <Text style={styles.fieldValueText}>{weightUnit}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+          {showWeightUnitDropdown && (
+            <Modal visible={showWeightUnitDropdown} transparent animationType="fade">
+              <TouchableOpacity 
+                style={styles.modalOverlay}
+                activeOpacity={1}
+                onPress={() => setShowWeightUnitDropdown(false)}
+              >
+                <View style={styles.dropdownContent}>
+                  {["kg", "lbs"].map((unit) => (
+                    <TouchableOpacity
+                      key={unit}
+                      style={styles.dropdownItem}
+                      onPress={() => {
+                        if (weightValue) {
+                          const num = parseFloat(weightValue);
+                          if (weightUnit === "kg" && unit === "lbs") {
+                            setWeightValue((num * 2.20462).toFixed(1));
+                          } else if (weightUnit === "lbs" && unit === "kg") {
+                            setWeightValue((num / 2.20462).toFixed(1));
+                          }
+                        }
+                        setWeightUnit(unit as "kg" | "lbs");
+                        setShowWeightUnitDropdown(false);
+                      }}
+                    >
+                      <Text style={styles.dropdownItemText}>{unit}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </TouchableOpacity>
+            </Modal>
+          )}
+
+          {/* GOAL */}
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>GOAL</Text>
+            <TouchableOpacity 
+              style={styles.fieldValue}
+              onPress={() => setShowGoalDropdown(!showGoalDropdown)}
+            >
+              <Text style={styles.fieldValueText}>
+                {goalOptions.find(g => g.value === userProfile.goal)?.label || "Select goal"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+          {showGoalDropdown && (
+            <Modal visible={showGoalDropdown} transparent animationType="fade">
+              <TouchableOpacity 
+                style={styles.modalOverlay}
+                activeOpacity={1}
+                onPress={() => setShowGoalDropdown(false)}
+              >
+                <View style={styles.dropdownContent}>
+                  {goalOptions.map((option) => (
+                    <TouchableOpacity
+                      key={option.value}
+                      style={styles.dropdownItem}
+                      onPress={() => {
+                        setUserProfile({ ...userProfile, goal: option.value });
+                        setShowGoalDropdown(false);
+                      }}
+                    >
+                      <Text style={styles.dropdownItemText}>{option.label}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </TouchableOpacity>
+            </Modal>
+          )}
+
+          {/* ACTIVITY LEVEL */}
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>ACTIVITY LEVEL</Text>
+            <TouchableOpacity 
+              style={styles.fieldValue}
+              onPress={() => setShowActivityDropdown(!showActivityDropdown)}
+            >
+              <Text style={styles.fieldValueText}>
+                {activityOptions.find(a => a.value === userProfile.activityLevel)?.label || "Select activity level"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+          {showActivityDropdown && (
+            <Modal visible={showActivityDropdown} transparent animationType="fade">
+              <TouchableOpacity 
+                style={styles.modalOverlay}
+                activeOpacity={1}
+                onPress={() => setShowActivityDropdown(false)}
+              >
+                <View style={styles.dropdownContent}>
+                  {activityOptions.map((option) => (
+                    <TouchableOpacity
+                      key={option.value}
+                      style={styles.dropdownItem}
+                      onPress={() => {
+                        setUserProfile({ ...userProfile, activityLevel: option.value });
+                        setShowActivityDropdown(false);
+                      }}
+                    >
+                      <Text style={styles.dropdownItemText}>{option.label}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </TouchableOpacity>
+            </Modal>
+          )}
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (view === "add") {
+    // Parse current line to extract prefix (quantity/unit) and food name part
+    const lines = entryText.split("\n");
+    const currentLine = lines[lines.length - 1] || "";
+    
+    // Try to extract prefix: matches patterns like "1 ", "10g ", "2 cups ", etc.
+    // Pattern: number (optional decimal) + optional unit + space(s)
+    const prefixMatch = currentLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
+    const prefix = prefixMatch ? prefixMatch[0] : "";
+    const foodNamePart = currentLine.slice(prefix.length).trim().toLowerCase();
+    
+    const suggestions =
+      foodNamePart.length === 0
+        ? []
+        : knownFoods
+            .filter((name) => name.toLowerCase().startsWith(foodNamePart))
+            .slice(0, 5);
+
+    return (
+      <SafeAreaView style={[styles.container, { paddingTop: 8 }]}>
         <KeyboardAvoidingView
           style={styles.addScreen}
           behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -812,25 +3015,62 @@ export default function App() {
           <View style={styles.addHeader}>
             <TouchableOpacity
               style={styles.iconButton}
-              onPress={() => setView("home")}
+              onPress={() => {
+                setView("home");
+                setEditingTemplateId(null);
+                setTemplateName("");
+                setEntryText("");
+              }}
             >
               <Text style={styles.iconText}>‹</Text>
             </TouchableOpacity>
-            <Text style={styles.headerTitle}>Add item(s)</Text>
-            <TouchableOpacity
-              style={[styles.addHeaderButton, loading && styles.addSubmitDisabled]}
-              onPress={handleAdd}
-              disabled={loading}
-            >
-              <Text
-                style={[
-                  styles.addHeaderButtonText,
-                  loading && styles.addSubmitTextDisabled
-                ]}
+            <Text style={styles.headerTitle}>
+              {isTemplateMode ? (editingTemplateId ? "Edit Template" : "New Template") : "Add item(s)"}
+            </Text>
+            {isTemplateMode ? (
+              <View style={styles.templateHeaderButtons}>
+                {editingTemplateId && (
+                  <TouchableOpacity
+                    style={styles.templateDeleteButton}
+                    onPress={() => {
+                      if (editingTemplateId) {
+                        const updated = mealTemplates.filter((t) => t.id !== editingTemplateId);
+                        setMealTemplates(updated);
+                        persistMealTemplates(updated);
+                        setEditingTemplateId(null);
+                        setTemplateName("");
+                        setEntryText("");
+                        setIsTemplateMode(false);
+                        setView("home");
+                      }
+                    }}
+                  >
+                    <Text style={styles.templateDeleteButtonText}>Delete</Text>
+                  </TouchableOpacity>
+                )}
+                <TouchableOpacity
+                  style={styles.addHeaderButton}
+                  onPress={handleSaveTemplate}
+                >
+                  <Text style={styles.addHeaderButtonText}>Save</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <TouchableOpacity
+                style={[styles.addHeaderButton, loading && styles.addSubmitDisabled]}
+                onPress={handleAdd}
+                disabled={loading}
               >
-                {loading ? "Adding..." : "Add"}
-              </Text>
-            </TouchableOpacity>
+                <Text
+                  style={[
+                    styles.addHeaderButtonText,
+                    loading && styles.addSubmitTextDisabled
+                  ]}
+                >
+                  {loading ? "Adding..." : "Add"}
+                </Text>
+              </TouchableOpacity>
+            )}
           </View>
 
           <ScrollView
@@ -840,9 +3080,21 @@ export default function App() {
             keyboardDismissMode="on-drag"
             showsVerticalScrollIndicator
           >
+            {isTemplateMode && (
+              <View style={styles.templateNameContainer}>
+                <Text style={styles.templateNameLabel}>Template name</Text>
+                <TextInput
+                  value={templateName}
+                  onChangeText={setTemplateName}
+                  placeholder="Template name"
+                  style={styles.templateNameInputCompact}
+                  autoFocus={false}
+                />
+              </View>
+            )}
             <View style={styles.addCard}>
               <Text style={styles.addHint}>
-                Describe the food items and we will do the rest
+                {isTemplateMode ? "Food items (one per line)" : "Describe the food items and we will do the rest"}
               </Text>
               <TextInput
                 value={entryText}
@@ -852,20 +3104,85 @@ export default function App() {
                 multiline
                 textAlignVertical="top"
                 editable
-                autoFocus
+                autoFocus={!isTemplateMode}
                 scrollEnabled={false}
               />
             </View>
 
-            <TouchableOpacity
-              style={styles.hideKeyboardButton}
-              onPress={() => Keyboard.dismiss()}
-            >
-              <Text style={styles.hideKeyboardText}>Hide keyboard</Text>
-            </TouchableOpacity>
+            {mealTemplates.length > 0 && (
+              <View style={styles.templatesSection}>
+                <Text style={styles.templatesSectionTitle}>Saved Meal Templates</Text>
+                <View style={styles.templatesContainer}>
+                  {mealTemplates.map((template) => (
+                    <View key={template.id} style={styles.templateChipWrapper}>
+                      <TouchableOpacity
+                        style={styles.templateChip}
+                        onPress={() => {
+                          setEntryText(template.items.join("\n"));
+                        }}
+                      >
+                        <Text style={styles.templateChipText}>{template.name}</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.templateEditButton}
+                        onPress={() => {
+                          setEditingTemplateId(template.id);
+                          setIsTemplateMode(true);
+                          setTemplateName(template.name);
+                          setEntryText(template.items.join("\n"));
+                          setView("add");
+                        }}
+                      >
+                        <Text style={styles.templateEditButtonText}>✎</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            )}
+
+            {suggestions.length > 0 && (
+              <View style={styles.suggestionsContainer}>
+                {suggestions.map((name) => {
+                  // Extract prefix from current line for display
+                  const lines = entryText.split("\n");
+                  const currentLine = lines[lines.length - 1] || "";
+                  const prefixMatch = currentLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
+                  const prefix = prefixMatch ? prefixMatch[0] : "";
+                  
+                  return (
+                    <TouchableOpacity
+                      key={name}
+                      style={styles.suggestionChip}
+                      onPress={() => {
+                        const text = entryText;
+                        const textLines = text.split("\n");
+                        const lastIdx = textLines.length - 1;
+                        const currLine = textLines[lastIdx] ?? "";
+                        
+                        // Extract prefix (quantity/unit) from current line
+                        const prefixMatch2 = currLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
+                        const prefix2 = prefixMatch2 ? prefixMatch2[0] : "";
+                        
+                        // Replace only the food name part, keeping the prefix
+                        const replacedLine = prefix2 + name;
+                        const replacedLines = [
+                          ...textLines.slice(0, lastIdx),
+                          replacedLine
+                        ];
+                        const nextText = replacedLines.join("\n");
+                        setEntryText(nextText);
+                      }}
+                    >
+                      <Text style={styles.suggestionText}>{prefix ? prefix + name : name}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            )}
 
             {error ? <Text style={styles.addError}>{error}</Text> : null}
-            {selectedMealLabel ? (
+            {selectedMealLabel && !isTemplateMode ? (
               <Text style={styles.addFooter}>Adding to {selectedMealLabel}</Text>
             ) : null}
           </ScrollView>
@@ -875,54 +3192,197 @@ export default function App() {
   }
 
   // Show food detail screen if a food item is selected
-  if (selectedFoodItem !== null) {
+  if (selectedFoodItem !== null && editableFoodNutrients !== null && originalFoodNutrients !== null) {
+    const isFoodDirty =
+      Math.round(editableFoodNutrients.calories_kcal) !== Math.round(originalFoodNutrients.calories_kcal) ||
+      Math.round(editableFoodNutrients.protein_g) !== Math.round(originalFoodNutrients.protein_g) ||
+      Math.round(editableFoodNutrients.carbs_g) !== Math.round(originalFoodNutrients.carbs_g) ||
+      Math.round(editableFoodNutrients.fat_g) !== Math.round(originalFoodNutrients.fat_g);
+    const handleUpdateFoodNutrients = async () => {
+      const day = getDayData(selectedDate);
+      if (!selectedMealId) return;
+      const items = day.mealItems[selectedMealId] || [];
+      const idx = items.findIndex((i) => i.id === selectedFoodItem.id);
+      if (idx === -1) return;
+
+      const oldItem = items[idx];
+      const oldNutrients = oldItem.nutrients;
+      const newNutrients: NutrientTotals = {
+        ...oldNutrients,
+        ...editableFoodNutrients
+      };
+
+      const updatedItem: MealItem = {
+        ...oldItem,
+        nutrients: newNutrients
+      };
+
+      const updatedItems = [...items];
+      updatedItems[idx] = updatedItem;
+
+      const nextMeals = day.meals.map((meal) =>
+        meal.id === selectedMealId
+          ? {
+              ...meal,
+              nutrients: sumTotals(
+                subtractTotals(meal.nutrients, oldNutrients),
+                newNutrients
+              )
+            }
+          : meal
+      );
+
+      const next = {
+        ...dataByDate,
+        [selectedDate]: { meals: nextMeals, mealItems: { ...day.mealItems, [selectedMealId]: updatedItems } }
+      };
+
+      try {
+        setFoodSaving(true);
+        setDataByDate(next);
+        await persistData(next);
+        setSelectedFoodItem(updatedItem);
+        setOriginalFoodNutrients(newNutrients);
+
+        // Remember per‑food override for future uses
+        const overrideKey = normalizeFoodNameForKey(updatedItem.name);
+        const nextOverrides = { ...foodOverrides, [overrideKey]: newNutrients };
+        setFoodOverrides(nextOverrides);
+        await persistFoodOverrides(nextOverrides);
+
+        // Also add to known foods with deduplication
+        const normalizedKey = normalizeFoodNameForDedup(updatedItem.name);
+        const canonical = getCanonicalFoodName(updatedItem.name);
+        if (normalizedKey && canonical) {
+          const nameMap = new Map<string, string>();
+          knownFoods.forEach((name) => {
+            const key = normalizeFoodNameForDedup(name);
+            if (key) nameMap.set(key, name);
+          });
+          if (!nameMap.has(normalizedKey)) {
+            nameMap.set(normalizedKey, canonical);
+            const updatedKnownFoods = Array.from(nameMap.values()).sort((a, b) => a.localeCompare(b));
+            setKnownFoods(updatedKnownFoods);
+            await persistKnownFoods(updatedKnownFoods);
+          }
+        }
+
+        setFoodSaveMessage("Changes saved");
+      } finally {
+        setFoodSaving(false);
+      }
+    };
+
     return (
-      <SafeAreaView style={styles.container}>
-        <ScrollView
-          style={{ flex: 1 }}
-          contentContainerStyle={styles.foodDetailContent}
-          showsVerticalScrollIndicator
-        >
-          <View style={styles.foodDetailHeader}>
+      <View style={{ flex: 1, backgroundColor: "#F5F5F7" }}>
+        <SafeAreaView style={{ backgroundColor: "#F5F5F7" }}>
+          <View style={styles.fixedHeader}>
             <TouchableOpacity
               style={styles.iconButton}
               onPress={() => setSelectedFoodItem(null)}
             >
               <Text style={styles.iconText}>‹</Text>
             </TouchableOpacity>
-            <Text style={styles.foodDetailTitle}>
-              {capitalizeFirst(stripParenthetical(selectedFoodItem.name)).toUpperCase()}
-            </Text>
+            <View style={styles.headerCenter}>
+              <Text style={styles.headerTitle}>
+                {capitalizeFirst(stripParenthetical(selectedFoodItem.name)).toUpperCase()}
+              </Text>
+            </View>
             <View style={styles.iconButton} />
           </View>
-
+        </SafeAreaView>
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={styles.foodDetailContent}
+          showsVerticalScrollIndicator
+          keyboardShouldPersistTaps="handled"
+        >
           <View style={styles.foodDetailSection}>
             <Text style={styles.foodDetailSectionTitle}>Nutrition Facts</Text>
             <View style={styles.foodDetailMacros}>
               <View style={styles.foodDetailMacroCard}>
-                <Text style={styles.foodDetailMacroValue}>
-                  {Math.round(selectedFoodItem.nutrients.calories_kcal)}
-                </Text>
                 <Text style={styles.foodDetailMacroLabel}>Calories</Text>
+                <TextInput
+                  style={styles.foodDetailMacroInput}
+                  keyboardType="numeric"
+                  value={String(Math.round(editableFoodNutrients.calories_kcal))}
+                  onChangeText={(text) => {
+                    setFoodSaveMessage(null);
+                    setEditableFoodNutrients({
+                      ...editableFoodNutrients,
+                      calories_kcal: Number(text) || 0
+                    });
+                  }}
+                />
               </View>
               <View style={styles.foodDetailMacroCard}>
-                <Text style={styles.foodDetailMacroValue}>
-                  {Math.round(selectedFoodItem.nutrients.protein_g)}g
-                </Text>
-                <Text style={styles.foodDetailMacroLabel}>Protein</Text>
+                <Text style={styles.foodDetailMacroLabel}>Protein (g)</Text>
+                <TextInput
+                  style={styles.foodDetailMacroInput}
+                  keyboardType="numeric"
+                  value={String(Math.round(editableFoodNutrients.protein_g))}
+                  onChangeText={(text) => {
+                    setFoodSaveMessage(null);
+                    setEditableFoodNutrients({
+                      ...editableFoodNutrients,
+                      protein_g: Number(text) || 0
+                    });
+                  }}
+                />
               </View>
               <View style={styles.foodDetailMacroCard}>
-                <Text style={styles.foodDetailMacroValue}>
-                  {Math.round(selectedFoodItem.nutrients.carbs_g)}g
-                </Text>
-                <Text style={styles.foodDetailMacroLabel}>Carbs</Text>
+                <Text style={styles.foodDetailMacroLabel}>Carbs (g)</Text>
+                <TextInput
+                  style={styles.foodDetailMacroInput}
+                  keyboardType="numeric"
+                  value={String(Math.round(editableFoodNutrients.carbs_g))}
+                  onChangeText={(text) => {
+                    setFoodSaveMessage(null);
+                    setEditableFoodNutrients({
+                      ...editableFoodNutrients,
+                      carbs_g: Number(text) || 0
+                    });
+                  }}
+                />
               </View>
               <View style={styles.foodDetailMacroCard}>
-                <Text style={styles.foodDetailMacroValue}>
-                  {Math.round(selectedFoodItem.nutrients.fat_g)}g
-                </Text>
-                <Text style={styles.foodDetailMacroLabel}>Fat</Text>
+                <Text style={styles.foodDetailMacroLabel}>Fat (g)</Text>
+                <TextInput
+                  style={styles.foodDetailMacroInput}
+                  keyboardType="numeric"
+                  value={String(Math.round(editableFoodNutrients.fat_g))}
+                  onChangeText={(text) => {
+                    setFoodSaveMessage(null);
+                    setEditableFoodNutrients({
+                      ...editableFoodNutrients,
+                      fat_g: Number(text) || 0
+                    });
+                  }}
+                />
               </View>
+            </View>
+
+            <View style={styles.foodDetailSection}>
+              <TouchableOpacity
+                style={[
+                  styles.foodDetailSaveButton,
+                  (!isFoodDirty || foodSaving) && styles.foodDetailSaveButtonDisabled
+                ]}
+                onPress={isFoodDirty && !foodSaving ? handleUpdateFoodNutrients : undefined}
+                disabled={!isFoodDirty || foodSaving}
+              >
+                <Text
+                  style={[
+                    styles.foodDetailSaveButtonText,
+                    (!isFoodDirty || foodSaving) && styles.foodDetailSaveButtonTextDisabled
+                  ]}
+                >
+                  {foodSaving ? "Saving changes" : "Save changes"}
+                </Text>
+              </TouchableOpacity>
+              {foodSaveMessage && (
+                <Text style={styles.foodDetailSaveMessage}>{foodSaveMessage}</Text>
+              )}
             </View>
 
             <View style={styles.foodDetailMicros}>
@@ -999,6 +3459,7 @@ export default function App() {
                 </View>
               )}
             </View>
+
           </View>
 
           {loadingInsights ? (
@@ -1007,12 +3468,14 @@ export default function App() {
             </View>
           ) : foodInsights ? (
             <>
-              {foodInsights.healthQuotient > 0 && (
-                <View style={styles.foodDetailSection}>
+              {foodInsights.healthQuotient > 0 && (() => {
+                const { label, color } = getHealthQuotientLevel(foodInsights.healthQuotient);
+                return (
+                <View style={styles.foodDetailHealthSection}>
                   <Text style={styles.foodDetailSectionTitle}>Health Quotient</Text>
                   <View style={styles.foodDetailHealthQuotient}>
-                    <Text style={styles.foodDetailHealthQuotientValue}>
-                      {foodInsights.healthQuotient}/100
+                    <Text style={[styles.foodDetailHealthQuotientValue, { color }]}>
+                      {label}
                     </Text>
                     <View style={styles.foodDetailHealthQuotientBar}>
                       <View
@@ -1020,42 +3483,78 @@ export default function App() {
                           styles.foodDetailHealthQuotientFill,
                           {
                             width: `${foodInsights.healthQuotient}%`,
-                            backgroundColor:
-                              foodInsights.healthQuotient >= 80
-                                ? "#4CAF50"
-                                : foodInsights.healthQuotient >= 60
-                                  ? "#FFC107"
-                                  : "#FF5722"
+                            backgroundColor: color
                           }
                         ]}
                       />
                     </View>
                   </View>
                 </View>
-              )}
+                );
+              })()}
 
               {foodInsights.insights && (
-                <View style={styles.foodDetailSection}>
-                  <Text style={styles.foodDetailSectionTitle}>Insights</Text>
-                  <Text style={styles.foodDetailInsights}>{foodInsights.insights}</Text>
+                <View style={styles.foodDetailSectionWrapper}>
+                  <View style={styles.foodDetailSection}>
+                    <Text style={styles.foodDetailSectionTitle}>Insights</Text>
+                    <Text style={[styles.foodDetailInsights, !isPro && styles.proFeatureBlur]}>{foodInsights.insights}</Text>
+                  </View>
+                  {!isPro && (
+                    <TouchableOpacity
+                      style={styles.proFeatureOverlayContributors}
+                      onPress={() => presentPaywall()}
+                      activeOpacity={1}
+                    >
+                      <Text style={styles.proFeatureOverlayText}>Unlock food insights</Text>
+                      <Text style={styles.proFeatureOverlaySubtext}>AI-powered tips and recommendations</Text>
+                      <TouchableOpacity
+                        style={styles.upgradeProButton}
+                        onPress={() => presentPaywall()}
+                        activeOpacity={0.9}
+                      >
+                        <Text style={styles.upgradeProButtonText}>Upgrade to Pro</Text>
+                      </TouchableOpacity>
+                    </TouchableOpacity>
+                  )}
                 </View>
               )}
 
               {foodInsights.tips && foodInsights.tips.length > 0 && (
-                <View style={styles.foodDetailSection}>
-                  <Text style={styles.foodDetailSectionTitle}>Tips</Text>
-                  {foodInsights.tips.map((tip, idx) => (
-                    <View key={idx} style={styles.foodDetailTip}>
-                      <Text style={styles.foodDetailTipBullet}>•</Text>
-                      <Text style={styles.foodDetailTipText}>{tip}</Text>
+                <View style={styles.foodDetailSectionWrapper}>
+                  <View style={styles.foodDetailSection}>
+                    <Text style={styles.foodDetailSectionTitle}>Tips</Text>
+                    <View style={!isPro && styles.proFeatureBlur}>
+                      {foodInsights.tips.map((tip, idx) => (
+                        <View key={idx} style={styles.foodDetailTip}>
+                          <Text style={styles.foodDetailTipBullet}>•</Text>
+                          <Text style={styles.foodDetailTipText}>{tip}</Text>
+                        </View>
+                      ))}
                     </View>
-                  ))}
+                  </View>
+                  {!isPro && (
+                    <TouchableOpacity
+                      style={styles.proFeatureOverlayContributors}
+                      onPress={() => presentPaywall()}
+                      activeOpacity={1}
+                    >
+                      <Text style={styles.proFeatureOverlayText}>Unlock food tips</Text>
+                      <Text style={styles.proFeatureOverlaySubtext}>AI-powered tips and recommendations</Text>
+                      <TouchableOpacity
+                        style={styles.upgradeProButton}
+                        onPress={() => presentPaywall()}
+                        activeOpacity={0.9}
+                      >
+                        <Text style={styles.upgradeProButtonText}>Upgrade to Pro</Text>
+                      </TouchableOpacity>
+                    </TouchableOpacity>
+                  )}
                 </View>
               )}
             </>
           ) : null}
         </ScrollView>
-      </SafeAreaView>
+      </View>
     );
   }
 
@@ -1064,25 +3563,38 @@ export default function App() {
       selectedItems.reduce((sum, item) => sum + item.nutrients.calories_kcal, 0)
     );
     return (
-      <SafeAreaView style={styles.container}>
-        <ScrollView contentContainerStyle={styles.mealDetailContent}>
-          <View style={styles.mealDetailHeader}>
+      <View style={{ flex: 1, backgroundColor: "#F5F5F7" }}>
+        <SafeAreaView style={{ backgroundColor: "#F5F5F7" }}>
+          <View style={styles.fixedHeader}>
             <TouchableOpacity
               style={styles.iconButton}
               onPress={() => setView("home")}
             >
               <Text style={styles.iconText}>‹</Text>
             </TouchableOpacity>
-            <Text style={styles.mealDetailTitle}>{selectedMealLabel}</Text>
-            <View style={styles.iconButton} />
+            <View style={styles.headerCenter}>
+              <Text style={styles.headerTitle}>{selectedMealLabel}</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.headerAddButton}
+              onPress={() => {
+                setEntryText("");
+                setView("add");
+              }}
+            >
+              <Text style={styles.headerAddText}>+ Add</Text>
+            </TouchableOpacity>
           </View>
-
+        </SafeAreaView>
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.mealDetailContent}>
           {selectedItems.map((item) => (
             <TouchableOpacity
               key={item.id}
               style={styles.itemCard}
-              onPress={() => {
+              onPress={async () => {
                 setSelectedFoodItem(item);
+                setEditableFoodNutrients(item.nutrients);
+                setOriginalFoodNutrients(item.nutrients);
                 fetchFoodInsights(item, selectedMealId);
               }}
             >
@@ -1139,18 +3651,37 @@ export default function App() {
             <Text style={styles.emptyText}>No items logged yet.</Text>
           )}
 
-          <TouchableOpacity
-            style={styles.addMoreButton}
-            onPress={() => setView("add")}
-          >
-            <Text style={styles.addMoreText}>+ Add more</Text>
-          </TouchableOpacity>
+          {selectedItems.length > 0 && (
+            <TouchableOpacity
+              style={styles.saveTemplateButton}
+              onPress={() => {
+                const itemNames = selectedItems.map((item) => {
+                  const baseName = capitalizeFirst(stripParenthetical(item.name)).trim();
+                  if (item.grams && item.grams > 0) {
+                    return `${Math.round(item.grams)}g ${baseName}`;
+                  }
+                  const qty = item.quantity ? String(item.quantity) : "";
+                  const unit = item.unit || "";
+                  const prefix = `${qty}${unit ? unit : ""}`.trim();
+                  return prefix ? `${prefix} ${baseName}` : baseName;
+                });
+                setEntryText(itemNames.join("\n"));
+                setTemplateName(`${selectedMealLabel} - ${new Date().toLocaleDateString()}`);
+                setEditingTemplateId(null); // New template
+                setIsTemplateMode(true);
+                setView("add");
+              }}
+            >
+              <Text style={styles.saveTemplateText}>Save as template</Text>
+            </TouchableOpacity>
+          )}
         </ScrollView>
+
 
         <TouchableOpacity style={styles.doneButton} onPress={() => setView("home")}>
           <Text style={styles.doneButtonText}>Done</Text>
         </TouchableOpacity>
-      </SafeAreaView>
+      </View>
     );
   }
 
@@ -1258,15 +3789,12 @@ export default function App() {
                   <tr><td>Protein</td><td>${Math.round(dayTotals.protein_g)}g</td></tr>
                   <tr><td>Carbs</td><td>${Math.round(dayTotals.carbs_g)}g</td></tr>
                   <tr><td>Fat</td><td>${Math.round(dayTotals.fat_g)}g</td></tr>
-                  <tr><td>Fiber</td><td>${Math.round(microTotals.fiber_g * 10) / 10}g</td></tr>
-                  <tr><td>Vitamin C</td><td>${Math.round(microTotals.vitamin_c_mg * 10) / 10}mg</td></tr>
-                  <tr><td>Vitamin A</td><td>${Math.round(microTotals.vitamin_a_mcg * 10) / 10}mcg</td></tr>
-                  <tr><td>Omega 3</td><td>${Math.round(microTotals.omega_3_g * 1000 * 10) / 10}mg</td></tr>
-                  <tr><td>Cholesterol</td><td>${Math.round(microTotals.cholesterol_mg * 10) / 10}mg</td></tr>
-                  <tr><td>Vitamin D</td><td>${Math.round(microTotals.vitamin_d_iu * 10) / 10}IU</td></tr>
-                  <tr><td>Magnesium</td><td>${Math.round(microTotals.magnesium_mg * 10) / 10}mg</td></tr>
-                  <tr><td>Sodium</td><td>${Math.round(microTotals.sodium_mg * 10) / 10}mg</td></tr>
-                  <tr><td>Potassium</td><td>${Math.round(microTotals.potassium_mg * 10) / 10}mg</td></tr>
+                  ${ANALYSIS_MICROS.map(({ label, unit, key }) => {
+                    const raw = key ? (microTotals[key] ?? 0) : 0;
+                    const disp = microDisplayValue(key, raw, unit);
+                    const fmt = Number.isInteger(disp) ? disp : Math.round(disp * 10) / 10;
+                    return `<tr><td>${label}</td><td>${fmt}${unit}</td></tr>`;
+                  }).join("")}
                 </table>
               </div>
           `;
@@ -1467,6 +3995,7 @@ export default function App() {
           <Image 
             source={require("./assets/loading-screen.png")}
             style={{ width: "100%", height: "100%", resizeMode: "contain" }}
+            resizeMode="contain"
           />
         </View>
       </SafeAreaView>
@@ -1480,19 +4009,25 @@ export default function App() {
           <Text style={styles.menuIcon}>☰</Text>
         </TouchableOpacity>
         <View style={styles.headerCenter}>
-          <TouchableOpacity style={styles.iconButton} onPress={goToPrevDay}>
-            <Text style={styles.iconText}>‹</Text>
-          </TouchableOpacity>
-          <Text style={styles.headerTitle}>
-            {hydrated ? formatHeaderLabel(selectedDate) : "Today"}
-          </Text>
-          <TouchableOpacity
-            style={[styles.iconButton, !canGoNext && styles.iconButtonDisabled]}
-            onPress={goToNextDay}
-            disabled={!canGoNext}
-          >
-            <Text style={[styles.iconText, !canGoNext && styles.iconTextDisabled]}>›</Text>
-          </TouchableOpacity>
+          {activeTab === "insights" ? (
+            <Text style={styles.headerTitle}>Insights</Text>
+          ) : (
+            <>
+              <TouchableOpacity style={styles.iconButton} onPress={goToPrevDay}>
+                <Text style={styles.iconText}>‹</Text>
+              </TouchableOpacity>
+              <Text style={styles.headerTitle}>
+                {hydrated ? formatHeaderLabel(selectedDate) : "Today"}
+              </Text>
+              <TouchableOpacity
+                style={[styles.iconButton, !canGoNext && styles.iconButtonDisabled]}
+                onPress={goToNextDay}
+                disabled={!canGoNext}
+              >
+                <Text style={[styles.iconText, !canGoNext && styles.iconTextDisabled]}>›</Text>
+              </TouchableOpacity>
+            </>
+          )}
         </View>
         <View style={styles.iconButton} />
       </View>
@@ -1500,20 +4035,75 @@ export default function App() {
       <Modal
         visible={menuVisible}
         transparent={true}
-        animationType="fade"
-        onRequestClose={() => setMenuVisible(false)}
+        animationType="none"
+        onRequestClose={closeSidebar}
       >
-        <TouchableOpacity
-          style={styles.menuOverlay}
-          activeOpacity={1}
-          onPress={() => setMenuVisible(false)}
-        >
-          <View style={styles.menuContainer}>
+        <View style={styles.sidebarRoot}>
+          <TouchableOpacity
+            style={[StyleSheet.absoluteFill, styles.sidebarOverlay]}
+            activeOpacity={1}
+            onPress={closeSidebar}
+          />
+          <Animated.View
+            style={[
+              styles.sidebar,
+              { width: SIDEBAR_WIDTH, transform: [{ translateX: sidebarAnim }] },
+            ]}
+          >
+            <View style={styles.sidebarHeader}>
+              <Text style={styles.sidebarTitle}>Menu</Text>
+              <TouchableOpacity
+                style={styles.sidebarCloseButton}
+                onPress={closeSidebar}
+              >
+                <Text style={styles.sidebarCloseText}>✕</Text>
+              </TouchableOpacity>
+            </View>
             <TouchableOpacity
               style={styles.menuItem}
               onPress={() => {
-                setMenuVisible(false);
-                // TODO: Navigate to Personal details screen
+                closeSidebar();
+                setTimeout(() => presentCustomerCenter(), 220);
+              }}
+            >
+              <Text style={styles.menuItemText}>Manage Subscription</Text>
+            </TouchableOpacity>
+            {/* DEBUG: Reset subscription for testing - REMOVE BEFORE PRODUCTION */}
+            <TouchableOpacity
+              style={[styles.menuItem, styles.debugMenuItem]}
+              onPress={async () => {
+                console.log("Reset button pressed");
+                closeSidebar();
+                try {
+                  await resetSubscriptionForTesting();
+                  console.log("Reset function completed");
+                } catch (err) {
+                  console.error("Reset button error:", err);
+                  // Force state update even if reset fails
+                  alert("Reset completed. Check console for details.");
+                }
+              }}
+            >
+              <Text style={[styles.menuItemText, styles.debugMenuItemText]}>🔧 Reset Subscription (Testing)</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                closeSidebar();
+                setTimeout(() => {
+                  setFeedbackRating(0);
+                  setFeedbackText("");
+                  setFeedbackModalVisible(true);
+                }, 220);
+              }}
+            >
+              <Text style={styles.menuItemText}>Share feedback</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                closeSidebar();
+                setTimeout(() => setView("personal"), 220);
               }}
             >
               <Text style={styles.menuItemText}>Personal details</Text>
@@ -1521,17 +4111,125 @@ export default function App() {
             <TouchableOpacity
               style={styles.menuItem}
               onPress={() => {
-                setMenuVisible(false);
-                setView("export");
+                closeSidebar();
+                setTimeout(() => setView("export"), 220);
               }}
             >
               <Text style={styles.menuItemText}>Export</Text>
+              {!isPro && (
+                <Image
+                  source={require("./assets/Pro_Badge.png")}
+                  style={styles.menuProBadge}
+                  resizeMode="contain"
+                />
+              )}
             </TouchableOpacity>
-          </View>
-        </TouchableOpacity>
+          </Animated.View>
+        </View>
       </Modal>
 
-      <View style={styles.mealsSwipeArea} {...mealsSwipeResponder.panHandlers}>
+      <Modal
+        visible={feedbackModalVisible}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setFeedbackModalVisible(false)}
+      >
+        <KeyboardAvoidingView
+          style={styles.feedbackModalOverlay}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          keyboardVerticalOffset={0}
+        >
+          <View style={styles.feedbackModalContent}>
+            <View style={styles.feedbackModalHeader}>
+              <Text style={styles.feedbackModalTitle}>How are we doing?</Text>
+              <TouchableOpacity
+                style={styles.feedbackModalCloseButton}
+                onPress={() => {
+                  setFeedbackModalVisible(false);
+                  setFeedbackRating(0);
+                  setFeedbackText("");
+                }}
+              >
+                <Text style={styles.feedbackModalCloseText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.feedbackModalSubtext}>
+              Your opinion means a world to us. Please share with us.
+            </Text>
+            <View style={styles.feedbackStarsRow}>
+              {[1, 2, 3, 4, 5].map((star) => (
+                <TouchableOpacity
+                  key={star}
+                  onPress={() => setFeedbackRating(star)}
+                  style={styles.feedbackStarButton}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.feedbackStarIcon}>
+                    {star <= feedbackRating ? "★" : "☆"}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <TextInput
+              style={styles.feedbackTextInput}
+              placeholder="Share your thoughts with us..."
+              placeholderTextColor="#9CA3AF"
+              multiline
+              maxLength={500}
+              value={feedbackText}
+              onChangeText={(t) => setFeedbackText(t)}
+              textAlignVertical="top"
+              editable
+            />
+            <Text style={styles.feedbackCharCount}>{feedbackText.length}/500</Text>
+            <TouchableOpacity
+              style={[
+                styles.feedbackSubmitButton,
+                feedbackRating < 1 && styles.feedbackSubmitButtonDisabled
+              ]}
+              onPress={async () => {
+                if (feedbackRating >= 1) {
+                  try {
+                    const res = await fetch(`${API_BASE_URL}/feedback`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        rating: feedbackRating,
+                        text: feedbackText.trim() || undefined
+                      })
+                    });
+                    if (!res.ok) {
+                      const err = await res.json().catch(() => ({}));
+                      console.warn("Feedback submit failed:", res.status, err);
+                    }
+                  } catch (err) {
+                    console.warn("Feedback submit error:", err);
+                  }
+                  setFeedbackModalVisible(false);
+                  setFeedbackRating(0);
+                  setFeedbackText("");
+                }
+              }}
+              disabled={feedbackRating < 1}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.feedbackSubmitButtonText}>Submit</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.feedbackSkipButton}
+              onPress={() => {
+                setFeedbackModalVisible(false);
+                setFeedbackRating(0);
+                setFeedbackText("");
+              }}
+            >
+              <Text style={styles.feedbackSkipButtonText}>Skip</Text>
+            </TouchableOpacity>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      <View style={styles.mealsSwipeArea} {...((activeTab === "meals" || activeTab === "analysis") ? mealsSwipeResponder.panHandlers : {})}>
         {activeTab === "meals" && (
           <Animated.View
             style={[
@@ -1542,24 +4240,70 @@ export default function App() {
             ]}
           >
             <ScrollView contentContainerStyle={styles.content}>
-            <Text style={styles.sectionLabel}>NUTRITION</Text>
-            <View style={styles.nutritionCard}>
-              {nutritionSummary.map((item) => (
-                <View key={item.label} style={styles.nutritionItem}>
-                  <Text style={styles.nutritionLabel}>{item.label}</Text>
-                  <Text style={styles.nutritionValue}>
-                    {item.label === "Calories"
-                      ? Math.round(totals.calories_kcal)
-                      : item.label === "Proteins"
-                        ? `${Math.round(totals.protein_g)}g`
-                        : item.label === "Carbs"
-                          ? `${Math.round(totals.carbs_g)}g`
-                          : `${Math.round(totals.fat_g)}g`}
-                  </Text>
-                  <Text style={styles.nutritionTarget}>{item.target}</Text>
+            <TouchableOpacity
+              onPress={() => setActiveTab("analysis")}
+              activeOpacity={1}
+            >
+              <Text style={styles.sectionLabel}>NUTRITION</Text>
+              <View style={styles.nutritionCard}>
+                {(() => {
+                  const macroTargets = getMacroTargets(userProfile);
+                  const nutritionSummary = [
+                    { label: "Calories", target: `(${macroTargets.calories_kcal})` },
+                    { label: "Protein", target: `(${macroTargets.protein_g}g)` },
+                    { label: "Carbs", target: `(${macroTargets.carbs_g}g)` },
+                    { label: "Fat", target: `(${macroTargets.fat_g}g)` }
+                  ];
+                  return nutritionSummary.map((item) => (
+                    <View key={item.label} style={styles.nutritionItem}>
+                      <Text style={styles.nutritionLabel}>{item.label}</Text>
+                      <Text style={styles.nutritionValue}>
+                        {item.label === "Calories"
+                          ? Math.round(totals.calories_kcal)
+                          : item.label === "Protein"
+                            ? `${Math.round(totals.protein_g)}g`
+                            : item.label === "Carbs"
+                              ? `${Math.round(totals.carbs_g)}g`
+                              : `${Math.round(totals.fat_g)}g`}
+                      </Text>
+                      <Text style={styles.nutritionTarget}>{item.target}</Text>
+                    </View>
+                  ));
+                })()}
+              </View>
+            </TouchableOpacity>
+
+            {shouldShowInsight && bestInsight && (
+              <View style={styles.yesterdayInsightCard}>
+                <View style={styles.yesterdayInsightHeader}>
+                  <Text style={styles.yesterdayInsightDate}>Yesterday</Text>
+                  <TouchableOpacity onPress={handleDismissInsight} style={styles.yesterdayInsightDismiss}>
+                    <Text style={styles.yesterdayInsightDismissText}>✕</Text>
+                  </TouchableOpacity>
                 </View>
-              ))}
-            </View>
+                {isPro ? (
+                  <>
+                    <Text style={styles.yesterdayInsightAffirmation}>{bestInsight.affirmation}</Text>
+                    <Text style={styles.yesterdayInsightCategory}>{bestInsight.category}</Text>
+                    <Text style={styles.yesterdayInsightValue}>{bestInsight.value}</Text>
+                    <Text style={styles.yesterdayInsightMessage}>{bestInsight.message}</Text>
+                  </>
+                ) : (
+                  <>
+                    <Text style={styles.yesterdayInsightAffirmation}>{bestInsight.affirmation}</Text>
+                    <Text style={styles.yesterdayInsightCategory}>{bestInsight.category}</Text>
+                    <Text style={styles.yesterdayInsightValue}>{bestInsight.value}</Text>
+                    <Text style={styles.yesterdayInsightMessage}>Upgrade to Pro for personalized tips and recommendations.</Text>
+                    <TouchableOpacity
+                      style={styles.upgradeProButton}
+                      onPress={() => presentPaywall()}
+                    >
+                      <Text style={styles.upgradeProButtonText}>Upgrade to Pro to View Full Insights</Text>
+                    </TouchableOpacity>
+                  </>
+                )}
+              </View>
+            )}
 
             <Text style={[styles.sectionLabel, styles.sectionSpacing]}>MEALS</Text>
             <View style={styles.mealsList}>
@@ -1601,7 +4345,7 @@ export default function App() {
                     style={styles.addCircle}
                     onPress={() => openAdd(meal.id)}
                   >
-                    <Text style={styles.addCircleText}>Add</Text>
+                    <Text style={styles.addCircleText}>+</Text>
                   </TouchableOpacity>
                 </TouchableOpacity>
                 );
@@ -1611,83 +4355,105 @@ export default function App() {
           </Animated.View>
         )}
 
-        {activeTab === "analysis" &&
-          selectedNutrient === null && (
+        {activeTab === "analysis" && (
+          <Animated.View
+            style={[
+              { flex: 1 },
+              {
+                transform: [{ translateX: slideAnim }],
+              },
+            ]}
+          >
+            {selectedNutrient === null ? (
             <ScrollView
               contentContainerStyle={styles.analysisContent}
               showsVerticalScrollIndicator
             >
               <Text style={styles.sectionLabel}>NUTRIENTS</Text>
               <View style={styles.analysisMacroList}>
-                {ANALYSIS_MACROS.map(({ key, label, unit, target }) => {
-                  const current = totals[key];
-                  const progress = target > 0 ? Math.min(1, current / target) : 0;
-                  return (
-                    <TouchableOpacity
-                      key={key}
-                      style={styles.analysisMacroCard}
-                      onPress={() =>
-                        setSelectedNutrient({
-                          type: "macro",
-                          key,
-                          label,
-                          unit,
-                          target
-                        })
-                      }
-                      activeOpacity={0.8}
-                    >
-                      <Text style={styles.analysisMacroName}>{label}</Text>
-                      <View style={styles.analysisMacroBarTrack}>
-                        <View
-                          style={[
-                            styles.analysisMacroBarFill,
-                            { width: `${progress * 100}%` }
-                          ]}
-                        />
-                      </View>
-                      <Text style={styles.analysisMacroValues}>
-                        <Text style={styles.analysisMacroCurrent}>
-                          {Math.round(current)}
-                          {unit}
+                {(() => {
+                  const macroTargets = getMacroTargets(userProfile);
+                  const ANALYSIS_MACROS = [
+                    { key: "calories_kcal" as const, label: "Calories", unit: "kcal", target: macroTargets.calories_kcal },
+                    { key: "protein_g" as const, label: "Protein", unit: "g", target: macroTargets.protein_g },
+                    { key: "carbs_g" as const, label: "Carbs", unit: "g", target: macroTargets.carbs_g },
+                    { key: "fat_g" as const, label: "Fat", unit: "g", target: macroTargets.fat_g }
+                  ];
+                  return ANALYSIS_MACROS.map(({ key, label, unit, target }) => {
+                    const current = Number(analysisTotals[key]) || 0;
+                    const progress = target > 0 ? Math.min(1, Math.max(0, current / target)) : 0;
+                    return (
+                      <TouchableOpacity
+                        key={key}
+                        style={styles.analysisMacroCard}
+                        onPress={() => {
+                          setSelectedNutrient({
+                            type: "macro",
+                            key,
+                            label,
+                            unit,
+                            target
+                          });
+                        }}
+                        activeOpacity={0.8}
+                      >
+                        <Text style={styles.analysisMacroName}>
+                          {label} ({unit})
                         </Text>
+                        <View style={styles.analysisMacroRingRow}>
+                          <CircularProgressRing progress={progress} value={current} />
+                        </View>
                         <Text style={styles.analysisMacroTarget}>
-                          {" "}
                           / {target}
-                          {unit}
                         </Text>
-                      </Text>
-                      <Text style={styles.analysisMacroArrow}>›</Text>
-                    </TouchableOpacity>
-                  );
-                })}
+                      </TouchableOpacity>
+                    );
+                  });
+                })()}
               </View>
 
-              <Text style={[styles.sectionLabel, styles.sectionSpacing]}>
-                MICRO-NUTRIENTS
-              </Text>
-              <View style={styles.analysisMicroGrid}>
+              <View style={[styles.sectionLabelContainer, styles.sectionSpacing]}>
+                <Text style={styles.sectionLabel}>
+                  MICRO-NUTRIENTS
+                </Text>
+                {!isPro && (
+                  <Image
+                    source={require("./assets/Pro_Badge.png")}
+                    style={styles.sectionProBadge}
+                    resizeMode="contain"
+                  />
+                )}
+              </View>
+              <View style={styles.analysisMicroGridWrapper}>
+              <View style={[styles.analysisMicroGrid, !isPro && styles.proFeatureBlur]}>
                 {ANALYSIS_MICROS.map(({ label, unit, target, key }) => {
-                  const current = key ? (microTotals[key] ?? 0) : 0;
+                  const raw = key ? (analysisMicroTotals[key] ?? 0) : 0;
+                  const safeRaw = Number(raw) || 0;
+                  const current = microDisplayValue(key, safeRaw, unit);
+                  const safeCurrent = Number(current) || 0;
                   return (
                     <TouchableOpacity
                       key={label}
                       style={styles.analysisMicroCard}
-                      onPress={() =>
+                      onPress={async () => {
+                        if (!isPro) {
+                          await presentPaywall();
+                          return;
+                        }
                         setSelectedNutrient({
                           type: "micro",
                           label,
                           unit,
                           target,
                           ...(key ? { key } : {})
-                        })
-                      }
+                        });
+                      }}
                       activeOpacity={0.8}
                     >
                       <Text style={styles.analysisMicroName}>{label}</Text>
                       <View style={styles.analysisMicroValues}>
                         <Text style={styles.analysisMicroCurrent}>
-                          {key ? Math.round(current) : current}
+                          {key ? Math.round(safeCurrent) : safeCurrent}
                           {unit}
                         </Text>
                         <Text style={styles.analysisMicroTarget}>
@@ -1699,26 +4465,48 @@ export default function App() {
                   );
                 })}
               </View>
+              {!isPro && (
+                <TouchableOpacity
+                  style={styles.proFeatureOverlay}
+                  onPress={() => presentPaywall()}
+                  activeOpacity={1}
+                >
+                  <Text style={styles.proFeatureOverlayText}>Unlock micronutrient tracking</Text>
+                  <Text style={styles.proFeatureOverlaySubtext}>See daily goals and progress for micros like Fiber, Cholesterol</Text>
+                  <TouchableOpacity
+                    style={styles.upgradeProButton}
+                    onPress={() => presentPaywall()}
+                    activeOpacity={0.9}
+                  >
+                    <Text style={styles.upgradeProButtonText}>Upgrade to Pro</Text>
+                  </TouchableOpacity>
+                </TouchableOpacity>
+              )}
+              </View>
             </ScrollView>
-          )}
-
-        {activeTab === "analysis" && selectedNutrient !== null && (
-          <ScrollView
-            contentContainerStyle={styles.nutrientDetailContent}
-            showsVerticalScrollIndicator
-          >
-            <View style={styles.nutrientDetailHeader}>
-              <TouchableOpacity
-                style={styles.iconButton}
-                onPress={() => setSelectedNutrient(null)}
-              >
-                <Text style={styles.iconText}>‹</Text>
-              </TouchableOpacity>
-              <Text style={styles.nutrientDetailTitle}>
-                {selectedNutrient.label.toUpperCase()}
-              </Text>
-              <View style={styles.iconButton} />
-            </View>
+            ) : (
+          <>
+            <SafeAreaView style={{ backgroundColor: "#F5F5F7" }}>
+              <View style={styles.fixedHeader}>
+                <TouchableOpacity
+                  style={styles.iconButton}
+                  onPress={() => setSelectedNutrient(null)}
+                >
+                  <Text style={styles.iconText}>‹</Text>
+                </TouchableOpacity>
+                <View style={styles.headerCenter}>
+                  <Text style={styles.headerTitle}>
+                    {selectedNutrient.label.toUpperCase()}
+                  </Text>
+                </View>
+                <View style={styles.iconButton} />
+              </View>
+            </SafeAreaView>
+            <ScrollView
+              style={{ flex: 1 }}
+              contentContainerStyle={styles.nutrientDetailContent}
+              showsVerticalScrollIndicator
+            >
 
             <Text style={styles.nutrientDetailExplanation}>
               {NUTRIENT_EXPLANATIONS[selectedNutrient.label] ??
@@ -1726,123 +4514,311 @@ export default function App() {
             </Text>
 
             {(() => {
-              const current =
+              const raw =
                 selectedNutrient.type === "macro"
-                  ? totals[selectedNutrient.key]
+                  ? (analysisTotals[selectedNutrient.key] ?? 0)
                   : selectedNutrient.type === "micro" && selectedNutrient.key
-                    ? (microTotals[selectedNutrient.key] ?? 0)
+                    ? (analysisMicroTotals[selectedNutrient.key] ?? 0)
                     : 0;
+              const safeRaw = Number(raw) || 0;
               const { target, unit } = selectedNutrient;
+              const key = selectedNutrient.type === "micro" ? selectedNutrient.key : undefined;
+              const current = key ? microDisplayValue(key, safeRaw, unit) : safeRaw;
+              const safeCurrent = Number(current) || 0;
               const pct =
-                target > 0 ? Math.round((current / target) * 100) : 0;
+                target > 0 ? Math.round((safeCurrent / target) * 100) : 0;
               return (
                 <Text style={styles.nutrientDetailProgress}>
-                  {Math.round(current)}
-                  {unit} today ({pct}% of your goal)
+                  {Math.round(safeCurrent)}
+                  {unit} today ({Number.isFinite(pct) ? pct : 0}% of your goal)
                 </Text>
               );
             })()}
 
-            <Text style={styles.nutrientDetailContributorsLabel}>
-              Contributors
-            </Text>
-            {(() => {
-              const contributors = getContributors(
-                selectedNutrient,
-                mealItems,
-                totals
-              );
-              if (contributors.length === 0) {
-                return (
-                  <Text style={styles.nutrientDetailEmpty}>
-                    No logged foods contribute to this nutrient yet.
-                  </Text>
+            <View style={styles.nutrientDetailContributorsLabelContainer}>
+              <Text style={styles.nutrientDetailContributorsLabel}>
+                Contributors
+              </Text>
+              {!isPro && (
+                <Image
+                  source={require("./assets/Pro_Badge.png")}
+                  style={styles.contributorsProBadge}
+                  resizeMode="contain"
+                />
+              )}
+            </View>
+            <View style={styles.nutrientDetailContributorsWrapper}>
+              {(() => {
+                const contributors = getContributors(
+                  selectedNutrient,
+                  analysisMealItems,
+                  analysisTotals
                 );
-              }
-              return (
-                <View style={styles.nutrientDetailContributors}>
-                  {contributors.map(({ name, amount }, idx) => (
-                    <View
-                      key={name + String(amount)}
-                      style={[
-                        styles.nutrientDetailRow,
-                        idx === contributors.length - 1 &&
-                          styles.nutrientDetailRowLast
-                      ]}
-                    >
-                      <Text
-                        style={styles.nutrientDetailRowName}
-                        numberOfLines={1}
-                        ellipsizeMode="tail"
+                if (contributors.length === 0) {
+                  return (
+                    <Text style={styles.nutrientDetailEmpty}>
+                      No logged foods contribute to this nutrient yet.
+                    </Text>
+                  );
+                }
+                const key = selectedNutrient.type === "micro" ? selectedNutrient.key : undefined;
+                const u = selectedNutrient.unit;
+                return (
+                  <View style={[styles.nutrientDetailContributors, !isPro && styles.proFeatureBlur]}>
+                    {contributors.map(({ name, amount }, idx) => {
+                      const safeAmount = Number(amount) || 0;
+                      const displayAmt = key ? microDisplayValue(key, safeAmount, u) : safeAmount;
+                      const safeDisplayAmt = Number(displayAmt) || 0;
+                      return (
+                      <View
+                        key={name + String(idx)}
+                        style={[
+                          styles.nutrientDetailRow,
+                          idx === contributors.length - 1 &&
+                            styles.nutrientDetailRowLast
+                        ]}
                       >
-                        {name}
-                      </Text>
-                      <Text style={styles.nutrientDetailRowAmount}>
-                        {Math.round(amount)}
-                        {selectedNutrient.unit}
-                      </Text>
-                    </View>
-                  ))}
-                </View>
-              );
-            })()}
-          </ScrollView>
+                        <Text
+                          style={styles.nutrientDetailRowName}
+                          numberOfLines={1}
+                          ellipsizeMode="tail"
+                        >
+                          {name}
+                        </Text>
+                        <Text style={styles.nutrientDetailRowAmount}>
+                          {Math.round(safeDisplayAmt)}
+                          {u}
+                        </Text>
+                      </View>
+                      );
+                    })}
+                  </View>
+                );
+              })()}
+              {!isPro && (
+                <TouchableOpacity
+                  style={styles.proFeatureOverlayContributors}
+                  onPress={() => presentPaywall()}
+                  activeOpacity={1}
+                >
+                  <Text style={styles.proFeatureOverlayText}>Unlock contributors list</Text>
+                  <Text style={styles.proFeatureOverlaySubtext}>See which foods contribute to this nutrient</Text>
+                  <TouchableOpacity
+                    style={styles.upgradeProButton}
+                    onPress={() => presentPaywall()}
+                    activeOpacity={0.9}
+                  >
+                    <Text style={styles.upgradeProButtonText}>Upgrade to Pro</Text>
+                  </TouchableOpacity>
+                </TouchableOpacity>
+              )}
+            </View>
+            </ScrollView>
+          </>
+            )}
+          </Animated.View>
         )}
 
-
         {activeTab === "insights" && (
-          <View style={styles.insightsPlaceholder}>
-            <Text style={styles.insightsPlaceholderText}>Insights coming soon.</Text>
+          <View style={styles.insightsRoot}>
+          {!isPro && (
+            <TouchableOpacity
+              style={styles.proFeatureFullOverlay}
+              onPress={() => presentPaywall()}
+              activeOpacity={1}
+            >
+              <View style={styles.insightsPaywallCard}>
+                <View style={styles.insightsPaywallProBadge}>
+                  <Text style={styles.insightsPaywallProBadgeText}>PRO</Text>
+                </View>
+
+                <View style={styles.insightsPaywallLogoRow}>
+                  <Image
+                    source={require("./assets/Logo.png")}
+                    style={styles.insightsPaywallLogoImage}
+                    resizeMode="contain"
+                  />
+                </View>
+
+                <Text style={styles.insightsPaywallHeadline}>
+                  UNLOCK PERSONALIZED{"\n"}INSIGHTS WITH PRO
+                </Text>
+                <Text style={styles.insightsPaywallBody}>
+                  AI-powered tips and recommendations
+                </Text>
+
+                <View style={styles.insightsPaywallSpacer} />
+
+                <Text style={styles.insightsPaywallTrialText}>
+                  Start a 7-day free trial
+                </Text>
+
+                <TouchableOpacity
+                  style={styles.insightsPaywallPrimaryButton}
+                  onPress={() => presentPaywall()}
+                  activeOpacity={0.9}
+                >
+                  <Text style={styles.insightsPaywallPrimaryButtonText}>Upgrade to Pro</Text>
+                </TouchableOpacity>
+              </View>
+            </TouchableOpacity>
+          )}
+            <View style={styles.insightsSubTabsContainer}>
+              <View style={styles.insightsSubTabs}>
+                <TouchableOpacity
+                  style={[styles.insightsSubTab, insightsSubTab === "day" && styles.insightsSubTabActive]}
+                  onPress={() => setInsightsSubTab("day")}
+                >
+                  <Text style={[styles.insightsSubTabLabel, insightsSubTab === "day" && styles.insightsSubTabLabelActive]}>
+                    Day
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.insightsSubTab, insightsSubTab === "week" && styles.insightsSubTabActive]}
+                  onPress={() => setInsightsSubTab("week")}
+                >
+                  <Text style={[styles.insightsSubTabLabel, insightsSubTab === "week" && styles.insightsSubTabLabelActive]}>
+                    Week
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+            <ScrollView
+              contentContainerStyle={styles.insightsContent}
+              showsVerticalScrollIndicator
+            >
+              {insightsSubTab === "day" ? (() => {
+                const past = getPastDatesWithMeals(dataByDate, todayKey);
+                if (past.length === 0) {
+                  return (
+                    <Text style={styles.insightsEmpty} selectable>
+                      No past days with logged meals yet. Log meals on the Meals tab to see insights here.
+                    </Text>
+                  );
+                }
+                return past.map((dateKey) => {
+                  const dayData = getDayData(dateKey);
+                  const { summary, tips } = getDayInsights(dayData, userProfile);
+                  const title = `Insights for ${formatHeaderLabel(dateKey)}`;
+                  return (
+                    <View key={dateKey} style={styles.insightsCard}>
+                      <Text style={styles.insightsCardTitle} selectable>{title}</Text>
+                      <Text style={styles.insightsCardSummary} selectable>{summary}</Text>
+                      {tips.length > 0 && (
+                        <View style={styles.insightsTips}>
+                          <Text style={styles.insightsTipsTitle} selectable>TIPS</Text>
+                          <View style={styles.insightsTipsDivider} />
+                          {tips.map((t, i) => renderInsightTip(t, i, styles.insightsTipItem))}
+                        </View>
+                      )}
+                    </View>
+                  );
+                });
+              })() : (() => {
+                const { daysWithMeals } = aggregateWeekData(dataByDate, todayKey);
+                const { summary, tips } = getWeekInsights(dataByDate, todayKey, userProfile);
+                if (daysWithMeals === 0) {
+                  return (
+                    <Text style={styles.insightsEmpty} selectable>
+                      No meals logged in the past 7 days. Log meals on the Meals tab to see weekly insights.
+                    </Text>
+                  );
+                }
+                return (
+                  <View style={styles.insightsCard}>
+                    <Text style={styles.insightsCardTitle} selectable>Insights for the week</Text>
+                    <Text style={styles.insightsCardSummary} selectable>{summary}</Text>
+                    {tips.length > 0 && (
+                      <View style={styles.insightsTips}>
+                        <Text style={styles.insightsTipsTitle} selectable>TIPS</Text>
+                        <View style={styles.insightsTipsDivider} />
+                        {tips.map((t, i) => renderInsightTip(t, i, styles.insightsTipItem))}
+                      </View>
+                    )}
+                  </View>
+                );
+              })()}
+            </ScrollView>
           </View>
         )}
       </View>
 
       <View style={styles.tabBar}>
         <TouchableOpacity
-          style={[styles.tabItem, activeTab === "meals" && styles.tabItemActive]}
+          style={styles.tabItem}
           onPress={() => setActiveTab("meals")}
+          activeOpacity={0.8}
         >
-          <Text
-            style={[styles.tabLabel, activeTab === "meals" && styles.tabLabelActive]}
-          >
-            MEALS
-          </Text>
+          <View style={[styles.tabPill, activeTab === "meals" && styles.tabPillActive]}>
+            <Text
+              style={[styles.tabLabel, activeTab === "meals" && styles.tabLabelActive]}
+            >
+              MEALS
+            </Text>
+          </View>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.tabItem, activeTab === "analysis" && styles.tabItemActive]}
+          style={styles.tabItem}
           onPress={() => setActiveTab("analysis")}
+          activeOpacity={0.8}
         >
-          <Text
-            style={[
-              styles.tabLabel,
-              activeTab === "analysis" && styles.tabLabelActive
-            ]}
+          <View
+            style={[styles.tabPill, activeTab === "analysis" && styles.tabPillActive]}
           >
-            ANALYSIS
-          </Text>
+            <Text
+              style={[
+                styles.tabLabel,
+                activeTab === "analysis" && styles.tabLabelActive
+              ]}
+            >
+              ANALYSIS
+            </Text>
+          </View>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.tabItem, activeTab === "insights" && styles.tabItemActive]}
+          style={styles.tabItem}
           onPress={() => setActiveTab("insights")}
+          activeOpacity={0.8}
         >
-          <Text
-            style={[
-              styles.tabLabel,
-              activeTab === "insights" && styles.tabLabelActive
-            ]}
+          <View
+            style={[styles.tabPill, activeTab === "insights" && styles.tabPillActive]}
           >
-            INSIGHTS
-          </Text>
+            <View style={styles.tabLabelContainer}>
+              <Text
+                style={[
+                  styles.tabLabel,
+                  activeTab === "insights" && styles.tabLabelActive
+                ]}
+              >
+                INSIGHTS
+              </Text>
+              {!isPro && (
+                <Image
+                  source={require("./assets/Pro_Badge.png")}
+                  style={styles.tabProBadge}
+                  resizeMode="contain"
+                />
+              )}
+            </View>
+          </View>
         </TouchableOpacity>
       </View>
     </SafeAreaView>
   );
 }
 
+export default function App() {
+  return (
+    <SubscriptionProvider>
+      <AppContent />
+    </SubscriptionProvider>
+  );
+}
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#F5F5F7",
+    backgroundColor: "#FFFFFF",
     paddingTop: 24
   },
   loadingContainer: {
@@ -1860,6 +4836,15 @@ const styles = StyleSheet.create({
     marginTop: 8,
     marginBottom: HEADER_TO_CONTENT_GAP,
     paddingHorizontal: 28
+  },
+  fixedHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingTop: 24,
+    paddingBottom: HEADER_TO_CONTENT_GAP,
+    paddingHorizontal: 28,
+    backgroundColor: "#F5F5F7"
   },
   headerCenter: {
     flex: 1,
@@ -1880,6 +4865,17 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
+  headerAddButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    backgroundColor: "#5B5CE9",
+    borderRadius: 20
+  },
+  headerAddText: {
+    color: "#FFFFFF",
+    fontSize: 14,
+    fontWeight: "600"
+  },
   iconButtonDisabled: {
     opacity: 0.4
   },
@@ -1893,34 +4889,172 @@ const styles = StyleSheet.create({
   menuIcon: {
     fontSize: 20,
     color: "#1F2937",
-    fontWeight: "600"
+    fontWeight: "400"
   },
-  menuOverlay: {
-    flex: 1,
-    backgroundColor: "rgba(0, 0, 0, 0.5)",
-    justifyContent: "flex-start",
-    paddingTop: 60,
-    paddingLeft: 28
+  sidebarRoot: {
+    flex: 1
   },
-  menuContainer: {
+  sidebar: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
     backgroundColor: "#FFFFFF",
-    borderRadius: 12,
-    paddingVertical: 8,
-    minWidth: 100,
+    paddingTop: 56,
+    paddingHorizontal: 20,
     shadowColor: "#000",
-    shadowOpacity: 0.1,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 4 },
-    elevation: 5
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
+    shadowOffset: { width: 4, height: 0 },
+    elevation: 8,
+    zIndex: 1
+  },
+  sidebarHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 24,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E5E7EB"
+  },
+  sidebarTitle: {
+    fontSize: 18,
+    fontWeight: "400",
+    color: "#111827"
+  },
+  sidebarCloseButton: {
+    width: 36,
+    height: 36,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 18,
+    backgroundColor: "#F3F4F6"
+  },
+  sidebarCloseText: {
+    fontSize: 16,
+    color: "#6B7280",
+    fontWeight: "400"
+  },
+  sidebarOverlay: {
+    backgroundColor: "rgba(0, 0, 0, 0.4)"
   },
   menuItem: {
-    paddingVertical: 14,
-    paddingHorizontal: 16
+    paddingVertical: 16,
+    paddingHorizontal: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: "#F3F4F6",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
   },
   menuItemText: {
     fontSize: 16,
     color: "#111827",
+    fontWeight: "400"
+  },
+  debugMenuItem: {
+    backgroundColor: "#FEF3C7",
+    borderBottomColor: "#FCD34D"
+  },
+  debugMenuItemText: {
+    color: "#92400E",
     fontWeight: "500"
+  },
+  feedbackModalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.4)",
+    justifyContent: "flex-end"
+  },
+  feedbackModalContent: {
+    backgroundColor: "#FFFFFF",
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingHorizontal: 24,
+    paddingTop: 24,
+    paddingBottom: 40
+  },
+  feedbackModalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 12
+  },
+  feedbackModalTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#111827"
+  },
+  feedbackModalCloseButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#F3F4F6",
+    justifyContent: "center",
+    alignItems: "center"
+  },
+  feedbackModalCloseText: {
+    fontSize: 16,
+    color: "#6B7280",
+    fontWeight: "600"
+  },
+  feedbackModalSubtext: {
+    fontSize: 14,
+    color: "#6B7280",
+    textAlign: "center",
+    marginBottom: 20
+  },
+  feedbackStarsRow: {
+    flexDirection: "row",
+    justifyContent: "center",
+    marginBottom: 20
+  },
+  feedbackStarButton: {
+    padding: 4,
+    marginHorizontal: 4
+  },
+  feedbackStarIcon: {
+    fontSize: 32,
+    color: "#FBBF24"
+  },
+  feedbackTextInput: {
+    backgroundColor: "#F3F4F6",
+    borderRadius: 12,
+    padding: 16,
+    fontSize: 16,
+    color: "#111827",
+    minHeight: 100,
+    marginBottom: 8
+  },
+  feedbackCharCount: {
+    fontSize: 12,
+    color: "#9CA3AF",
+    textAlign: "right",
+    marginBottom: 20
+  },
+  feedbackSubmitButton: {
+    backgroundColor: "#7C3AED",
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: "center",
+    marginBottom: 12
+  },
+  feedbackSubmitButtonDisabled: {
+    backgroundColor: "#D1D5DB",
+    opacity: 0.7
+  },
+  feedbackSubmitButtonText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#FFFFFF"
+  },
+  feedbackSkipButton: {
+    alignItems: "center",
+    paddingVertical: 8
+  },
+  feedbackSkipButtonText: {
+    fontSize: 14,
+    color: "#6B7280"
   },
   mealsSwipeArea: {
     flex: 1
@@ -1931,16 +5065,29 @@ const styles = StyleSheet.create({
     paddingHorizontal: 28
   },
   mealDetailContent: {
-    paddingTop: 8,
+    paddingTop: HEADER_TO_CONTENT_GAP,
     paddingBottom: 120,
     paddingHorizontal: 28
+  },
+  sectionLabelContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 10
   },
   sectionLabel: {
     color: "#111827",
     fontWeight: "700",
     fontSize: 12,
-    letterSpacing: 1,
-    marginBottom: 10
+    letterSpacing: 0
+  },
+  sectionProBadge: {
+    width: 36,
+    height: 18
+  },
+  menuProBadge: {
+    width: 40,
+    height: 20
   },
   sectionSpacing: {
     marginTop: 24
@@ -1963,7 +5110,7 @@ const styles = StyleSheet.create({
     flex: 1
   },
   nutritionLabel: {
-    color: "#9CA3AF",
+    color: "#000000",
     fontSize: 12,
     marginBottom: 6
   },
@@ -1976,6 +5123,208 @@ const styles = StyleSheet.create({
     color: "#9CA3AF",
     fontSize: 11,
     marginTop: 4
+  },
+  upgradeProButton: {
+    alignSelf: "center",
+    marginTop: 12,
+    backgroundColor: "#5B5CE9",
+    borderRadius: 20,
+    paddingVertical: 10,
+    paddingHorizontal: 20
+  },
+  upgradeProButtonText: {
+    color: "#FFFFFF",
+    fontSize: 14,
+    fontWeight: "600"
+  },
+  proFeatureBlur: {
+    opacity: 0.4
+  },
+  analysisMicroGridWrapper: {
+    position: "relative",
+    minHeight: 80
+  },
+  proFeatureOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(255,255,255,0.96)",
+    justifyContent: "center",
+    alignItems: "center",
+    borderRadius: 12
+  },
+  proFeatureOverlayContributors: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(255,255,255,0.96)",
+    justifyContent: "flex-start",
+    alignItems: "center",
+    borderRadius: 12,
+    paddingTop: 32
+  },
+  proFeatureOverlayText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#111827",
+    marginBottom: 4
+  },
+  proFeatureOverlaySubtext: {
+    fontSize: 14,
+    color: "#6B7280",
+    marginBottom: 12,
+    textAlign: "center"
+  },
+  proFeatureFullOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(255,255,255,0.95)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 24,
+    zIndex: 1
+  },
+  insightsPaywallCard: {
+    width: "100%",
+    maxWidth: 360,
+    borderRadius: 28,
+    backgroundColor: "#FFFFFF",
+    paddingHorizontal: 24,
+    paddingTop: 28,
+    paddingBottom: 24,
+    shadowColor: "#000000",
+    shadowOpacity: 0.08,
+    shadowRadius: 30,
+    shadowOffset: { width: 0, height: 18 },
+    elevation: 10,
+    alignItems: "center"
+  },
+  insightsPaywallProBadge: {
+    paddingHorizontal: 18,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: "#111827",
+    marginBottom: 18
+  },
+  insightsPaywallProBadgeText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "700",
+    letterSpacing: 1
+  },
+  insightsPaywallLogoRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 20
+  },
+  insightsPaywallLogoImage: {
+    width: 140,
+    height: 40
+  },
+  insightsPaywallHeadline: {
+    textAlign: "center",
+    fontSize: 14,
+    lineHeight: 20,
+    fontWeight: "700",
+    color: "#111827",
+    marginBottom: 8,
+    letterSpacing: 0.5
+  },
+  insightsPaywallBody: {
+    textAlign: "center",
+    fontSize: 14,
+    lineHeight: 20,
+    color: "#4B5563"
+  },
+  insightsPaywallSpacer: {
+    height: 20
+  },
+  insightsPaywallTrialText: {
+    fontSize: 13,
+    color: "#6B7280",
+    marginBottom: 10
+  },
+  insightsPaywallPrimaryButton: {
+    alignSelf: "stretch",
+    backgroundColor: "#576CDB",
+    borderRadius: 999,
+    paddingVertical: 12,
+    alignItems: "center",
+    marginBottom: 16
+  },
+  insightsPaywallPrimaryButtonText: {
+    color: "#FFFFFF",
+    fontSize: 15,
+    fontWeight: "600"
+  },
+  insightsPaywallSecondaryText: {
+    fontSize: 13,
+    color: "#9CA3AF"
+  },
+  manageSubscriptionButton: {
+    alignSelf: "flex-start",
+    marginBottom: 24,
+    paddingVertical: 10,
+    paddingHorizontal: 16
+  },
+  manageSubscriptionButtonText: {
+    fontSize: 15,
+    color: "#5B5CE9",
+    fontWeight: "600"
+  },
+  yesterdayInsightCard: {
+    backgroundColor: "#374151",
+    borderRadius: 16,
+    padding: 20,
+    marginTop: 24,
+    marginBottom: 8,
+    shadowColor: "#000",
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 4
+  },
+  yesterdayInsightHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 12
+  },
+  yesterdayInsightDate: {
+    color: "#9CA3AF",
+    fontSize: 14,
+    fontWeight: "500"
+  },
+  yesterdayInsightDismiss: {
+    width: 24,
+    height: 24,
+    justifyContent: "center",
+    alignItems: "center"
+  },
+  yesterdayInsightDismissText: {
+    color: "#9CA3AF",
+    fontSize: 18,
+    fontWeight: "300"
+  },
+  yesterdayInsightAffirmation: {
+    color: "#FFFFFF",
+    fontSize: 24,
+    fontWeight: "700",
+    marginBottom: 8
+  },
+  yesterdayInsightCategory: {
+    color: "#9CA3AF",
+    fontSize: 12,
+    fontWeight: "600",
+    letterSpacing: 0.5,
+    marginBottom: 4
+  },
+  yesterdayInsightValue: {
+    color: "#FFFFFF",
+    fontSize: 36,
+    fontWeight: "800",
+    marginBottom: 12
+  },
+  yesterdayInsightMessage: {
+    color: "#D1D5DB",
+    fontSize: 14,
+    lineHeight: 20
   },
   mealsList: {
     gap: 12
@@ -2010,7 +5359,7 @@ const styles = StyleSheet.create({
   mealLabel: {
     fontSize: 16,
     color: "#111827",
-    fontWeight: "600"
+    fontWeight: "400"
   },
   mealCalories: {
     color: "#6B7280",
@@ -2018,51 +5367,67 @@ const styles = StyleSheet.create({
     marginTop: 4
   },
   addCircle: {
-    minWidth: 62,
+    width: 32,
     height: 32,
     borderRadius: 16,
     backgroundColor: "#E5E7EB",
     alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: 14
+    justifyContent: "center"
   },
   addCircleText: {
-    color: "#2563EB",
-    fontSize: 14,
-    fontWeight: "600"
+    color: "#6B7280",
+    fontSize: 20,
+    fontWeight: "400",
+    lineHeight: 20
   },
   tabBar: {
     position: "absolute",
-    left: 28,
-    right: 28,
-    bottom: 16,
+    left: 0,
+    right: 0,
+    bottom: 0,
     backgroundColor: "#FFFFFF",
-    borderRadius: 28,
-    padding: 6,
+    paddingHorizontal: 32,
+    paddingTop: 14,
+    paddingBottom: 32,
     flexDirection: "row",
     justifyContent: "space-between",
-    shadowColor: "#000",
-    shadowOpacity: 0.08,
-    shadowRadius: 16,
-    shadowOffset: { width: 0, height: 6 },
-    elevation: 6
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#E5E7EB",
+    zIndex: 100
   },
   tabItem: {
     flex: 1,
     alignItems: "center",
-    paddingVertical: 10,
-    borderRadius: 22
+    justifyContent: "center",
+    marginTop: 8
   },
-  tabItemActive: {
+  tabPill: {
+    paddingHorizontal: 18,
+    paddingVertical: 8,
+    borderRadius: 18
+  },
+  tabLabelContainer: {
+    position: "relative",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  tabPillActive: {
     backgroundColor: "#E0E7FF"
   },
   tabLabel: {
     color: "#6B7280",
     fontSize: 11,
-    fontWeight: "700"
+    fontWeight: "600"
   },
   tabLabelActive: {
     color: "#1D4ED8"
+  },
+  tabProBadge: {
+    position: "absolute",
+    width: 40,
+    height: 20,
+    top: -22,
+    right: -22
   },
   analysisContent: {
     paddingTop: 8,
@@ -2070,15 +5435,20 @@ const styles = StyleSheet.create({
     paddingHorizontal: 28
   },
   analysisMacroList: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "space-between",
     gap: 12
   },
   analysisMacroCard: {
-    flexDirection: "row",
-    alignItems: "center",
+    width: "48%",
+    minWidth: 0,
+    flexDirection: "column",
     backgroundColor: "#FFFFFF",
     borderRadius: 12,
     paddingVertical: 14,
     paddingHorizontal: 14,
+    minHeight: 200,
     shadowColor: "#000",
     shadowOpacity: 0.06,
     shadowRadius: 8,
@@ -2086,53 +5456,60 @@ const styles = StyleSheet.create({
     elevation: 2
   },
   analysisMacroName: {
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: "600",
     color: "#111827",
-    width: 72
+    marginBottom: 10,
+    textAlign: "center"
   },
-  analysisMacroBarTrack: {
-    flex: 1,
+  analysisMacroRingRow: {
+    flexDirection: "row",
+    justifyContent: "center",
+    alignItems: "center"
+  },
+  analysisMacroRingWrap: {
+    width: "100%"
+  },
+  analysisMacroProgressBar: {
     height: 8,
-    borderRadius: 4,
     backgroundColor: "#E5E7EB",
-    marginHorizontal: 12,
+    borderRadius: 4,
     overflow: "hidden"
   },
-  analysisMacroBarFill: {
+  analysisMacroProgressFill: {
     height: "100%",
-    borderRadius: 4,
-    backgroundColor: "#2563EB"
+    backgroundColor: "#2563EB",
+    borderRadius: 4
   },
-  analysisMacroValues: {
-    fontSize: 14,
-    color: "#6B7280",
-    marginRight: 8
+  analysisMacroRingCenter: {
+    paddingTop: 8,
+    alignItems: "center"
   },
-  analysisMacroCurrent: {
-    fontWeight: "600",
+  analysisMacroRingValue: {
+    fontSize: 15,
+    fontWeight: "800",
     color: "#111827"
   },
   analysisMacroTarget: {
+    fontSize: 14,
     fontWeight: "400",
-    color: "#9CA3AF"
-  },
-  analysisMacroArrow: {
-    fontSize: 16,
-    color: "#9CA3AF"
+    color: "#9CA3AF",
+    marginTop: 8,
+    alignSelf: "center"
   },
   analysisMicroGrid: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 12,
+    justifyContent: "space-between",
     marginTop: 0
   },
   analysisMicroCard: {
-    width: "31%",
+    width: "32%",
     minWidth: 0,
     backgroundColor: "#FFFFFF",
     borderRadius: 12,
     padding: 14,
+    marginBottom: 12,
     shadowColor: "#000",
     shadowOpacity: 0.06,
     shadowRadius: 8,
@@ -2159,33 +5536,119 @@ const styles = StyleSheet.create({
     color: "#9CA3AF",
     marginTop: 2
   },
-  insightsPlaceholder: {
+  insightsRoot: {
     flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: 28
+    position: "relative"
   },
-  insightsPlaceholderText: {
+  insightsSubTabsContainer: {
+    paddingHorizontal: 28,
+    paddingTop: 8,
+    paddingBottom: 12
+  },
+  insightsSubTabs: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 28,
+    padding: 6,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    shadowColor: "#000",
+    shadowOpacity: 0.08,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 6
+  },
+  insightsSubTab: {
+    flex: 1,
+    alignItems: "center",
+    paddingVertical: 10,
+    borderRadius: 22
+  },
+  insightsSubTabActive: {
+    backgroundColor: "#E0E7FF"
+  },
+  insightsSubTabLabel: {
+    color: "#6B7280",
+    fontSize: 11,
+    fontWeight: "700"
+  },
+  insightsSubTabLabelActive: {
+    color: "#1D4ED8"
+  },
+  insightsContent: {
+    paddingHorizontal: 28,
+    paddingTop: 8,
+    paddingBottom: 120
+  },
+  insightsEmpty: {
+    fontSize: 15,
+    color: "#6B7280",
+    lineHeight: 22,
+    paddingTop: 16
+  },
+  insightsCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 20,
+    marginBottom: 16,
+    shadowColor: "#000",
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2,
+    borderWidth: 1,
+    borderColor: "#E5E7EB"
+  },
+  insightsCardTitle: {
+    fontSize: 20,
+    fontWeight: "600",
+    color: "#111827",
+    marginBottom: 14
+  },
+  insightsCardSummary: {
     fontSize: 16,
-    color: "#9CA3AF"
+    color: "#374151",
+    lineHeight: 24,
+    marginBottom: 16
+  },
+  insightsTips: {
+    marginTop: 8
+  },
+  insightsTipsTitle: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#666666",
+    marginBottom: 8,
+    letterSpacing: 0.5
+  },
+  insightsTipsDivider: {
+    height: 1,
+    backgroundColor: "#E5E7EB",
+    marginBottom: 12
+  },
+  insightsTipRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    marginBottom: 14
+  },
+  insightsTipBar: {
+    width: 5,
+    borderRadius: 3,
+    minHeight: 20,
+    alignSelf: "stretch",
+    marginRight: 10
+  },
+  insightsTipTextWrap: {
+    flex: 1
+  },
+  insightsTipItem: {
+    fontSize: 14,
+    color: "#111827",
+    lineHeight: 22
   },
   nutrientDetailContent: {
-    paddingTop: 8,
+    paddingTop: HEADER_TO_CONTENT_GAP,
     paddingBottom: 120,
     paddingHorizontal: 28
-  },
-  nutrientDetailHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: HEADER_TO_CONTENT_GAP,
-    paddingHorizontal: 0
-  },
-  nutrientDetailTitle: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#1F2937",
-    letterSpacing: 0.5
   },
   nutrientDetailExplanation: {
     fontSize: 16,
@@ -2199,16 +5662,29 @@ const styles = StyleSheet.create({
     color: "#111827",
     marginBottom: 24
   },
+  nutrientDetailContributorsLabelContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 12
+  },
   nutrientDetailContributorsLabel: {
     fontSize: 14,
     fontWeight: "600",
-    color: "#6B7280",
-    marginBottom: 12
+    color: "#6B7280"
+  },
+  contributorsProBadge: {
+    width: 36,
+    height: 18
   },
   nutrientDetailEmpty: {
     fontSize: 14,
     color: "#9CA3AF",
     fontStyle: "italic"
+  },
+  nutrientDetailContributorsWrapper: {
+    position: "relative",
+    minHeight: 80
   },
   nutrientDetailContributors: {
     backgroundColor: "#FFFFFF",
@@ -2246,7 +5722,7 @@ const styles = StyleSheet.create({
   addScreen: {
     flex: 1,
     paddingHorizontal: 28,
-    paddingTop: 16,
+    paddingTop: 8,
     paddingBottom: 24,
     justifyContent: "flex-start"
   },
@@ -2257,7 +5733,7 @@ const styles = StyleSheet.create({
     marginBottom: HEADER_TO_CONTENT_GAP
   },
   addHeaderButton: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: "#5B5CE9",
     borderRadius: 20,
     paddingVertical: 8,
     paddingHorizontal: 20,
@@ -2268,7 +5744,28 @@ const styles = StyleSheet.create({
     elevation: 2
   },
   addHeaderButtonText: {
-    color: "#2563EB",
+    color: "#FFFFFF",
+    fontWeight: "600",
+    fontSize: 15
+  },
+  templateHeaderButtons: {
+    flexDirection: "row",
+    gap: 12,
+    alignItems: "center"
+  },
+  templateDeleteButton: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 20,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    shadowColor: "#000",
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2
+  },
+  templateDeleteButtonText: {
+    color: "#DC2626",
     fontWeight: "600",
     fontSize: 15
   },
@@ -2299,6 +5796,23 @@ const styles = StyleSheet.create({
     color: "#111827",
     fontSize: 16
   },
+  templateNameContainer: {
+    marginBottom: 20
+  },
+  templateNameLabel: {
+    color: "#6B7280",
+    fontSize: 12,
+    fontStyle: "italic",
+    marginBottom: 8
+  },
+  templateNameInputCompact: {
+    color: "#111827",
+    fontSize: 18,
+    fontWeight: "600",
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E5E7EB"
+  },
   addSubmit: {
     marginTop: 24,
     alignSelf: "center",
@@ -2321,7 +5835,7 @@ const styles = StyleSheet.create({
     fontSize: 16
   },
   addSubmitTextDisabled: {
-    color: "#6B7280"
+    color: "rgba(255,255,255,0.8)"
   },
   addError: {
     marginTop: 12,
@@ -2332,28 +5846,6 @@ const styles = StyleSheet.create({
     marginTop: 16,
     color: "#9CA3AF",
     textAlign: "center"
-  },
-  hideKeyboardButton: {
-    alignSelf: "center",
-    marginTop: 16,
-    paddingVertical: 8,
-    paddingHorizontal: 16
-  },
-  hideKeyboardText: {
-    color: "#6B7280",
-    fontSize: 14
-  },
-  mealDetailHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: HEADER_TO_CONTENT_GAP,
-    paddingHorizontal: 28
-  },
-  mealDetailTitle: {
-    fontSize: 16,
-    fontWeight: "600",
-    color: "#1F2937"
   },
   itemCard: {
     backgroundColor: "#FFFFFF",
@@ -2444,19 +5936,6 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: "#3F3F46"
   },
-  addMoreButton: {
-    alignSelf: "center",
-    marginTop: 12,
-    backgroundColor: "#5B5CE9",
-    borderRadius: 30,
-    paddingVertical: 12,
-    paddingHorizontal: 40
-  },
-  addMoreText: {
-    color: "#FFFFFF",
-    fontSize: 16,
-    fontWeight: "600"
-  },
   emptyText: {
     textAlign: "center",
     color: "#9CA3AF",
@@ -2538,38 +6017,377 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 4 },
     elevation: 3
   },
+  personalDetailsContent: {
+    paddingTop: HEADER_TO_CONTENT_GAP,
+    paddingBottom: 120,
+    paddingHorizontal: 28
+  },
+  personalInput: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 16,
+    fontSize: 16,
+    color: "#111827",
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: "#E5E7EB"
+  },
+  helperText: {
+    fontSize: 14,
+    color: "#6B7280",
+    marginBottom: 8,
+    marginTop: -8
+  },
+  optionRow: {
+    flexDirection: "row",
+    gap: 12,
+    marginBottom: 24
+  },
+  optionButton: {
+    flex: 1,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 16,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#E5E7EB"
+  },
+  optionButtonSelected: {
+    backgroundColor: "#3B82F6",
+    borderColor: "#3B82F6"
+  },
+  optionButtonText: {
+    fontSize: 16,
+    color: "#111827",
+    fontWeight: "500"
+  },
+  optionButtonTextSelected: {
+    color: "#FFFFFF"
+  },
+  heightRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 24
+  },
+  unitToggle: {
+    flexDirection: "row",
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 4,
+    borderWidth: 1,
+    borderColor: "#E5E7EB"
+  },
+  unitButton: {
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 8
+  },
+  unitButtonSelected: {
+    backgroundColor: "#3B82F6"
+  },
+  unitButtonText: {
+    fontSize: 16,
+    color: "#6B7280",
+    fontWeight: "500"
+  },
+  unitButtonTextSelected: {
+    color: "#FFFFFF"
+  },
+  goalOption: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#E5E7EB"
+  },
+  goalOptionSelected: {
+    backgroundColor: "#3B82F6",
+    borderColor: "#3B82F6"
+  },
+  goalOptionText: {
+    fontSize: 16,
+    color: "#111827",
+    fontWeight: "500"
+  },
+  goalOptionTextSelected: {
+    color: "#FFFFFF"
+  },
+  activityOption: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#E5E7EB"
+  },
+  activityOptionSelected: {
+    backgroundColor: "#3B82F6",
+    borderColor: "#3B82F6"
+  },
+  activityOptionLabel: {
+    fontSize: 16,
+    color: "#111827",
+    fontWeight: "600",
+    marginBottom: 4
+  },
+  activityOptionLabelSelected: {
+    color: "#FFFFFF"
+  },
+  activityOptionDescription: {
+    fontSize: 14,
+    color: "#6B7280"
+  },
+  activityOptionDescriptionSelected: {
+    color: "#E5E7EB"
+  },
+  saveButtonText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#111827"
+  },
+  personalHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    marginBottom: HEADER_TO_CONTENT_GAP
+  },
+  personalSaveButton: {
+    minWidth: 60,
+    alignItems: "flex-end"
+  },
+  wheelPickerContainer: {
+    height: ITEM_HEIGHT * VISIBLE_ITEMS,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    overflow: "hidden",
+    position: "relative",
+    borderWidth: 1,
+    borderColor: "#E5E7EB"
+  },
+  wheelPickerSelection: {
+    position: "absolute",
+    top: ITEM_HEIGHT * 2,
+    left: 0,
+    right: 0,
+    height: ITEM_HEIGHT,
+    backgroundColor: "rgba(0, 0, 0, 0.05)",
+    zIndex: 1,
+    borderRadius: 8,
+    marginHorizontal: 4
+  },
+  wheelPickerScroll: {
+    flex: 1
+  },
+  wheelPickerContent: {
+    paddingVertical: ITEM_HEIGHT * 2
+  },
+  wheelPickerItem: {
+    height: ITEM_HEIGHT,
+    justifyContent: "center",
+    alignItems: "center"
+  },
+  wheelPickerItemText: {
+    fontSize: 18,
+    color: "#000000",
+    fontWeight: "500"
+  },
+  collapsibleFieldContainer: {
+    marginBottom: 20
+  },
+  collapsibleFieldRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8
+  },
+  collapsibleFieldLabel: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#111827",
+    letterSpacing: 1,
+    textTransform: "uppercase"
+  },
+  collapsibleFieldValue: {
+    backgroundColor: "#F3F4F6",
+    borderRadius: 3,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    minWidth: 120,
+    alignItems: "flex-end"
+  },
+  collapsibleFieldValueText: {
+    fontSize: 12,
+    color: "#111827",
+    fontWeight: "400"
+  },
+  fieldRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 20
+  },
+  fieldLabel: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#111827",
+    letterSpacing: 0,
+    textTransform: "uppercase"
+  },
+  fieldValue: {
+    backgroundColor: "#F3F4F6",
+    borderRadius: 3,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    minWidth: 120,
+    alignItems: "flex-end"
+  },
+  fieldValueInput: {
+    textAlign: "right"
+  },
+  fieldValueError: {
+    borderWidth: 1,
+    borderColor: "#DC2626"
+  },
+  fieldValueText: {
+    fontSize: 14,
+    color: "#111827",
+    fontWeight: "400"
+  },
+  heightInputRow: {
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center"
+  },
+  heightInput: {
+    backgroundColor: "#F3F4F6",
+    borderRadius: 3,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    width: 100,
+    fontSize: 12,
+    color: "#111827",
+    textAlign: "right"
+  },
+  unitDropdown: {
+    backgroundColor: "#F3F4F6",
+    borderRadius: 3,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    minWidth: 60,
+    alignItems: "center"
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.3)",
+    justifyContent: "center",
+    alignItems: "center"
+  },
+  modalContent: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    width: "90%",
+    maxWidth: 400
+  },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E5E7EB"
+  },
+  modalButton: {
+    fontSize: 16,
+    color: "#3B82F6",
+    fontWeight: "600"
+  },
+  inlinePickerContainer: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 8,
+    marginTop: 8,
+    paddingVertical: 8
+  },
+  inlinePickerHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingBottom: 4
+  },
+  inlinePicker: {
+    width: "100%",
+    backgroundColor: "#FFFFFF"
+  },
+  dropdownContent: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    marginHorizontal: 20,
+    minWidth: 200,
+    shadowColor: "#000",
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 5
+  },
+  dropdownItem: {
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E5E7EB"
+  },
+  dropdownItemText: {
+    fontSize: 16,
+    color: "#111827"
+  },
+  datePickerRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginBottom: 12
+  },
+  datePickerColumn: {
+    flex: 1
+  },
+  heightPickerRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginBottom: 12
+  },
+  heightPickerColumn: {
+    flex: 2
+  },
+  heightUnitColumn: {
+    flex: 1
+  },
+  singleWheelPicker: {
+    marginBottom: 12
+  },
   exportButtonText: {
     color: "#FFFFFF",
     fontSize: 16,
     fontWeight: "600"
   },
   foodDetailContent: {
-    paddingTop: 8,
+    paddingTop: HEADER_TO_CONTENT_GAP,
     paddingBottom: 120,
     paddingHorizontal: 28
   },
-  foodDetailHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: HEADER_TO_CONTENT_GAP,
-    paddingHorizontal: 0
-  },
-  foodDetailTitle: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#1F2937",
-    letterSpacing: 0.5
+  foodDetailSectionWrapper: {
+    position: "relative",
+    marginBottom: 32
   },
   foodDetailSection: {
-    marginBottom: 32
+    marginBottom: 0
+  },
+  foodDetailHealthSection: {
+    marginTop: 24,
+    marginBottom: 24
   },
   foodDetailSectionTitle: {
     fontSize: 14,
     fontWeight: "600",
     color: "#6B7280",
     marginBottom: 16,
-    letterSpacing: 0.5
+    letterSpacing: 0
   },
   foodDetailMacros: {
     flexDirection: "row",
@@ -2582,7 +6400,7 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     padding: 16,
     minWidth: "45%",
-    alignItems: "center",
+    alignItems: "flex-start",
     shadowColor: "#000",
     shadowOpacity: 0.06,
     shadowRadius: 8,
@@ -2596,9 +6414,21 @@ const styles = StyleSheet.create({
     marginBottom: 4
   },
   foodDetailMacroLabel: {
-    fontSize: 12,
-    color: "#6B7280",
-    fontWeight: "500"
+    fontSize: 14,
+    color: "#111827",
+    fontWeight: "600"
+  },
+  foodDetailMacroInput: {
+    marginTop: 4,
+    width: "100%",
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    backgroundColor: "#F9FAFB",
+    fontSize: 14,
+    color: "#111827"
   },
   foodDetailMicros: {
     backgroundColor: "#FFFFFF",
@@ -2608,7 +6438,9 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.06,
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 3 },
-    elevation: 2
+    elevation: 2,
+    marginTop: 12,
+    marginBottom: 16
   },
   foodDetailMicroRow: {
     flexDirection: "row",
@@ -2627,6 +6459,183 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
     color: "#111827"
+  },
+  foodDetailSaveButton: {
+    marginTop: 8,
+    alignSelf: "center",
+    backgroundColor: "#FFFFFF",
+    borderRadius: 20,
+    paddingHorizontal: 24,
+    paddingVertical: 10,
+    shadowColor: "#000",
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2
+  },
+  foodDetailSaveButtonText: {
+    color: "#2563EB",
+    fontSize: 14,
+    fontWeight: "600"
+  },
+  foodDetailSaveButtonDisabled: {
+    backgroundColor: "#F3F4F6",
+    shadowOpacity: 0
+  },
+  foodDetailSaveButtonTextDisabled: {
+    color: "#9CA3AF"
+  },
+  foodDetailSaveMessage: {
+    marginTop: 8,
+    alignSelf: "center",
+    fontSize: 12,
+    color: "#059669"
+  },
+  suggestionsContainer: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 12
+  },
+  suggestionChip: {
+    backgroundColor: "#EEF2FF",
+    borderRadius: 16,
+    paddingVertical: 6,
+    paddingHorizontal: 12
+  },
+  suggestionText: {
+    fontSize: 12,
+    color: "#4F46E5",
+    fontWeight: "500"
+  },
+  templatesSection: {
+    marginTop: 20,
+    marginBottom: 12
+  },
+  templatesSectionTitle: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#6B7280",
+    marginBottom: 8
+  },
+  templatesContainer: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8
+  },
+  templateChipWrapper: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4
+  },
+  templateChip: {
+    backgroundColor: "#F3F4F6",
+    borderRadius: 16,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderWidth: 1,
+    borderColor: "#E5E7EB"
+  },
+  templateChipText: {
+    fontSize: 13,
+    color: "#111827",
+    fontWeight: "500"
+  },
+  templateEditButton: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: "#E5E7EB",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  templateEditButtonText: {
+    fontSize: 12,
+    color: "#6B7280"
+  },
+  saveTemplateButton: {
+    marginTop: 16,
+    marginBottom: 12,
+    alignSelf: "center",
+    backgroundColor: "#FFFFFF",
+    borderRadius: 20,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    shadowColor: "#000",
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2
+  },
+  saveTemplateText: {
+    color: "#2563EB",
+    fontSize: 14,
+    fontWeight: "600"
+  },
+  templateModalContent: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 16,
+    padding: 24,
+    marginHorizontal: 40,
+    shadowColor: "#000",
+    shadowOpacity: 0.2,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8
+  },
+  templateModalHeader: {
+    marginBottom: 20
+  },
+  templateModalTitle: {
+    fontSize: 18,
+    fontWeight: "600",
+    color: "#111827",
+    marginBottom: 12
+  },
+  templateNameInput: {
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 16,
+    color: "#111827",
+    marginBottom: 20,
+    backgroundColor: "#F9FAFB"
+  },
+  templateModalButtons: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: 12
+  },
+  templateModalDelete: {
+    paddingVertical: 10,
+    paddingHorizontal: 20
+  },
+  templateModalDeleteText: {
+    fontSize: 16,
+    color: "#DC2626",
+    fontWeight: "500"
+  },
+  templateModalCancel: {
+    paddingVertical: 10,
+    paddingHorizontal: 20
+  },
+  templateModalCancelText: {
+    fontSize: 16,
+    color: "#6B7280",
+    fontWeight: "500"
+  },
+  templateModalSave: {
+    backgroundColor: "#2563EB",
+    borderRadius: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 20
+  },
+  templateModalSaveText: {
+    fontSize: 16,
+    color: "#FFFFFF",
+    fontWeight: "600"
   },
   foodDetailLoading: {
     padding: 24,
@@ -2647,11 +6656,10 @@ const styles = StyleSheet.create({
     elevation: 2
   },
   foodDetailHealthQuotientValue: {
-    fontSize: 32,
-    fontWeight: "700",
+    fontSize: 16,
+    fontWeight: "600",
     color: "#111827",
-    marginBottom: 12,
-    textAlign: "center"
+    marginBottom: 8
   },
   foodDetailHealthQuotientBar: {
     height: 8,
