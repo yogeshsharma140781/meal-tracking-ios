@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+import fs from "fs";
+import path from "path";
 import { mealsRouter } from "./routes/meals";
 import { foodsRouter } from "./routes/foods";
 import { feedbackRouter } from "./routes/feedback";
@@ -18,27 +20,28 @@ app.use("/v1/meals", mealsRouter);
 app.use("/v1/foods", foodsRouter);
 app.use("/v1/feedback", feedbackRouter);
 
-const ensureFeedbackTable = async () => {
+const ensureSchema = async () => {
   if (!hasDatabase || !pool) return;
   try {
-    await pool.query(`
-      create table if not exists feedback (
-        id uuid primary key,
-        rating smallint not null check (rating >= 1 and rating <= 5),
-        text text,
-        created_at timestamptz not null default now()
-      )
-    `);
-    console.log("Feedback table ready");
+    const schemaPath = path.join(__dirname, "../schema.sql");
+    const schema = fs.readFileSync(schemaPath, "utf8");
+    await pool.query(schema);
+    console.log("Database schema ready");
   } catch (err) {
-    console.error("Feedback table init error:", err);
+    console.error("Schema init error:", err);
+    throw err;
   }
 };
 
 const port = Number(process.env.PORT) || 4000;
-ensureFeedbackTable().then(() => {
-  app.listen(port, () => {
-    // eslint-disable-next-line no-console
-    console.log(`Meal Tracking API listening on ${port}`);
+ensureSchema()
+  .then(() => {
+    app.listen(port, () => {
+      // eslint-disable-next-line no-console
+      console.log(`Meal Tracking API listening on ${port}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Failed to initialize database:", err);
+    process.exit(1);
   });
-});
