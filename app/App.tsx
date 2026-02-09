@@ -42,19 +42,30 @@ function TabIcon({
 const RING_SIZE = 112;
 const RING_STROKE = 8;
 
-function CircularProgressRing({ progress, value }: { progress: number; value: number }) {
+function CircularProgressRing({
+  progress,
+  value,
+  size = RING_SIZE,
+  suffix = "",
+}: {
+  progress: number;
+  value: number;
+  size?: number;
+  suffix?: string;
+}) {
   const [SkiaModule, setSkiaModule] = useState<{
     Canvas: React.ComponentType<any>;
     Path: React.ComponentType<any>;
     Group: React.ComponentType<any>;
     ringPath: unknown;
   } | null>(null);
+  const stroke = Math.max(6, (RING_STROKE / RING_SIZE) * size);
 
   useEffect(() => {
     let cancelled = false;
     import("@shopify/react-native-skia").then((mod) => {
       if (cancelled) return;
-      const oval = mod.Skia.XYWHRect(RING_STROKE / 2, RING_STROKE / 2, RING_SIZE - RING_STROKE, RING_SIZE - RING_STROKE);
+      const oval = mod.Skia.XYWHRect(stroke / 2, stroke / 2, size - stroke, size - stroke);
       const p = mod.Skia.Path.Make();
       p.addArc(oval, -90, 360);
       setSkiaModule({ Canvas: mod.Canvas, Path: mod.Path, Group: mod.Group, ringPath: p });
@@ -62,30 +73,31 @@ function CircularProgressRing({ progress, value }: { progress: number; value: nu
       if (!cancelled) setSkiaModule(null);
     });
     return () => { cancelled = true; };
-  }, []);
+  }, [size, stroke]);
 
   const safeProgress = Math.min(1, Math.max(0, Number.isFinite(progress) ? progress : 0));
   const displayValue = Math.round(Number.isFinite(value) ? value : 0);
+  const displayText = `${displayValue}${suffix}`;
 
   if (SkiaModule) {
     const { Canvas, Path, Group, ringPath } = SkiaModule;
     return (
       <View
-        style={{ width: RING_SIZE, height: RING_SIZE, position: "relative" }}
+        style={{ width: size, height: size, position: "relative" }}
         pointerEvents="none"
       >
-        <Canvas style={{ width: RING_SIZE, height: RING_SIZE }}>
-          <Group style="stroke" strokeWidth={RING_STROKE} color="#E5E7EB">
+        <Canvas style={{ width: size, height: size }}>
+          <Group style="stroke" strokeWidth={stroke} color="#E0E0E0">
             <Path path={ringPath} />
           </Group>
           {safeProgress > 0.001 && (
-            <Group style="stroke" strokeWidth={RING_STROKE} color="#2563EB" strokeCap="round">
+            <Group style="stroke" strokeWidth={stroke} color="#4263EB" strokeCap="round">
               <Path path={ringPath} start={0} end={safeProgress} />
             </Group>
           )}
         </Canvas>
         <View style={[StyleSheet.absoluteFillObject, { justifyContent: "center", alignItems: "center" }]} pointerEvents="none">
-          <Text style={{ fontSize: 15, fontWeight: "800", color: "#111827" }}>{displayValue}</Text>
+          <Text style={{ fontSize: size <= 72 ? 14 : 15, fontWeight: "700", color: "#000000" }}>{displayText}</Text>
         </View>
       </View>
     );
@@ -97,7 +109,7 @@ function CircularProgressRing({ progress, value }: { progress: number; value: nu
         <View style={[styles.analysisMacroProgressFill, { width: `${Math.min(100, safeProgress * 100)}%` }]} />
       </View>
       <View style={styles.analysisMacroRingCenter}>
-        <Text style={styles.analysisMacroRingValue}>{displayValue}</Text>
+        <Text style={styles.analysisMacroRingValue}>{displayText}</Text>
       </View>
     </View>
   );
@@ -4728,27 +4740,31 @@ function AppContent() {
               <View style={styles.nutritionCard}>
                 {(() => {
                   const macroTargets = getMacroTargets(userProfile);
-                  const nutritionSummary = [
-                    { label: "Calories", target: `(${macroTargets.calories_kcal})` },
-                    { label: "Protein", target: `(${macroTargets.protein_g}g)` },
-                    { label: "Carbs", target: `(${macroTargets.carbs_g}g)` },
-                    { label: "Fat", target: `(${macroTargets.fat_g}g)` }
+                  const items = [
+                    { key: "calories_kcal" as const, label: "Calories", value: totals.calories_kcal, target: macroTargets.calories_kcal, unit: "" },
+                    { key: "protein_g" as const, label: "Protein", value: totals.protein_g, target: macroTargets.protein_g, unit: "g" },
+                    { key: "carbs_g" as const, label: "Carbs", value: totals.carbs_g, target: macroTargets.carbs_g, unit: "g" },
+                    { key: "fat_g" as const, label: "Fat", value: totals.fat_g, target: macroTargets.fat_g, unit: "g" }
                   ];
-                  return nutritionSummary.map((item) => (
-                    <View key={item.label} style={styles.nutritionItem}>
-                      <Text style={styles.nutritionLabel}>{item.label}</Text>
-                      <Text style={styles.nutritionValue}>
-                        {item.label === "Calories"
-                          ? Math.round(totals.calories_kcal)
-                          : item.label === "Protein"
-                            ? `${Math.round(totals.protein_g)}g`
-                            : item.label === "Carbs"
-                              ? `${Math.round(totals.carbs_g)}g`
-                              : `${Math.round(totals.fat_g)}g`}
-                      </Text>
-                      <Text style={styles.nutritionTarget}>{item.target}</Text>
-                    </View>
-                  ));
+                  return items.map((item) => {
+                    const current = Number(item.value) || 0;
+                    const target = Number(item.target) || 1;
+                    const progress = target > 0 ? Math.min(1, current / target) : 0;
+                    return (
+                      <View key={item.key} style={styles.nutritionItem}>
+                        <Text style={styles.nutritionLabel}>{item.label}</Text>
+                        <CircularProgressRing
+                          progress={progress}
+                          value={current}
+                          size={72}
+                          suffix={item.unit}
+                        />
+                        <Text style={styles.nutritionTarget}>
+                          / {Math.round(target)}
+                        </Text>
+                      </View>
+                    );
+                  });
                 })()}
               </View>
             </TouchableOpacity>
@@ -5650,26 +5666,26 @@ const styles = StyleSheet.create({
   },
   nutritionCard: {
     backgroundColor: "#FFFFFF",
-    borderRadius: 16,
-    paddingVertical: 24,
-    paddingHorizontal: 12,
+    borderRadius: 14,
+    paddingVertical: 28,
+    paddingHorizontal: 16,
     flexDirection: "row",
     justifyContent: "space-between",
     shadowColor: "#000",
-    shadowOpacity: 0.06,
-    shadowRadius: 10,
+    shadowOpacity: 0.08,
+    shadowRadius: 12,
     shadowOffset: { width: 0, height: 4 },
-    elevation: 2
+    elevation: 3
   },
   nutritionItem: {
     alignItems: "center",
-    flex: 1,
-    paddingVertical: 8
+    flex: 1
   },
   nutritionLabel: {
     color: "#000000",
-    fontSize: 12,
-    marginBottom: 8
+    fontSize: 13,
+    fontWeight: "600",
+    marginBottom: 12
   },
   nutritionValue: {
     color: "#111827",
@@ -5677,8 +5693,9 @@ const styles = StyleSheet.create({
     fontSize: 16
   },
   nutritionTarget: {
-    color: "#9CA3AF",
-    fontSize: 11,
+    color: "#888888",
+    fontSize: 13,
+    fontWeight: "400",
     marginTop: 8
   },
   upgradeProButton: {
