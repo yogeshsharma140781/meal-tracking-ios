@@ -4818,6 +4818,25 @@ function AppContent() {
                         {Math.round(meal.nutrients.calories_kcal)} Cal
                       </Text>
                     ) : null}
+                    {(meal.nutrients.protein_g > 0 || meal.nutrients.carbs_g > 0 || meal.nutrients.fat_g > 0) ? (
+                      <View style={styles.mealMacros}>
+                        <View style={styles.macroPill}>
+                          <Text style={styles.macroText}>
+                            {Math.round(meal.nutrients.protein_g)}g Protein
+                          </Text>
+                        </View>
+                        <View style={styles.macroPill}>
+                          <Text style={styles.macroText}>
+                            {Math.round(meal.nutrients.carbs_g)}g Carbs
+                          </Text>
+                        </View>
+                        <View style={styles.macroPill}>
+                          <Text style={styles.macroText}>
+                            {Math.round(meal.nutrients.fat_g)}g Fat
+                          </Text>
+                        </View>
+                      </View>
+                    ) : null}
                   </View>
                   <TouchableOpacity
                     style={styles.addCircle}
@@ -5334,7 +5353,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     marginTop: 4,
     marginBottom: HEADER_TO_CONTENT_GAP,
-    paddingHorizontal: 28
+    paddingHorizontal: 12
   },
   fixedHeader: {
     flexDirection: "row",
@@ -5342,7 +5361,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     paddingTop: 12,
     paddingBottom: HEADER_TO_CONTENT_GAP,
-    paddingHorizontal: 28,
+    paddingHorizontal: 12,
     backgroundColor: "#F5F5F7"
   },
   headerCenter: {
@@ -5372,7 +5391,7 @@ const styles = StyleSheet.create({
   },
   headerUpgradeButton: {
     paddingVertical: 5,
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     backgroundColor: "#2563EB",
     borderRadius: 14
   },
@@ -5383,7 +5402,7 @@ const styles = StyleSheet.create({
   },
   headerAddButton: {
     paddingVertical: 8,
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     backgroundColor: "#2563EB",
     borderRadius: 20
   },
@@ -5426,7 +5445,7 @@ const styles = StyleSheet.create({
     bottom: 0,
     backgroundColor: "#FFFFFF",
     paddingTop: 56,
-    paddingHorizontal: 20,
+    paddingHorizontal: 12,
     shadowColor: "#000",
     shadowOpacity: 0.15,
     shadowRadius: 12,
@@ -5466,7 +5485,7 @@ const styles = StyleSheet.create({
   },
   menuItem: {
     paddingVertical: 16,
-    paddingHorizontal: 4,
+    paddingHorizontal: 12,
     borderBottomWidth: 1,
     borderBottomColor: "#F3F4F6",
     flexDirection: "row",
@@ -5495,7 +5514,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
-    paddingHorizontal: 24,
+    paddingHorizontal: 12,
     paddingTop: 24,
     paddingBottom: 40
   },
@@ -5593,13 +5612,13 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     paddingTop: 8,
     paddingBottom: 100,
-    paddingHorizontal: 28,
+    paddingHorizontal: 12,
     backgroundColor: "#F5F5F7"
   },
   mealDetailContent: {
     paddingTop: HEADER_TO_CONTENT_GAP,
     paddingBottom: 120,
-    paddingHorizontal: 28
+    paddingHorizontal: 12
   },
   sectionLabelContainer: {
     flexDirection: "row",
@@ -5633,7 +5652,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
     borderRadius: 16,
     paddingVertical: 24,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     flexDirection: "row",
     justifyContent: "space-between",
     shadowColor: "#000",
@@ -5668,7 +5687,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#2563EB",
     borderRadius: 20,
     paddingVertical: 10,
-    paddingHorizontal: 20
+    paddingHorizontal: 12
   },
   upgradeProButtonText: {
     color: "#FFFFFF",
@@ -5722,7 +5741,7 @@ const styles = StyleSheet.create({
     maxWidth: 360,
     borderRadius: 28,
     backgroundColor: "#FFFFFF",
-    paddingHorizontal: 24,
+    paddingHorizontal: 12,
     paddingTop: 28,
     paddingBottom: 24,
     shadowColor: "#000000",
@@ -5733,7 +5752,7 @@ const styles = StyleSheet.create({
     alignItems: "center"
   },
   insightsPaywallProBadge: {
-    paddingHorizontal: 18,
+    paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 999,
     backgroundColor: "#111827",
@@ -5799,7 +5818,7 @@ const styles = StyleSheet.create({
     alignSelf: "flex-start",
     marginBottom: 24,
     paddingVertical: 10,
-    paddingHorizontal: 16
+    paddingHorizontal: 12
   },
   manageSubscriptionButtonText: {
     fontSize: 15,
@@ -5870,8 +5889,8 @@ const styles = StyleSheet.create({
   mealCard: {
     backgroundColor: "#FFFFFF",
     borderRadius: 16,
-    paddingVertical: 16,
-    paddingHorizontal: 16,
+    paddingVertical: 22,
+    paddingHorizontal: 12,
     flexDirection: "row",
     alignItems: "center",
     shadowColor: "#000",
@@ -5904,11 +5923,16 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 4
   },
+  mealMacros: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: 8
+  },
   addCircle: {
     width: 32,
     height: 32,
-    borderRadius: 16,
-    backgroundColor: "#E5E7EB",
     alignItems: "center",
     justifyContent: "center"
   },
@@ -5924,7 +5948,7 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
     backgroundColor: "#FFFFFF",
-    paddingHorizontal: 20,
+    paddingHorizontal: 12,
     paddingTop: 6,
     paddingBottom: 32,
     flexDirection: "row",
@@ -5968,7 +5992,7 @@ const styles = StyleSheet.create({
   analysisContent: {
     paddingTop: 8,
     paddingBottom: 120,
-    paddingHorizontal: 28
+    paddingHorizontal: 12
   },
   analysisMacroList: {
     flexDirection: "row",
@@ -5983,7 +6007,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
     borderRadius: 12,
     paddingVertical: 14,
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     minHeight: 200,
     shadowColor: "#000",
     shadowOpacity: 0.06,
@@ -6078,7 +6102,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#F5F5F7"
   },
   insightsSubTabsContainer: {
-    paddingHorizontal: 28,
+    paddingHorizontal: 12,
     paddingTop: 8,
     paddingBottom: 12
   },
@@ -6112,7 +6136,7 @@ const styles = StyleSheet.create({
     color: "#1D4ED8"
   },
   insightsContent: {
-    paddingHorizontal: 28,
+    paddingHorizontal: 12,
     paddingTop: 8,
     paddingBottom: 120
   },
@@ -6185,7 +6209,7 @@ const styles = StyleSheet.create({
   nutrientDetailContent: {
     paddingTop: HEADER_TO_CONTENT_GAP,
     paddingBottom: 120,
-    paddingHorizontal: 28
+    paddingHorizontal: 12
   },
   nutrientDetailExplanation: {
     fontSize: 16,
@@ -6238,7 +6262,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     paddingVertical: 14,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     borderBottomWidth: 1,
     borderBottomColor: "#E5E7EB"
   },
@@ -6258,7 +6282,7 @@ const styles = StyleSheet.create({
   },
   addScreen: {
     flex: 1,
-    paddingHorizontal: 28,
+    paddingHorizontal: 12,
     paddingTop: 8,
     paddingBottom: 24,
     justifyContent: "flex-start"
@@ -6273,7 +6297,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#2563EB",
     borderRadius: 20,
     paddingVertical: 8,
-    paddingHorizontal: 20,
+    paddingHorizontal: 12,
     shadowColor: "#000",
     shadowOpacity: 0.08,
     shadowRadius: 8,
@@ -6294,7 +6318,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
     borderRadius: 20,
     paddingVertical: 8,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     shadowColor: "#000",
     shadowOpacity: 0.08,
     shadowRadius: 8,
@@ -6356,7 +6380,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
     borderRadius: 24,
     paddingVertical: 12,
-    paddingHorizontal: 48,
+    paddingHorizontal: 12,
     shadowColor: "#000",
     shadowOpacity: 0.08,
     shadowRadius: 10,
@@ -6388,7 +6412,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
     borderRadius: 16,
     paddingVertical: 22,
-    paddingHorizontal: 20,
+    paddingHorizontal: 12,
     marginHorizontal: 0,
     width: "100%",
     alignSelf: "stretch",
@@ -6454,13 +6478,13 @@ const styles = StyleSheet.create({
     fontWeight: "600"
   },
   doneButton: {
-    marginHorizontal: 28,
+    marginHorizontal: 12,
     marginBottom: 24,
     alignSelf: "center",
     backgroundColor: "#FFFFFF",
     borderRadius: 28,
     paddingVertical: 12,
-    paddingHorizontal: 80,
+    paddingHorizontal: 12,
     shadowColor: "#000",
     shadowOpacity: 0.08,
     shadowRadius: 10,
@@ -6480,13 +6504,13 @@ const styles = StyleSheet.create({
   exportContent: {
     paddingTop: 8,
     paddingBottom: 100,
-    paddingHorizontal: 28
+    paddingHorizontal: 12
   },
   exportOption: {
     backgroundColor: "#FFFFFF",
     borderRadius: 12,
     paddingVertical: 16,
-    paddingHorizontal: 20,
+    paddingHorizontal: 12,
     marginBottom: 12,
     shadowColor: "#000",
     shadowOpacity: 0.06,
@@ -6528,7 +6552,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
     borderRadius: 8,
     paddingVertical: 12,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     fontSize: 14,
     color: "#111827",
     borderWidth: 1,
@@ -6545,7 +6569,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#2563EB",
     borderRadius: 12,
     paddingVertical: 16,
-    paddingHorizontal: 24,
+    paddingHorizontal: 12,
     alignItems: "center",
     shadowColor: "#000",
     shadowOpacity: 0.1,
@@ -6556,7 +6580,7 @@ const styles = StyleSheet.create({
   personalDetailsContent: {
     paddingTop: HEADER_TO_CONTENT_GAP,
     paddingBottom: 120,
-    paddingHorizontal: 28
+    paddingHorizontal: 12
   },
   personalInput: {
     backgroundColor: "#FFFFFF",
@@ -6615,7 +6639,7 @@ const styles = StyleSheet.create({
   },
   unitButton: {
     paddingVertical: 12,
-    paddingHorizontal: 20,
+    paddingHorizontal: 12,
     borderRadius: 8
   },
   unitButtonSelected: {
@@ -6686,7 +6710,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 20,
+    paddingHorizontal: 12,
     paddingVertical: 12,
     marginBottom: HEADER_TO_CONTENT_GAP
   },
@@ -6749,7 +6773,7 @@ const styles = StyleSheet.create({
   collapsibleFieldValue: {
     backgroundColor: "#F3F4F6",
     borderRadius: 3,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 8,
     minWidth: 120,
     alignItems: "flex-end"
@@ -6775,7 +6799,7 @@ const styles = StyleSheet.create({
   fieldValue: {
     backgroundColor: "#F3F4F6",
     borderRadius: 3,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 8,
     minWidth: 120,
     alignItems: "flex-end"
@@ -6800,7 +6824,7 @@ const styles = StyleSheet.create({
   heightInput: {
     backgroundColor: "#F3F4F6",
     borderRadius: 3,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 8,
     width: 100,
     fontSize: 12,
@@ -6810,7 +6834,7 @@ const styles = StyleSheet.create({
   unitDropdown: {
     backgroundColor: "#F3F4F6",
     borderRadius: 3,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 8,
     minWidth: 60,
     alignItems: "center"
@@ -6848,7 +6872,7 @@ const styles = StyleSheet.create({
   inlinePickerHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingBottom: 4
   },
   inlinePicker: {
@@ -6858,7 +6882,7 @@ const styles = StyleSheet.create({
   dropdownContent: {
     backgroundColor: "#FFFFFF",
     borderRadius: 12,
-    marginHorizontal: 20,
+    marginHorizontal: 12,
     minWidth: 200,
     shadowColor: "#000",
     shadowOpacity: 0.2,
@@ -6905,7 +6929,7 @@ const styles = StyleSheet.create({
   foodDetailContent: {
     paddingTop: HEADER_TO_CONTENT_GAP,
     paddingBottom: 120,
-    paddingHorizontal: 28
+    paddingHorizontal: 12
   },
   foodDetailSectionWrapper: {
     position: "relative",
@@ -6958,7 +6982,7 @@ const styles = StyleSheet.create({
     marginTop: 4,
     width: "100%",
     paddingVertical: 6,
-    paddingHorizontal: 10,
+    paddingHorizontal: 12,
     borderRadius: 6,
     borderWidth: 1,
     borderColor: "#E5E7EB",
@@ -6983,7 +7007,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     paddingVertical: 12,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     borderBottomWidth: 1,
     borderBottomColor: "#E5E7EB"
   },
@@ -7001,7 +7025,7 @@ const styles = StyleSheet.create({
     alignSelf: "center",
     backgroundColor: "#FFFFFF",
     borderRadius: 20,
-    paddingHorizontal: 24,
+    paddingHorizontal: 12,
     paddingVertical: 10,
     shadowColor: "#000",
     shadowOpacity: 0.08,
@@ -7068,7 +7092,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#F3F4F6",
     borderRadius: 16,
     paddingVertical: 8,
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     borderWidth: 1,
     borderColor: "#E5E7EB"
   },
@@ -7095,7 +7119,7 @@ const styles = StyleSheet.create({
     alignSelf: "center",
     backgroundColor: "#FFFFFF",
     borderRadius: 20,
-    paddingHorizontal: 20,
+    paddingHorizontal: 12,
     paddingVertical: 10,
     shadowColor: "#000",
     shadowOpacity: 0.08,
@@ -7112,7 +7136,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
     borderRadius: 16,
     padding: 24,
-    marginHorizontal: 40,
+    marginHorizontal: 12,
     shadowColor: "#000",
     shadowOpacity: 0.2,
     shadowRadius: 12,
@@ -7146,7 +7170,7 @@ const styles = StyleSheet.create({
   },
   templateModalDelete: {
     paddingVertical: 10,
-    paddingHorizontal: 20
+    paddingHorizontal: 12
   },
   templateModalDeleteText: {
     fontSize: 16,
@@ -7155,7 +7179,7 @@ const styles = StyleSheet.create({
   },
   templateModalCancel: {
     paddingVertical: 10,
-    paddingHorizontal: 20
+    paddingHorizontal: 12
   },
   templateModalCancelText: {
     fontSize: 16,
@@ -7166,7 +7190,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#2563EB",
     borderRadius: 8,
     paddingVertical: 10,
-    paddingHorizontal: 20
+    paddingHorizontal: 12
   },
   templateModalSaveText: {
     fontSize: 16,
