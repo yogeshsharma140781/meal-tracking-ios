@@ -4,6 +4,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  Pressable,
   View,
   StyleSheet,
   ScrollView,
@@ -19,6 +20,23 @@ import {
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SubscriptionProvider, useSubscription } from "./SubscriptionContext";
+
+// Tab icon using PNG assets (pass -active or -inactive based on state)
+function TabIcon({
+  source,
+  size = 24,
+}: {
+  source: number;
+  size?: number;
+}) {
+  return (
+    <Image
+      source={source}
+      style={{ width: size, height: size }}
+      resizeMode="contain"
+    />
+  );
+}
 
 // Lazy-load Skia only when Analysis tab is shown (avoids "App entry not found" at startup)
 const RING_SIZE = 112;
@@ -236,6 +254,120 @@ const CollapsibleField: React.FC<CollapsibleFieldProps> = ({
   );
 };
 
+const DELETE_REVEAL_WIDTH = 100;
+const SWIPE_SENSITIVITY = 1.3; // Slower, smoother tracking
+
+/** Swipeable item card: tap opens detail, swipe left reveals red delete. */
+const SwipeableItemCard: React.FC<{
+  item: { id: string; name: string; quantity: number; unit: string; grams: number; nutrients: { calories_kcal: number; protein_g: number; carbs_g: number; fat_g: number } };
+  onOpenDetail: () => void;
+  onDelete: () => void;
+  cardStyle: any;
+  cardContent: React.ReactNode;
+}> = ({ item, onOpenDetail, onDelete, cardStyle, cardContent }) => {
+  const translateX = useRef(new Animated.Value(0)).current;
+  const lastOffset = useRef(0);
+  const panResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => false,
+        onMoveShouldSetPanResponder: (_, g) =>
+          Math.abs(g.dx) > 6 && Math.abs(g.dx) > Math.abs(g.dy),
+        onPanResponderMove: (_, g) => {
+          const { dx } = g;
+          const amplified = lastOffset.current + dx * SWIPE_SENSITIVITY;
+          const newVal = Math.max(-DELETE_REVEAL_WIDTH, Math.min(0, amplified));
+          translateX.setValue(newVal);
+        },
+        onPanResponderRelease: (_, g) => {
+          const { dx, vx } = g;
+          const current = lastOffset.current + dx * SWIPE_SENSITIVITY;
+          const shouldReveal = dx < -10 || vx < -0.2 || current < -DELETE_REVEAL_WIDTH * 0.4;
+          const target = shouldReveal ? -DELETE_REVEAL_WIDTH : 0;
+          lastOffset.current = target;
+          Animated.timing(translateX, {
+            toValue: target,
+            duration: 320,
+            easing: Easing.out(Easing.cubic),
+            useNativeDriver: true,
+          }).start();
+        },
+      }),
+    [translateX]
+  );
+  return (
+    <View style={{ marginBottom: 14, overflow: "hidden" }} {...panResponder.panHandlers}>
+      <View
+        style={{
+          position: "absolute",
+          right: 2,
+          top: 0,
+          bottom: 0,
+          width: DELETE_REVEAL_WIDTH,
+          backgroundColor: "#DC2626",
+          borderTopRightRadius: 16,
+          borderBottomRightRadius: 16,
+          justifyContent: "center",
+          alignItems: "center",
+          zIndex: 0,
+        }}
+      >
+        <TouchableOpacity
+          onPress={onDelete}
+          style={{ flex: 1, justifyContent: "center", alignItems: "center", width: "100%" }}
+        >
+          <Image
+          source={require("./assets/trash-icon.png")}
+          style={{ width: 28, height: 28 }}
+          resizeMode="contain"
+        />
+        </TouchableOpacity>
+      </View>
+      <Animated.View style={[{ zIndex: 1 }, { transform: [{ translateX }] }]}>
+        <View style={{ borderRadius: 16, overflow: "hidden" }}>
+          <PressableCard style={cardStyle} onPress={onOpenDetail}>
+            {cardContent}
+          </PressableCard>
+        </View>
+      </Animated.View>
+    </View>
+  );
+};
+
+/** Card with press affordance: scale down to 0.98 on press, subtle shadow. */
+const PressableCard: React.FC<{
+  style: any;
+  onPress: () => void;
+  children: React.ReactNode;
+}> = ({ style, onPress, children }) => {
+  const scaleAnim = useRef(new Animated.Value(1)).current;
+
+  const handlePressIn = () => {
+    Animated.timing(scaleAnim, {
+      toValue: 0.98,
+      duration: 80,
+      useNativeDriver: true,
+    }).start();
+  };
+
+  const handlePressOut = () => {
+    Animated.timing(scaleAnim, {
+      toValue: 1,
+      duration: 120,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start();
+  };
+
+  return (
+    <Pressable onPress={onPress} onPressIn={handlePressIn} onPressOut={handlePressOut}>
+      <Animated.View style={[style, { transform: [{ scale: scaleAnim }] }]}>
+        {children}
+      </Animated.View>
+    </Pressable>
+  );
+};
+
 // For local testing, use: http://YOUR_MAC_IP:4000/v1
 // For production, use: https://meal-tracking-api.onrender.com/v1
 const API_BASE_URL =
@@ -256,6 +388,19 @@ type NutrientTotals = {
   magnesium_mg: number;
   vitamin_c_mg: number;
   vitamin_a_mcg: number;
+};
+
+type ParsedFoodRole = "main" | "side" | "cooking-fat" | "sauce" | "beverage" | "unknown";
+
+type ParsedFood = {
+  name: string;
+  originalText: string;
+  quantity?: number;
+  unit?: string;
+  approx?: boolean;
+  role: ParsedFoodRole;
+  confidence: number;
+  notes?: string;
 };
 
 type UserProfile = {
@@ -509,6 +654,302 @@ function resolveFromKnownFoods(
   return items.length > 0 ? items : null;
 }
 
+/**
+ * Local fallback parser when API is unavailable. Parses simple formats like
+ * "100g chicken", "2 eggs", "oatmeal with berries" and returns estimated items.
+ * Uses a minimal built-in nutrient table for common foods.
+ */
+const LOCAL_FOOD_ESTIMATES: Record<string, NutrientTotals> = {
+  chicken: { calories_kcal: 165, protein_g: 31, carbs_g: 0, fat_g: 3.6, fiber_g: 0, sodium_mg: 74, cholesterol_mg: 85, omega_3_g: 0.1, omega_6_g: 0.6, potassium_mg: 256, calcium_mg: 15, iron_mg: 1.3, vitamin_d_iu: 5, vitamin_b12_ug: 0.3, magnesium_mg: 29, vitamin_c_mg: 0, vitamin_a_mcg: 9 },
+  rice: { calories_kcal: 130, protein_g: 2.7, carbs_g: 28, fat_g: 0.3, fiber_g: 0.4, sodium_mg: 1, cholesterol_mg: 0, omega_3_g: 0, omega_6_g: 0.09, potassium_mg: 35, calcium_mg: 10, iron_mg: 0.2, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 12, vitamin_c_mg: 0, vitamin_a_mcg: 0 },
+  egg: { calories_kcal: 155, protein_g: 13, carbs_g: 1.1, fat_g: 11, fiber_g: 0, sodium_mg: 124, cholesterol_mg: 373, omega_3_g: 0.1, omega_6_g: 1.4, potassium_mg: 126, calcium_mg: 50, iron_mg: 1.8, vitamin_d_iu: 87, vitamin_b12_ug: 0.9, magnesium_mg: 12, vitamin_c_mg: 0, vitamin_a_mcg: 160 },
+  eggs: { calories_kcal: 155, protein_g: 13, carbs_g: 1.1, fat_g: 11, fiber_g: 0, sodium_mg: 124, cholesterol_mg: 373, omega_3_g: 0.1, omega_6_g: 1.4, potassium_mg: 126, calcium_mg: 50, iron_mg: 1.8, vitamin_d_iu: 87, vitamin_b12_ug: 0.9, magnesium_mg: 12, vitamin_c_mg: 0, vitamin_a_mcg: 160 },
+  oats: { calories_kcal: 389, protein_g: 16.9, carbs_g: 66.3, fat_g: 6.9, fiber_g: 10.6, sodium_mg: 2, cholesterol_mg: 0, omega_3_g: 0.11, omega_6_g: 2.42, potassium_mg: 429, calcium_mg: 54, iron_mg: 4.7, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 177, vitamin_c_mg: 0, vitamin_a_mcg: 0 },
+  oatmeal: { calories_kcal: 389, protein_g: 16.9, carbs_g: 66.3, fat_g: 6.9, fiber_g: 10.6, sodium_mg: 2, cholesterol_mg: 0, omega_3_g: 0.11, omega_6_g: 2.42, potassium_mg: 429, calcium_mg: 54, iron_mg: 4.7, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 177, vitamin_c_mg: 0, vitamin_a_mcg: 0 },
+  bread: { calories_kcal: 265, protein_g: 9, carbs_g: 49, fat_g: 3.2, fiber_g: 2.7, sodium_mg: 491, cholesterol_mg: 0, omega_3_g: 0.02, omega_6_g: 0.54, potassium_mg: 115, calcium_mg: 260, iron_mg: 3.6, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 25, vitamin_c_mg: 0, vitamin_a_mcg: 0 },
+  banana: { calories_kcal: 89, protein_g: 1.1, carbs_g: 23, fat_g: 0.3, fiber_g: 2.6, sodium_mg: 1, cholesterol_mg: 0, omega_3_g: 0.03, omega_6_g: 0.05, potassium_mg: 358, calcium_mg: 5, iron_mg: 0.3, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 27, vitamin_c_mg: 8.7, vitamin_a_mcg: 3 },
+  apple: { calories_kcal: 52, protein_g: 0.3, carbs_g: 14, fat_g: 0.2, fiber_g: 2.4, sodium_mg: 1, cholesterol_mg: 0, omega_3_g: 0.01, omega_6_g: 0.04, potassium_mg: 107, calcium_mg: 6, iron_mg: 0.1, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 5, vitamin_c_mg: 4.6, vitamin_a_mcg: 2 },
+  milk: { calories_kcal: 50, protein_g: 3.4, carbs_g: 4.8, fat_g: 1.5, fiber_g: 0, sodium_mg: 44, cholesterol_mg: 5, omega_3_g: 0.04, omega_6_g: 0.05, potassium_mg: 150, calcium_mg: 120, iron_mg: 0, vitamin_d_iu: 40, vitamin_b12_ug: 0.4, magnesium_mg: 11, vitamin_c_mg: 0, vitamin_a_mcg: 46 },
+  yogurt: { calories_kcal: 59, protein_g: 10, carbs_g: 3.6, fat_g: 0.4, fiber_g: 0, sodium_mg: 36, cholesterol_mg: 5, omega_3_g: 0.02, omega_6_g: 0.02, potassium_mg: 141, calcium_mg: 110, iron_mg: 0.1, vitamin_d_iu: 0, vitamin_b12_ug: 0.4, magnesium_mg: 11, vitamin_c_mg: 0, vitamin_a_mcg: 27 },
+  salad: { calories_kcal: 15, protein_g: 1.2, carbs_g: 2.9, fat_g: 0.2, fiber_g: 1.2, sodium_mg: 28, cholesterol_mg: 0, omega_3_g: 0.01, omega_6_g: 0.04, potassium_mg: 194, calcium_mg: 36, iron_mg: 0.9, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 13, vitamin_c_mg: 9.2, vitamin_a_mcg: 469 },
+  coffee: { calories_kcal: 2, protein_g: 0.3, carbs_g: 0, fat_g: 0, fiber_g: 0, sodium_mg: 5, cholesterol_mg: 0, omega_3_g: 0, omega_6_g: 0, potassium_mg: 116, calcium_mg: 5, iron_mg: 0, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 7, vitamin_c_mg: 0, vitamin_a_mcg: 0 },
+  pasta: { calories_kcal: 131, protein_g: 5, carbs_g: 25, fat_g: 1.1, fiber_g: 1.8, sodium_mg: 1, cholesterol_mg: 0, omega_3_g: 0.01, omega_6_g: 0.2, potassium_mg: 24, calcium_mg: 7, iron_mg: 1.3, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 18, vitamin_c_mg: 0, vitamin_a_mcg: 0 },
+};
+const GENERIC_FOOD: NutrientTotals = { calories_kcal: 150, protein_g: 10, carbs_g: 15, fat_g: 8, fiber_g: 2, sodium_mg: 200, cholesterol_mg: 30, omega_3_g: 0.1, omega_6_g: 0.5, potassium_mg: 200, calcium_mg: 30, iron_mg: 1, vitamin_d_iu: 10, vitamin_b12_ug: 0.2, magnesium_mg: 20, vitamin_c_mg: 5, vitamin_a_mcg: 50 };
+
+function findLocalFoodEstimate(foodPart: string): NutrientTotals {
+  const normalized = foodPart.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+  const words = normalized.split(/\s+/);
+  for (const w of words) {
+    if (w.length >= 3 && LOCAL_FOOD_ESTIMATES[w]) {
+      return LOCAL_FOOD_ESTIMATES[w];
+    }
+  }
+  if (LOCAL_FOOD_ESTIMATES[normalized]) return LOCAL_FOOD_ESTIMATES[normalized];
+  return GENERIC_FOOD;
+}
+
+// --- Smarter local parser: identify foods + apply portion heuristics ---
+
+const BREAD_LIKE_KEYWORDS = ["parantha", "paratha", "chapati", "roti", "naan", "bread", "pav", "bun"];
+
+const DEFAULT_GRAMS_PER_PIECE: Record<string, number> = {
+  "plain parantha": 60,
+  parantha: 60,
+  paratha: 60,
+  chapati: 40,
+  roti: 40,
+  naan: 90,
+  bread: 30,
+  pav: 35,
+  bun: 40,
+  "*": 50,
+};
+
+const DEFAULT_OIL_PER_PIECE_G = 8;
+const DEFAULT_OIL_PER_SERVING_G = 10;
+
+const OIL_PER_GRAM_RATIO = 0.18; // 18% of main grams as oil for gram-based mains
+const MIN_OIL_G = 5;
+const MAX_OIL_G = 40;
+
+function clamp(val: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, val));
+}
+
+function detectFoodRole(name: string): ParsedFoodRole {
+  const lower = name.toLowerCase();
+  if (/\b(oil|ghee|butter|olive oil|avocado oil)\b/.test(lower)) return "cooking-fat";
+  if (/\b(sauce|ketchup|mayo|mayonnaise|chutney|dressing)\b/.test(lower)) return "sauce";
+  if (/\b(coffee|tea|juice|latte|cappuccino|milk|smoothie)\b/.test(lower)) return "beverage";
+  return "main";
+}
+
+function isBreadLike(name: string): boolean {
+  const lower = name.toLowerCase();
+  return BREAD_LIKE_KEYWORDS.some((k) => lower.includes(k));
+}
+
+function parseToParsedFoods(text: string): ParsedFood[] {
+  const chunks = text
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const results: ParsedFood[] = [];
+
+  for (const chunk of chunks) {
+    const lower = chunk.toLowerCase();
+
+    // Special case: "<grams> g <main> in <fat>"
+    const gramInMatch = lower.match(
+      /^(\d+(?:\.\d+)?)\s*g\s+(.+?)\s+in\s+(.+)$/
+    );
+    if (gramInMatch) {
+      const grams = parseFloat(gramInMatch[1]);
+      const mainText = gramInMatch[2].trim();
+      const fatText = gramInMatch[3].trim();
+
+      const mainName = capitalizeFirst(mainText);
+      const fatName = capitalizeFirst(fatText);
+
+      results.push({
+        name: mainName,
+        originalText: chunk,
+        quantity: Number.isFinite(grams) ? grams : undefined,
+        unit: "g",
+        approx: !Number.isFinite(grams),
+        role: "main",
+        confidence: 0.95,
+      });
+
+      results.push({
+        name: fatName,
+        originalText: chunk,
+        quantity: undefined,
+        unit: undefined,
+        approx: true,
+        role: detectFoodRole(fatName),
+        confidence: 0.8,
+        notes: "Cooking fat inferred from 'in ... oil'",
+      });
+      continue;
+    }
+
+    // Special case: "<num> <main> in <fat>"
+    const inMatch = lower.match(
+      /^(\d+(?:\.\d+)?)\s+(.+?)\s+in\s+(.+)$/
+    );
+    if (inMatch) {
+      const qty = parseFloat(inMatch[1]);
+      const mainText = inMatch[2].trim();
+      const fatText = inMatch[3].trim();
+
+      const mainName = capitalizeFirst(mainText);
+      const fatName = capitalizeFirst(fatText);
+
+      results.push({
+        name: mainName,
+        originalText: chunk,
+        quantity: Number.isFinite(qty) ? qty : undefined,
+        unit: "piece",
+        approx: !Number.isFinite(qty),
+        role: "main",
+        confidence: 0.9,
+      });
+
+      results.push({
+        name: fatName,
+        originalText: chunk,
+        quantity: undefined,
+        unit: undefined,
+        approx: true,
+        role: detectFoodRole(fatName),
+        confidence: 0.7,
+        notes: "Cooking fat inferred from 'in ... oil'",
+      });
+      continue;
+    }
+
+    // Generic "<num> <food>" or "<food> <num>"
+    const numMatch = lower.match(
+      /^(\d+(?:\.\d+)?)\s+(.+)$|^(.+?)\s+(\d+(?:\.\d+)?)\s*$/
+    );
+    if (numMatch) {
+      const num = parseFloat(numMatch[1] || numMatch[4]);
+      const foodPart = (numMatch[2] || numMatch[3] || "").trim();
+      if (!foodPart) continue;
+      const name = capitalizeFirst(foodPart);
+      results.push({
+        name,
+        originalText: chunk,
+        quantity: Number.isFinite(num) ? num : undefined,
+        unit: undefined,
+        approx: !Number.isFinite(num),
+        role: detectFoodRole(name),
+        confidence: 0.8,
+      });
+      continue;
+    }
+
+    // Fallback: treat entire chunk as a single food with unknown quantity
+    const name = capitalizeFirst(chunk);
+    results.push({
+      name,
+      originalText: chunk,
+      quantity: undefined,
+      unit: undefined,
+      approx: true,
+      role: detectFoodRole(name),
+      confidence: 0.6,
+    });
+  }
+
+  return results;
+}
+
+function enrichParsedFoods(parsedFoods: ParsedFood[]): MealItem[] {
+  if (parsedFoods.length === 0) return [];
+
+  // Estimate total mains as pieces and grams for oil heuristics
+  let totalMainPieces = 0;
+  let totalMainGrams = 0;
+
+  for (const f of parsedFoods) {
+    if (f.role !== "main") continue;
+    const lowerName = f.name.toLowerCase();
+    const qty = f.quantity && f.quantity > 0 ? f.quantity : undefined;
+
+    if (isBreadLike(lowerName) || (f.unit === "piece" && qty)) {
+      const pieces = qty ?? 1;
+      const key = Object.keys(DEFAULT_GRAMS_PER_PIECE).find(
+        (k) => k !== "*" && lowerName.includes(k)
+      );
+      const perPiece =
+        (key && DEFAULT_GRAMS_PER_PIECE[key]) || DEFAULT_GRAMS_PER_PIECE["*"];
+      totalMainPieces += pieces;
+      totalMainGrams += perPiece * pieces;
+    } else if (f.unit === "g" && qty) {
+      totalMainGrams += qty;
+    }
+  }
+
+  const items: MealItem[] = [];
+
+  for (const f of parsedFoods) {
+    const lowerName = f.name.toLowerCase();
+    let grams = 0;
+    let quantity = f.quantity;
+    let unit: string | undefined = f.unit;
+    let approx = !!f.approx;
+
+    if (f.role === "main") {
+      if (isBreadLike(lowerName) || (quantity && quantity > 0 && (unit === "piece" || !unit))) {
+        const pieces = quantity && quantity > 0 ? quantity : 1;
+        const key = Object.keys(DEFAULT_GRAMS_PER_PIECE).find(
+          (k) => k !== "*" && lowerName.includes(k)
+        );
+        const perPiece =
+          (key && DEFAULT_GRAMS_PER_PIECE[key]) || DEFAULT_GRAMS_PER_PIECE["*"];
+        grams = perPiece * pieces;
+        quantity = pieces;
+        unit = "piece";
+        approx = approx || !f.quantity;
+      } else if (unit === "g" && quantity && quantity > 0) {
+        // Explicit gram-based main, e.g. "150g chicken"
+        grams = quantity;
+        approx = approx || false;
+      } else {
+        // Fallback main: assume one 100g serving
+        grams = 100;
+        quantity = 100;
+        unit = "g";
+        approx = true;
+      }
+    } else if (f.role === "cooking-fat") {
+      if (totalMainPieces > 0) {
+        // Piece-based mains (e.g. paranthas with oil)
+        grams = totalMainPieces * DEFAULT_OIL_PER_PIECE_G;
+      } else if (totalMainGrams > 0) {
+        // Gram-based mains (e.g. "150g chicken ... in oil")
+        grams = clamp(totalMainGrams * OIL_PER_GRAM_RATIO, MIN_OIL_G, MAX_OIL_G);
+      } else {
+        // No clear main context: single-serving default
+        grams = DEFAULT_OIL_PER_SERVING_G;
+      }
+      quantity = grams;
+      unit = "g";
+      approx = true;
+    } else {
+      // Generic fallback: 100g serving
+      grams = 100;
+      quantity = 100;
+      unit = "g";
+      approx = true;
+    }
+
+    const nutrientsBase = findLocalFoodEstimate(f.name);
+    const scale = grams / 100;
+    const nutrients = scaleTotals(nutrientsBase, scale);
+
+    items.push({
+      id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+      name: f.name,
+      quantity: quantity || grams,
+      unit: unit || "g",
+      grams,
+      nutrients,
+    });
+  }
+
+  return items;
+}
+
+function parseFoodTextLocally(text: string): MealItem[] {
+  const parsed = parseToParsedFoods(text);
+  return enrichParsedFoods(parsed);
+}
+
 function parseFoodLine(
   line: string,
   nameToCanonical: Map<string, string>,
@@ -608,7 +1049,7 @@ function parseFoodLine(
 }
 
 /** Fixed spacing between top header and content on all screens */
-const HEADER_TO_CONTENT_GAP = 24;
+const HEADER_TO_CONTENT_GAP = 18;
 
 const defaultProfile: UserProfile = {
   dateOfBirth: null,
@@ -2310,35 +2751,49 @@ function AppContent() {
       if (cached && cached.length > 0) {
         resolvedItems = cached;
       } else {
-        const res = await fetch(`${API_BASE_URL}/meals/nl-log`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: entryText,
-            startedAt: `${selectedDate}T12:00:00.000Z`,
-            tzOffsetMinutes: new Date().getTimezoneOffset()
-          })
-        });
-        if (!res.ok) {
-          const payload = await res.json();
-          throw new Error(payload?.error || "Failed to log meal.");
-        }
-        const data = (await res.json()) as MealResponse & { items?: MealItem[] };
-        const apiItems = data.items || [];
-        resolvedItems = apiItems;
-        if (apiItems.length > 0) {
-          const nextNutrients = { ...foodNutrients };
-          for (const item of apiItems) {
-            if (item && item.name && item.grams > 0 && item.nutrients) {
-              const key = normalizeFoodNameForDedup(item.name);
-              if (key) {
-                const nutrientsPer100g = scaleTotals(item.nutrients, 100 / item.grams);
-                nextNutrients[key] = nutrientsPer100g;
+        try {
+          const res = await fetch(`${API_BASE_URL}/meals/nl-log`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text: entryText,
+              startedAt: `${selectedDate}T12:00:00.000Z`,
+              tzOffsetMinutes: new Date().getTimezoneOffset()
+            })
+          });
+          if (!res.ok) {
+            const payload = await res.json().catch(() => ({}));
+            throw new Error(payload?.error || "Failed to log meal.");
+          }
+          const data = (await res.json()) as MealResponse & { items?: MealItem[] };
+          const apiItems = data.items || [];
+          if (apiItems.length > 0) {
+            resolvedItems = apiItems;
+            const nextNutrients = { ...foodNutrients };
+            for (const item of apiItems) {
+              if (item && item.name && item.grams > 0 && item.nutrients) {
+                const key = normalizeFoodNameForDedup(item.name);
+                if (key) {
+                  const nutrientsPer100g = scaleTotals(item.nutrients, 100 / item.grams);
+                  nextNutrients[key] = nutrientsPer100g;
+                }
               }
             }
+            setFoodNutrients(nextNutrients);
+            await persistFoodNutrients(nextNutrients);
+          } else {
+            resolvedItems = parseFoodTextLocally(entryText);
+            if (resolvedItems.length === 0) {
+              throw new Error("Could not parse any foods. Try formats like \"100g chicken\" or \"2 eggs\".");
+            }
           }
-          setFoodNutrients(nextNutrients);
-          await persistFoodNutrients(nextNutrients);
+        } catch (apiErr) {
+          const localItems = parseFoodTextLocally(entryText);
+          if (localItems.length > 0) {
+            resolvedItems = localItems;
+          } else {
+            throw apiErr;
+          }
         }
       }
 
@@ -3588,63 +4043,62 @@ function AppContent() {
         </SafeAreaView>
         <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.mealDetailContent}>
           {selectedItems.map((item) => (
-            <TouchableOpacity
+            <SwipeableItemCard
               key={item.id}
-              style={styles.itemCard}
-              onPress={async () => {
+              item={item}
+              onOpenDetail={async () => {
                 setSelectedFoodItem(item);
                 setEditableFoodNutrients(item.nutrients);
                 setOriginalFoodNutrients(item.nutrients);
                 fetchFoodInsights(item, selectedMealId);
               }}
-            >
-              <View style={styles.itemHeaderRow}>
-                <View style={styles.itemHeaderText}>
-                  <Text
-                    style={styles.itemTitle}
-                    numberOfLines={1}
-                    ellipsizeMode="tail"
-                  >
-                    {capitalizeFirst(stripParenthetical(item.name))}
-                  </Text>
-                  <Text style={styles.itemSubtitle}>
-                    {item.quantity} {item.unit}
-                    {item.unit === "g" || item.unit === "ml"
-                      ? ""
-                      : `, ${Math.round(item.grams)}g`}
-                  </Text>
-                </View>
-                <TouchableOpacity
-                  style={styles.itemRemove}
-                  onPress={(e) => {
-                    e.stopPropagation();
-                    handleDeleteItem(selectedMealId, item.id);
-                  }}
-                >
-                  <Text style={styles.itemRemoveText}>×</Text>
-                </TouchableOpacity>
-              </View>
-              <View style={styles.itemMacros}>
-                <View style={styles.macroPill}>
-                  <Text style={styles.macroText}>
-                    {Math.round(item.nutrients.protein_g)}g Protein
-                  </Text>
-                </View>
-                <View style={styles.macroPill}>
-                  <Text style={styles.macroText}>
-                    {Math.round(item.nutrients.carbs_g)}g Carbs
-                  </Text>
-                </View>
-                <View style={styles.macroPill}>
-                  <Text style={styles.macroText}>
-                    {Math.round(item.nutrients.fat_g)}g Fat
-                  </Text>
-                </View>
-                <Text style={styles.itemCalories}>
-                  {Math.round(item.nutrients.calories_kcal)} Cal
-                </Text>
-              </View>
-            </TouchableOpacity>
+              onDelete={() => handleDeleteItem(selectedMealId, item.id)}
+              cardStyle={styles.itemCard}
+              cardContent={
+                <>
+                  <View style={styles.itemHeaderRow}>
+                    <View style={styles.itemHeaderText}>
+                      <Text
+                        style={styles.itemTitle}
+                        numberOfLines={1}
+                        ellipsizeMode="tail"
+                      >
+                        {capitalizeFirst(stripParenthetical(item.name))}
+                      </Text>
+                      <Text style={styles.itemSubtitle}>
+                        {item.quantity} {item.unit}
+                        {item.unit === "g" || item.unit === "ml"
+                          ? ""
+                          : `, ${Math.round(item.grams)}g`}
+                      </Text>
+                    </View>
+                    <View style={styles.itemChevron}>
+                      <Text style={styles.itemChevronText}>›</Text>
+                    </View>
+                  </View>
+                  <View style={styles.itemMacros}>
+                    <View style={styles.macroPill}>
+                      <Text style={styles.macroText}>
+                        {Math.round(item.nutrients.protein_g)}g Protein
+                      </Text>
+                    </View>
+                    <View style={styles.macroPill}>
+                      <Text style={styles.macroText}>
+                        {Math.round(item.nutrients.carbs_g)}g Carbs
+                      </Text>
+                    </View>
+                    <View style={styles.macroPill}>
+                      <Text style={styles.macroText}>
+                        {Math.round(item.nutrients.fat_g)}g Fat
+                      </Text>
+                    </View>
+                    <Text style={styles.itemCalories}>
+                      {Math.round(item.nutrients.calories_kcal)} Cal
+                    </Text>
+                  </View>
+                </>
+              }
+            />
           ))}
 
           {selectedItems.length === 0 && (
@@ -4005,9 +4459,14 @@ function AppContent() {
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
-        <TouchableOpacity style={styles.iconButton} onPress={() => setMenuVisible(true)}>
-          <Text style={styles.menuIcon}>☰</Text>
-        </TouchableOpacity>
+        <View style={styles.headerLeftContainer}>
+          <TouchableOpacity
+            style={[styles.iconButton, styles.menuIconButton]}
+            onPress={() => setMenuVisible(true)}
+          >
+            <Text style={styles.menuIcon}>☰</Text>
+          </TouchableOpacity>
+        </View>
         <View style={styles.headerCenter}>
           {activeTab === "insights" ? (
             <Text style={styles.headerTitle}>Insights</Text>
@@ -4029,7 +4488,24 @@ function AppContent() {
             </>
           )}
         </View>
-        <View style={styles.iconButton} />
+        <View style={styles.headerRightContainer}>
+          {!isPro && (
+            <TouchableOpacity
+              style={styles.headerUpgradeButton}
+              onPress={() => presentPaywall()}
+              activeOpacity={0.8}
+            >
+              <Text
+                style={styles.headerUpgradeButtonText}
+                numberOfLines={1}
+                ellipsizeMode="clip"
+                allowFontScaling={false}
+              >
+                Upgrade
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
 
       <Modal
@@ -4090,19 +4566,6 @@ function AppContent() {
               style={styles.menuItem}
               onPress={() => {
                 closeSidebar();
-                setTimeout(() => {
-                  setFeedbackRating(0);
-                  setFeedbackText("");
-                  setFeedbackModalVisible(true);
-                }, 220);
-              }}
-            >
-              <Text style={styles.menuItemText}>Share feedback</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.menuItem}
-              onPress={() => {
-                closeSidebar();
                 setTimeout(() => setView("personal"), 220);
               }}
             >
@@ -4124,6 +4587,19 @@ function AppContent() {
                 />
               )}
             </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                closeSidebar();
+                setTimeout(() => {
+                  setFeedbackRating(0);
+                  setFeedbackText("");
+                  setFeedbackModalVisible(true);
+                }, 220);
+              }}
+            >
+              <Text style={styles.menuItemText}>Share feedback</Text>
+            </TouchableOpacity>
           </Animated.View>
         </View>
       </Modal>
@@ -4141,7 +4617,9 @@ function AppContent() {
         >
           <View style={styles.feedbackModalContent}>
             <View style={styles.feedbackModalHeader}>
-              <Text style={styles.feedbackModalTitle}>How are we doing?</Text>
+              <View style={styles.feedbackModalTitleWrap}>
+                <Text style={styles.feedbackModalTitle}>How are we doing?</Text>
+              </View>
               <TouchableOpacity
                 style={styles.feedbackModalCloseButton}
                 onPress={() => {
@@ -4154,7 +4632,7 @@ function AppContent() {
               </TouchableOpacity>
             </View>
             <Text style={styles.feedbackModalSubtext}>
-              Your opinion means a world to us. Please share with us.
+              Your opinion means a world to us.
             </Text>
             <View style={styles.feedbackStarsRow}>
               {[1, 2, 3, 4, 5].map((star) => (
@@ -4181,7 +4659,6 @@ function AppContent() {
               textAlignVertical="top"
               editable
             />
-            <Text style={styles.feedbackCharCount}>{feedbackText.length}/500</Text>
             <TouchableOpacity
               style={[
                 styles.feedbackSubmitButton,
@@ -4239,7 +4716,10 @@ function AppContent() {
               },
             ]}
           >
-            <ScrollView contentContainerStyle={styles.content}>
+            <ScrollView
+              style={{ flex: 1, backgroundColor: "#F5F5F7" }}
+              contentContainerStyle={styles.content}
+            >
             <TouchableOpacity
               onPress={() => setActiveTab("analysis")}
               activeOpacity={1}
@@ -4293,12 +4773,11 @@ function AppContent() {
                     <Text style={styles.yesterdayInsightAffirmation}>{bestInsight.affirmation}</Text>
                     <Text style={styles.yesterdayInsightCategory}>{bestInsight.category}</Text>
                     <Text style={styles.yesterdayInsightValue}>{bestInsight.value}</Text>
-                    <Text style={styles.yesterdayInsightMessage}>Upgrade to Pro for personalized tips and recommendations.</Text>
                     <TouchableOpacity
                       style={styles.upgradeProButton}
                       onPress={() => presentPaywall()}
                     >
-                      <Text style={styles.upgradeProButtonText}>Upgrade to Pro to View Full Insights</Text>
+                      <Text style={styles.upgradeProButtonText}>Upgrade to view full insights</Text>
                     </TouchableOpacity>
                   </>
                 )}
@@ -4314,14 +4793,13 @@ function AppContent() {
                 const iconSize = meal.id === "snack-afternoon" || meal.id === "snack-evening" ? 36 : 40;
                 
                 return (
-                <TouchableOpacity
+                <PressableCard
                   key={meal.id}
                   style={styles.mealCard}
                   onPress={() => {
                     setSelectedMealId(meal.id);
                     setView("meal");
                   }}
-                  activeOpacity={0.9}
                 >
                   <View style={styles.mealIcon}>
                     <Image
@@ -4347,7 +4825,7 @@ function AppContent() {
                   >
                     <Text style={styles.addCircleText}>+</Text>
                   </TouchableOpacity>
-                </TouchableOpacity>
+                </PressableCard>
                 );
               })}
             </View>
@@ -4366,6 +4844,7 @@ function AppContent() {
           >
             {selectedNutrient === null ? (
             <ScrollView
+              style={{ flex: 1, backgroundColor: "#F5F5F7" }}
               contentContainerStyle={styles.analysisContent}
               showsVerticalScrollIndicator
             >
@@ -4413,7 +4892,7 @@ function AppContent() {
               </View>
 
               <View style={[styles.sectionLabelContainer, styles.sectionSpacing]}>
-                <Text style={styles.sectionLabel}>
+                <Text style={[styles.sectionLabel, styles.sectionLabelInRow]}>
                   MICRO-NUTRIENTS
                 </Text>
                 {!isPro && (
@@ -4749,57 +5228,77 @@ function AppContent() {
           onPress={() => setActiveTab("meals")}
           activeOpacity={0.8}
         >
-          <View style={[styles.tabPill, activeTab === "meals" && styles.tabPillActive]}>
-            <Text
-              style={[styles.tabLabel, activeTab === "meals" && styles.tabLabelActive]}
-            >
-              MEALS
-            </Text>
+          <View style={styles.tabIconWrap}>
+            <TabIcon
+              source={
+                activeTab === "meals"
+                  ? require("./assets/Meals-active.png")
+                  : require("./assets/Meals-inactive.png")
+              }
+              size={28}
+            />
           </View>
+          <Text
+            style={[styles.tabLabel, activeTab === "meals" && styles.tabLabelActive]}
+          >
+            MEALS
+          </Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={styles.tabItem}
           onPress={() => setActiveTab("analysis")}
           activeOpacity={0.8}
         >
-          <View
-            style={[styles.tabPill, activeTab === "analysis" && styles.tabPillActive]}
-          >
-            <Text
-              style={[
-                styles.tabLabel,
-                activeTab === "analysis" && styles.tabLabelActive
-              ]}
-            >
-              ANALYSIS
-            </Text>
+          <View style={styles.tabIconWrap}>
+            <TabIcon
+              source={
+                activeTab === "analysis"
+                  ? require("./assets/Analysis-active.png")
+                  : require("./assets/Analysis-inactive.png")
+              }
+              size={28}
+            />
           </View>
+          <Text
+            style={[
+              styles.tabLabel,
+              activeTab === "analysis" && styles.tabLabelActive
+            ]}
+          >
+            ANALYSIS
+          </Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={styles.tabItem}
           onPress={() => setActiveTab("insights")}
           activeOpacity={0.8}
         >
-          <View
-            style={[styles.tabPill, activeTab === "insights" && styles.tabPillActive]}
-          >
-            <View style={styles.tabLabelContainer}>
-              <Text
-                style={[
-                  styles.tabLabel,
-                  activeTab === "insights" && styles.tabLabelActive
-                ]}
-              >
-                INSIGHTS
-              </Text>
-              {!isPro && (
-                <Image
-                  source={require("./assets/Pro_Badge.png")}
-                  style={styles.tabProBadge}
-                  resizeMode="contain"
-                />
-              )}
-            </View>
+          <View style={styles.tabIconWrap}>
+            <TabIcon
+              source={
+                activeTab === "insights"
+                  ? require("./assets/Insights-active.png")
+                  : require("./assets/Insights-inactive.png")
+              }
+              size={28}
+            />
+          </View>
+          <View style={styles.tabLabelContainer}>
+            <Text
+              style={[
+                styles.tabLabel,
+                activeTab === "insights" && styles.tabLabelActive
+              ]}
+            >
+              INSIGHTS
+            </Text>
+            {!isPro && (
+              <Image
+                source={require("./assets/Pro_Badge.png")}
+                style={styles.tabProBadge}
+                resizeMode="contain"
+              />
+            )}
           </View>
         </TouchableOpacity>
       </View>
@@ -4818,14 +5317,14 @@ export default function App() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#FFFFFF",
-    paddingTop: 24
+    backgroundColor: "#F5F5F7",
+    paddingTop: 10
   },
   loadingContainer: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
-    backgroundColor: "#FFFFFF",
+    backgroundColor: "#F5F5F7",
     width: "100%",
     height: "100%"
   },
@@ -4833,7 +5332,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginTop: 8,
+    marginTop: 4,
     marginBottom: HEADER_TO_CONTENT_GAP,
     paddingHorizontal: 28
   },
@@ -4841,7 +5340,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingTop: 24,
+    paddingTop: 12,
     paddingBottom: HEADER_TO_CONTENT_GAP,
     paddingHorizontal: 28,
     backgroundColor: "#F5F5F7"
@@ -4865,10 +5364,27 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
+  headerRightContainer: {
+    width: 100,
+    alignItems: "flex-end",
+    justifyContent: "center",
+    flexShrink: 0
+  },
+  headerUpgradeButton: {
+    paddingVertical: 5,
+    paddingHorizontal: 14,
+    backgroundColor: "#2563EB",
+    borderRadius: 14
+  },
+  headerUpgradeButtonText: {
+    color: "#FFFFFF",
+    fontSize: 11,
+    fontWeight: "600"
+  },
   headerAddButton: {
     paddingVertical: 8,
     paddingHorizontal: 14,
-    backgroundColor: "#5B5CE9",
+    backgroundColor: "#2563EB",
     borderRadius: 20
   },
   headerAddText: {
@@ -4890,6 +5406,15 @@ const styles = StyleSheet.create({
     fontSize: 20,
     color: "#1F2937",
     fontWeight: "400"
+  },
+  headerLeftContainer: {
+    width: 100,
+    alignItems: "flex-start",
+    justifyContent: "center"
+  },
+  menuIconButton: {
+    alignItems: "flex-start",
+    marginLeft: 0
   },
   sidebarRoot: {
     flex: 1
@@ -4976,14 +5501,21 @@ const styles = StyleSheet.create({
   },
   feedbackModalHeader: {
     flexDirection: "row",
-    justifyContent: "space-between",
+    justifyContent: "center",
     alignItems: "center",
-    marginBottom: 12
+    marginBottom: 12,
+    position: "relative"
+  },
+  feedbackModalTitleWrap: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center"
   },
   feedbackModalTitle: {
-    fontSize: 18,
+    fontSize: 15,
     fontWeight: "700",
-    color: "#111827"
+    color: "#111827",
+    textAlign: "center"
   },
   feedbackModalCloseButton: {
     width: 32,
@@ -4991,7 +5523,10 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     backgroundColor: "#F3F4F6",
     justifyContent: "center",
-    alignItems: "center"
+    alignItems: "center",
+    position: "absolute",
+    right: 0,
+    top: 0
   },
   feedbackModalCloseText: {
     fontSize: 16,
@@ -5014,28 +5549,22 @@ const styles = StyleSheet.create({
     marginHorizontal: 4
   },
   feedbackStarIcon: {
-    fontSize: 32,
+    fontSize: 24,
     color: "#FBBF24"
   },
   feedbackTextInput: {
     backgroundColor: "#F3F4F6",
     borderRadius: 12,
     padding: 16,
-    fontSize: 16,
+    fontSize: 14,
     color: "#111827",
-    minHeight: 100,
-    marginBottom: 8
-  },
-  feedbackCharCount: {
-    fontSize: 12,
-    color: "#9CA3AF",
-    textAlign: "right",
+    minHeight: 140,
     marginBottom: 20
   },
   feedbackSubmitButton: {
-    backgroundColor: "#7C3AED",
-    borderRadius: 12,
-    paddingVertical: 14,
+    backgroundColor: "#2563EB",
+    borderRadius: 999,
+    paddingVertical: 12,
     alignItems: "center",
     marginBottom: 12
   },
@@ -5057,12 +5586,15 @@ const styles = StyleSheet.create({
     color: "#6B7280"
   },
   mealsSwipeArea: {
-    flex: 1
+    flex: 1,
+    backgroundColor: "#F5F5F7"
   },
   content: {
+    flexGrow: 1,
     paddingTop: 8,
     paddingBottom: 100,
-    paddingHorizontal: 28
+    paddingHorizontal: 28,
+    backgroundColor: "#F5F5F7"
   },
   mealDetailContent: {
     paddingTop: HEADER_TO_CONTENT_GAP,
@@ -5079,11 +5611,16 @@ const styles = StyleSheet.create({
     color: "#111827",
     fontWeight: "700",
     fontSize: 12,
-    letterSpacing: 0
+    letterSpacing: 0,
+    marginBottom: 10
+  },
+  sectionLabelInRow: {
+    marginBottom: 0
   },
   sectionProBadge: {
-    width: 36,
-    height: 18
+    width: 40,
+    height: 20,
+    alignSelf: "center"
   },
   menuProBadge: {
     width: 40,
@@ -5095,8 +5632,8 @@ const styles = StyleSheet.create({
   nutritionCard: {
     backgroundColor: "#FFFFFF",
     borderRadius: 16,
-    paddingVertical: 16,
-    paddingHorizontal: 12,
+    paddingVertical: 24,
+    paddingHorizontal: 16,
     flexDirection: "row",
     justifyContent: "space-between",
     shadowColor: "#000",
@@ -5107,12 +5644,13 @@ const styles = StyleSheet.create({
   },
   nutritionItem: {
     alignItems: "center",
-    flex: 1
+    flex: 1,
+    paddingVertical: 8
   },
   nutritionLabel: {
     color: "#000000",
     fontSize: 12,
-    marginBottom: 6
+    marginBottom: 8
   },
   nutritionValue: {
     color: "#111827",
@@ -5122,12 +5660,12 @@ const styles = StyleSheet.create({
   nutritionTarget: {
     color: "#9CA3AF",
     fontSize: 11,
-    marginTop: 4
+    marginTop: 8
   },
   upgradeProButton: {
     alignSelf: "center",
     marginTop: 12,
-    backgroundColor: "#5B5CE9",
+    backgroundColor: "#2563EB",
     borderRadius: 20,
     paddingVertical: 10,
     paddingHorizontal: 20
@@ -5242,7 +5780,7 @@ const styles = StyleSheet.create({
   },
   insightsPaywallPrimaryButton: {
     alignSelf: "stretch",
-    backgroundColor: "#576CDB",
+    backgroundColor: "#2563EB",
     borderRadius: 999,
     paddingVertical: 12,
     alignItems: "center",
@@ -5265,7 +5803,7 @@ const styles = StyleSheet.create({
   },
   manageSubscriptionButtonText: {
     fontSize: 15,
-    color: "#5B5CE9",
+    color: "#2563EB",
     fontWeight: "600"
   },
   yesterdayInsightCard: {
@@ -5332,15 +5870,15 @@ const styles = StyleSheet.create({
   mealCard: {
     backgroundColor: "#FFFFFF",
     borderRadius: 16,
-    paddingVertical: 14,
-    paddingHorizontal: 14,
+    paddingVertical: 16,
+    paddingHorizontal: 16,
     flexDirection: "row",
     alignItems: "center",
     shadowColor: "#000",
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 3 },
-    elevation: 2
+    shadowOpacity: 0.08,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 3
   },
   mealIcon: {
     width: 40,
@@ -5386,8 +5924,8 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
     backgroundColor: "#FFFFFF",
-    paddingHorizontal: 32,
-    paddingTop: 14,
+    paddingHorizontal: 20,
+    paddingTop: 6,
     paddingBottom: 32,
     flexDirection: "row",
     justifyContent: "space-between",
@@ -5399,35 +5937,33 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
-    marginTop: 8
+    flexDirection: "column",
+    gap: 4,
+    paddingTop: 2
   },
-  tabPill: {
-    paddingHorizontal: 18,
-    paddingVertical: 8,
-    borderRadius: 18
+  tabIconWrap: {
+    alignItems: "center",
+    justifyContent: "center"
   },
   tabLabelContainer: {
     position: "relative",
     alignItems: "center",
     justifyContent: "center"
   },
-  tabPillActive: {
-    backgroundColor: "#E0E7FF"
-  },
   tabLabel: {
-    color: "#6B7280",
-    fontSize: 11,
-    fontWeight: "600"
+    color: "#111827",
+    fontSize: 9,
+    fontWeight: "500"
   },
   tabLabelActive: {
-    color: "#1D4ED8"
+    color: "#2563EB"
   },
   tabProBadge: {
     position: "absolute",
     width: 40,
     height: 20,
-    top: -22,
-    right: -22
+    top: -26,
+    right: -30
   },
   analysisContent: {
     paddingTop: 8,
@@ -5538,7 +6074,8 @@ const styles = StyleSheet.create({
   },
   insightsRoot: {
     flex: 1,
-    position: "relative"
+    position: "relative",
+    backgroundColor: "#F5F5F7"
   },
   insightsSubTabsContainer: {
     paddingHorizontal: 28,
@@ -5733,7 +6270,7 @@ const styles = StyleSheet.create({
     marginBottom: HEADER_TO_CONTENT_GAP
   },
   addHeaderButton: {
-    backgroundColor: "#5B5CE9",
+    backgroundColor: "#2563EB",
     borderRadius: 20,
     paddingVertical: 8,
     paddingHorizontal: 20,
@@ -5850,22 +6387,22 @@ const styles = StyleSheet.create({
   itemCard: {
     backgroundColor: "#FFFFFF",
     borderRadius: 16,
-    padding: 16,
+    paddingVertical: 22,
+    paddingHorizontal: 20,
     marginHorizontal: 0,
-    marginBottom: 14,
     width: "100%",
     alignSelf: "stretch",
     shadowColor: "#000",
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 3 },
-    elevation: 2
+    shadowOpacity: 0.18,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 6
   },
   itemHeaderRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 10
+    marginBottom: 12
   },
   itemHeaderText: {
     flex: 1,
@@ -5882,17 +6419,16 @@ const styles = StyleSheet.create({
     color: "#6B7280",
     marginTop: 4
   },
-  itemRemove: {
+  itemChevron: {
     width: 28,
     height: 28,
-    borderRadius: 14,
-    backgroundColor: "#E5E7EB",
     alignItems: "center",
     justifyContent: "center"
   },
-  itemRemoveText: {
+  itemChevronText: {
     color: "#6B7280",
-    fontSize: 18
+    fontSize: 24,
+    fontWeight: "300"
   },
   itemMacros: {
     flexDirection: "row",
