@@ -19,6 +19,7 @@ import {
   Easing
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import Svg, { Circle } from "react-native-svg";
 import { SubscriptionProvider, useSubscription } from "./SubscriptionContext";
 
 // Tab icon using PNG assets (pass -active or -inactive based on state)
@@ -38,7 +39,6 @@ function TabIcon({
   );
 }
 
-// Lazy-load Skia only when Analysis tab is shown (avoids "App entry not found" at startup)
 const RING_SIZE = 112;
 const RING_STROKE = 8;
 
@@ -53,63 +53,46 @@ function CircularProgressRing({
   size?: number;
   suffix?: string;
 }) {
-  const [SkiaModule, setSkiaModule] = useState<{
-    Canvas: React.ComponentType<any>;
-    Path: React.ComponentType<any>;
-    Group: React.ComponentType<any>;
-    ringPath: unknown;
-  } | null>(null);
   const stroke = Math.max(6, (RING_STROKE / RING_SIZE) * size);
-
-  useEffect(() => {
-    let cancelled = false;
-    import("@shopify/react-native-skia").then((mod) => {
-      if (cancelled) return;
-      const oval = mod.Skia.XYWHRect(stroke / 2, stroke / 2, size - stroke, size - stroke);
-      const p = mod.Skia.Path.Make();
-      p.addArc(oval, -90, 360);
-      setSkiaModule({ Canvas: mod.Canvas, Path: mod.Path, Group: mod.Group, ringPath: p });
-    }).catch(() => {
-      if (!cancelled) setSkiaModule(null);
-    });
-    return () => { cancelled = true; };
-  }, [size, stroke]);
+  const radius = (size - stroke) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const arcLength = circumference * (270 / 360);
+  const gapLength = circumference * (90 / 360);
+  const offset = circumference * (135 / 360);
 
   const safeProgress = Math.min(1, Math.max(0, Number.isFinite(progress) ? progress : 0));
   const displayValue = Math.round(Number.isFinite(value) ? value : 0);
   const displayText = `${displayValue}${suffix}`;
 
-  if (SkiaModule) {
-    const { Canvas, Path, Group, ringPath } = SkiaModule;
-    return (
-      <View
-        style={{ width: size, height: size, position: "relative" }}
-        pointerEvents="none"
-      >
-        <Canvas style={{ width: size, height: size }}>
-          <Group style="stroke" strokeWidth={stroke} color="#E0E0E0">
-            <Path path={ringPath} />
-          </Group>
-          {safeProgress > 0.001 && (
-            <Group style="stroke" strokeWidth={stroke} color="#4263EB" strokeCap="round">
-              <Path path={ringPath} start={0} end={safeProgress} />
-            </Group>
-          )}
-        </Canvas>
-        <View style={[StyleSheet.absoluteFillObject, { justifyContent: "center", alignItems: "center" }]} pointerEvents="none">
-          <Text style={{ fontSize: size <= 72 ? 14 : 15, fontWeight: "700", color: "#000000" }}>{displayText}</Text>
-        </View>
-      </View>
-    );
-  }
-
   return (
-    <View style={styles.analysisMacroRingWrap} pointerEvents="none">
-      <View style={styles.analysisMacroProgressBar}>
-        <View style={[styles.analysisMacroProgressFill, { width: `${Math.min(100, safeProgress * 100)}%` }]} />
-      </View>
-      <View style={styles.analysisMacroRingCenter}>
-        <Text style={styles.analysisMacroRingValue}>{displayText}</Text>
+    <View style={{ width: size, height: size, position: "relative" }} pointerEvents="none">
+      <Svg width={size} height={size} style={{ position: "absolute" }}>
+        <Circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          stroke="#E0E0E0"
+          strokeWidth={stroke}
+          fill="none"
+          strokeDasharray={`${arcLength} ${gapLength}`}
+          strokeDashoffset={-offset}
+        />
+        {safeProgress > 0.001 && (
+          <Circle
+            cx={size / 2}
+            cy={size / 2}
+            r={radius}
+            stroke="#4263EB"
+            strokeWidth={stroke}
+            fill="none"
+            strokeLinecap="round"
+            strokeDasharray={`${safeProgress * arcLength} ${circumference}`}
+            strokeDashoffset={-offset}
+          />
+        )}
+      </Svg>
+      <View style={[StyleSheet.absoluteFillObject, { justifyContent: "center", alignItems: "center" }]} pointerEvents="none">
+        <Text style={{ fontSize: size <= 72 ? 12 : 14, fontWeight: "800", color: "#111827" }}>{displayText}</Text>
       </View>
     </View>
   );
@@ -515,6 +498,25 @@ const getHealthQuotientLevel = (score: number): { label: string; color: string }
   if (score >= 35) return { label: "Fair", color: "#F97316" };
   return { label: "Poor", color: "#EF4444" };
 };
+
+/** Determine top qualities of a food based on nutrients */
+const getTopQualities = (nutrients: NutrientTotals): string[] => {
+  const qualities: string[] = [];
+  const calories = nutrients.calories_kcal || 1;
+  const proteinPerCal = (nutrients.protein_g || 0) / calories * 100;
+  const fiberPerCal = (nutrients.fiber_g || 0) / calories * 100;
+  const carbsRatio = (nutrients.carbs_g || 0) / calories;
+  const fatRatio = (nutrients.fat_g || 0) / calories;
+  
+  if (proteinPerCal > 0.5 && nutrients.protein_g > 0) qualities.push("High Protein");
+  if (fiberPerCal > 0.3 && nutrients.fiber_g > 0) qualities.push("High Fiber");
+  if (carbsRatio < 0.4 && nutrients.carbs_g > 0) qualities.push("Low carbs");
+  if (fatRatio < 0.2 && nutrients.fat_g > 0) qualities.push("Low Fat");
+  if ((nutrients.vitamin_c_mg || 0) > 10 || (nutrients.vitamin_a_mcg || 0) > 100) qualities.push("Rich in Vitamins");
+  if ((nutrients.potassium_mg || 0) > 200 || (nutrients.magnesium_mg || 0) > 30) qualities.push("Rich in Minerals");
+  
+  return qualities.slice(0, 3);
+};
 const normalizeFoodNameForKey = (name: string) =>
   stripParenthetical(name).trim().toLowerCase();
 
@@ -569,6 +571,60 @@ const normalizeFoodNameForDedup = (name: string): string => {
 // Get canonical version (properly capitalized) from normalized key
 const getCanonicalFoodName = (name: string): string => {
   return capitalizeFirst(stripParenthetical(name).trim());
+};
+
+/** Infer typical serving size (grams) from food name. Used for saved foods display and when logging new foods. */
+const inferDefaultServingGrams = (name: string): number => {
+  const lower = name.toLowerCase();
+  const rules: { keywords: string[]; grams: number }[] = [
+    { keywords: ["vitamin", "omega", "tablet", "capsule", "supplement", "pill", "softgel", "gummy", "multivitamin", "probiotic"], grams: 1 },
+    { keywords: ["chapati", "chapatti", "roti", "phulka"], grams: 50 },
+    { keywords: ["naan"], grams: 90 },
+    { keywords: ["paratha", "parantha"], grams: 80 },
+    { keywords: ["chicken breast", "chicken thigh"], grams: 120 },
+    { keywords: ["chicken drumstick"], grams: 75 },
+    { keywords: ["chicken"], grams: 100 },
+    { keywords: ["salmon", "fish fillet", "tilapia", "cod"], grams: 120 },
+    { keywords: ["steak", "beef"], grams: 100 },
+    { keywords: ["egg"], grams: 50 },
+    { keywords: ["walnut", "almond", "cashew", "pistachio", "peanut", "nut"], grams: 28 },
+    { keywords: ["bread slice", "slice of bread"], grams: 30 },
+    { keywords: ["bread"], grams: 40 },
+    { keywords: ["banana"], grams: 120 },
+    { keywords: ["apple", "orange", "pear"], grams: 150 },
+    { keywords: ["mango"], grams: 200 },
+    { keywords: ["strawberry", "blueberry", "raspberry", "berry"], grams: 100 },
+    { keywords: ["milk"], grams: 240 },
+    { keywords: ["yogurt", "curd", "dahi"], grams: 170 },
+    { keywords: ["oatmeal", "oats"], grams: 40 },
+    { keywords: ["rice cooked", "cooked rice"], grams: 150 },
+    { keywords: ["rice"], grams: 80 },
+    { keywords: ["pasta cooked", "cooked pasta"], grams: 140 },
+    { keywords: ["pasta", "noodle"], grams: 85 },
+    { keywords: ["potato", "sweet potato"], grams: 150 },
+    { keywords: ["olive oil", "coconut oil", "oil"], grams: 15 },
+    { keywords: ["butter", "ghee"], grams: 14 },
+    { keywords: ["cheese slice", "slice of cheese"], grams: 28 },
+    { keywords: ["cheese"], grams: 40 },
+    { keywords: ["broccoli", "cauliflower", "spinach", "lettuce", "kale"], grams: 80 },
+    { keywords: ["dal", "lentil", "beans cooked"], grams: 150 },
+    { keywords: ["paneer"], grams: 100 },
+    { keywords: ["idli"], grams: 50 },
+    { keywords: ["dosa"], grams: 70 },
+    { keywords: ["sandwich", "burger"], grams: 150 },
+    { keywords: ["pizza slice"], grams: 100 },
+    { keywords: ["pizza"], grams: 120 },
+    { keywords: ["cookie", "biscuit"], grams: 15 },
+    { keywords: ["protein bar", "energy bar"], grams: 60 },
+    { keywords: ["coffee", "tea"], grams: 240 },
+    { keywords: ["smoothie", "shake"], grams: 300 },
+    { keywords: ["avocado"], grams: 100 },
+    { keywords: ["toast"], grams: 30 },
+  ];
+  for (const { keywords, grams } of rules) {
+    if (keywords.some((t) => lower.includes(t))) return grams;
+  }
+  return 100;
 };
 
 /** Unit to grams for volume measures (approximate) */
@@ -1182,6 +1238,7 @@ const YESTERDAY_INSIGHT_DISMISSED_KEY = "@mealtracking_yesterdayInsightDismissed
 const FOOD_SUGGESTIONS_KEY = "@mealtracking_foodSuggestions";
 const FOOD_NUTRIENTS_KEY = "@mealtracking_foodNutrients";
 const FOOD_OVERRIDES_KEY = "@mealtracking_foodOverrides";
+const FOOD_SERVING_GRAMS_KEY = "@mealtracking_foodServingGrams";
 const MEAL_TEMPLATES_KEY = "@mealtracking_mealTemplates";
 
 type MealTemplate = {
@@ -1984,7 +2041,7 @@ function getContributors(
 
 function AppContent() {
   const { isPro, isLoading: subscriptionLoading, presentPaywall, presentCustomerCenter, resetSubscriptionForTesting } = useSubscription();
-  const [view, setView] = useState<"home" | "add" | "meal" | "export" | "personal">("home");
+  const [view, setView] = useState<"home" | "add" | "meal" | "export" | "personal" | "savedFoods">("home");
   const [activeTab, setActiveTab] = useState<TabId>("meals");
   const [selectedNutrient, setSelectedNutrient] = useState<SelectedNutrient | null>(null);
   const [selectedMealId, setSelectedMealId] = useState<string | null>(null);
@@ -1996,6 +2053,7 @@ function AppContent() {
   const [knownFoods, setKnownFoods] = useState<string[]>([]);
   const [foodNutrients, setFoodNutrients] = useState<Record<string, NutrientTotals>>({});
   const [foodOverrides, setFoodOverrides] = useState<Record<string, NutrientTotals>>({});
+  const [foodServingGrams, setFoodServingGrams] = useState<Record<string, number>>({});
   const [mealTemplates, setMealTemplates] = useState<MealTemplate[]>([]);
   const [templateName, setTemplateName] = useState("");
   const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
@@ -2039,6 +2097,27 @@ function AppContent() {
   const [feedbackModalVisible, setFeedbackModalVisible] = useState(false);
   const [feedbackRating, setFeedbackRating] = useState<number>(0);
   const [feedbackText, setFeedbackText] = useState("");
+  const [editingSavedFoodName, setEditingSavedFoodName] = useState<string | null>(null);
+  const [savedFoodEditName, setSavedFoodEditName] = useState("");
+  const [savedFoodEditCalories, setSavedFoodEditCalories] = useState("");
+  const [savedFoodEditServingGrams, setSavedFoodEditServingGrams] = useState("");
+  const [savedFoodDeleteConfirm, setSavedFoodDeleteConfirm] = useState<string | null>(null);
+  const [savedFoodsSearchQuery, setSavedFoodsSearchQuery] = useState("");
+
+  const addScrollRef = useRef<ScrollView>(null);
+
+  useEffect(() => {
+    if (view !== "add") return;
+    const sub = Keyboard.addListener(
+      Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow",
+      () => {
+        setTimeout(() => {
+          addScrollRef.current?.scrollTo({ y: 0, animated: true });
+        }, 50);
+      }
+    );
+    return () => sub.remove();
+  }, [view]);
 
   const todayKey = toDateKey(new Date());
   const yesterdayKey = addDays(todayKey, -1);
@@ -2140,6 +2219,15 @@ function AppContent() {
     async (overrides: Record<string, NutrientTotals>) => {
       try {
         await AsyncStorage.setItem(FOOD_OVERRIDES_KEY, JSON.stringify(overrides));
+      } catch (_) {}
+    },
+    []
+  );
+
+  const persistFoodServingGrams = useCallback(
+    async (servingGrams: Record<string, number>) => {
+      try {
+        await AsyncStorage.setItem(FOOD_SERVING_GRAMS_KEY, JSON.stringify(servingGrams));
       } catch (_) {}
     },
     []
@@ -2429,6 +2517,23 @@ function AppContent() {
         console.warn("Error loading food overrides:", err);
       }
 
+      // Load per-food serving size (grams) for saved foods display
+      try {
+        const servingRaw = await AsyncStorage.getItem(FOOD_SERVING_GRAMS_KEY);
+        if (!cancelled && servingRaw) {
+          const parsed = JSON.parse(servingRaw);
+          if (parsed && typeof parsed === "object") {
+            const out: Record<string, number> = {};
+            for (const [k, v] of Object.entries(parsed)) {
+              if (typeof v === "number" && v > 0) out[k] = v;
+            }
+            setFoodServingGrams(out);
+          }
+        }
+      } catch (err) {
+        console.warn("Error loading food serving grams:", err);
+      }
+
       // Load cached food nutrients (for known-foods reuse)
       try {
         const nutrientsRaw = await AsyncStorage.getItem(FOOD_NUTRIENTS_KEY);
@@ -2498,6 +2603,24 @@ function AppContent() {
       cancelled = true;
     };
   }, []);
+
+  // Migrate: add inferred serving sizes for existing known foods that don't have one
+  useEffect(() => {
+    if (!hydrated || knownFoods.length === 0) return;
+    let needsUpdate = false;
+    const next = { ...foodServingGrams };
+    for (const name of knownFoods) {
+      const key = normalizeFoodNameForKey(name);
+      if (key && !(key in next)) {
+        next[key] = inferDefaultServingGrams(name);
+        needsUpdate = true;
+      }
+    }
+    if (needsUpdate) {
+      setFoodServingGrams(next);
+      persistFoodServingGrams(next);
+    }
+  }, [hydrated, knownFoods]);
 
   // Debug: Log view changes
   useEffect(() => {
@@ -2861,6 +2984,21 @@ function AppContent() {
         const mergedList = Array.from(nameMap.values()).sort((a, b) => a.localeCompare(b));
         setKnownFoods(mergedList);
         await persistKnownFoods(mergedList);
+
+        const nextServing = { ...foodServingGrams };
+        finalItems.forEach((item) => {
+          if (item && item.name) {
+            const canonical = getCanonicalFoodName(item.name);
+            const key = normalizeFoodNameForKey(canonical);
+            if (key && !(key in nextServing)) {
+              nextServing[key] = inferDefaultServingGrams(canonical);
+            }
+          }
+        });
+        if (Object.keys(nextServing).length !== Object.keys(foodServingGrams).length) {
+          setFoodServingGrams(nextServing);
+          await persistFoodServingGrams(nextServing);
+        }
       }
 
       await persistData(next);
@@ -3455,6 +3593,260 @@ function AppContent() {
     );
   }
 
+  if (view === "savedFoods") {
+    const getCaloriesPer100gForSavedFood = (name: string): number | null => {
+      const key = normalizeFoodNameForKey(name);
+      const nutrients = foodOverrides[key] ?? foodNutrients[key] ?? foodNutrients[name];
+      if (nutrients && typeof nutrients.calories_kcal === "number") return nutrients.calories_kcal;
+      return null;
+    };
+
+    const getServingGramsForSavedFood = (name: string): number => {
+      const key = normalizeFoodNameForKey(name);
+      const g = foodServingGrams[key];
+      if (typeof g === "number" && g > 0) return g;
+      return inferDefaultServingGrams(name);
+    };
+
+    const handleSaveSavedFoodEdit = async () => {
+      if (!editingSavedFoodName) return;
+      const newName = savedFoodEditName.trim();
+      const caloriesPerServing = parseFloat(savedFoodEditCalories);
+      const servingGrams = (() => {
+        const n = parseFloat(savedFoodEditServingGrams);
+        return Number.isFinite(n) && n > 0 ? n : 100;
+      })();
+      if (!newName) {
+        setEditingSavedFoodName(null);
+        return;
+      }
+      const keyOld = normalizeFoodNameForKey(editingSavedFoodName);
+      const keyNew = normalizeFoodNameForKey(newName);
+      const existingNutrients = foodOverrides[keyOld] ?? foodNutrients[keyOld] ?? foodNutrients[editingSavedFoodName] ?? emptyTotals();
+      const caloriesPer100g = Number.isFinite(caloriesPerServing) && servingGrams > 0
+        ? (caloriesPerServing * 100) / servingGrams
+        : existingNutrients.calories_kcal;
+      const newNutrients: NutrientTotals = { ...existingNutrients, calories_kcal: caloriesPer100g };
+
+      if (keyOld !== keyNew || editingSavedFoodName !== newName) {
+        const nextKnown = knownFoods.filter((n) => normalizeFoodNameForKey(n) !== keyOld);
+        if (!nextKnown.includes(newName)) nextKnown.push(newName);
+        nextKnown.sort((a, b) => a.localeCompare(b));
+        setKnownFoods(nextKnown);
+        await persistKnownFoods(nextKnown);
+
+        const nextOverrides = { ...foodOverrides };
+        delete nextOverrides[keyOld];
+        nextOverrides[keyNew] = newNutrients;
+        setFoodOverrides(nextOverrides);
+        await persistFoodOverrides(nextOverrides);
+
+        const nextServing = { ...foodServingGrams };
+        delete nextServing[keyOld];
+        nextServing[keyNew] = servingGrams;
+        setFoodServingGrams(nextServing);
+        await persistFoodServingGrams(nextServing);
+      } else {
+        const nextOverrides = { ...foodOverrides, [keyOld]: newNutrients };
+        setFoodOverrides(nextOverrides);
+        await persistFoodOverrides(nextOverrides);
+
+        const nextServing = { ...foodServingGrams, [keyOld]: servingGrams };
+        setFoodServingGrams(nextServing);
+        await persistFoodServingGrams(nextServing);
+      }
+      setEditingSavedFoodName(null);
+    };
+
+    const handleDeleteSavedFood = async (name: string) => {
+      const key = normalizeFoodNameForKey(name);
+      const nextKnown = knownFoods.filter((n) => normalizeFoodNameForKey(n) !== key);
+      setKnownFoods(nextKnown);
+      await persistKnownFoods(nextKnown);
+      const nextOverrides = { ...foodOverrides };
+      delete nextOverrides[key];
+      setFoodOverrides(nextOverrides);
+      await persistFoodOverrides(nextOverrides);
+      const nextServing = { ...foodServingGrams };
+      delete nextServing[key];
+      setFoodServingGrams(nextServing);
+      await persistFoodServingGrams(nextServing);
+      setSavedFoodDeleteConfirm(null);
+    };
+
+    return (
+      <SafeAreaView style={[styles.container, { paddingTop: 8 }]}>
+        <View style={styles.fixedHeader}>
+          <TouchableOpacity
+            style={styles.iconButton}
+            onPress={() => setView("home")}
+          >
+            <Text style={styles.iconText}>‹</Text>
+          </TouchableOpacity>
+          <View style={styles.headerCenter}>
+            <Text style={styles.headerTitle}>Saved foods</Text>
+          </View>
+          <View style={styles.iconButton} />
+        </View>
+        <View style={styles.savedFoodsSearchWrap}>
+          <TextInput
+            style={styles.savedFoodsSearchInput}
+            value={savedFoodsSearchQuery}
+            onChangeText={setSavedFoodsSearchQuery}
+            placeholder="Search saved foods..."
+            placeholderTextColor="#9CA3AF"
+            autoCapitalize="none"
+            autoCorrect={false}
+            clearButtonMode="while-editing"
+          />
+        </View>
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={styles.savedFoodsListContent}
+          showsVerticalScrollIndicator
+          keyboardShouldPersistTaps="handled"
+        >
+          {(() => {
+            const q = savedFoodsSearchQuery.trim().toLowerCase();
+            const filtered = q
+              ? knownFoods.filter((name) => name.toLowerCase().includes(q))
+              : knownFoods;
+            if (knownFoods.length === 0) {
+              return <Text style={styles.savedFoodsEmpty}>No saved foods yet. Add meals and they’ll appear here.</Text>;
+            }
+            if (filtered.length === 0) {
+              return <Text style={styles.savedFoodsEmpty}>No results for "{savedFoodsSearchQuery.trim()}"</Text>;
+            }
+            return filtered.map((name) => {
+              const caloriesPer100g = getCaloriesPer100gForSavedFood(name);
+              const servingGrams = getServingGramsForSavedFood(name);
+              const caloriesForServing =
+                caloriesPer100g !== null
+                  ? Math.round((caloriesPer100g * servingGrams) / 100)
+                  : null;
+              const isDeleting = savedFoodDeleteConfirm === name;
+              return (
+                <View key={name} style={styles.savedFoodsRow}>
+                  <View style={styles.savedFoodsRowTop}>
+                    <View style={styles.savedFoodsRowLeft}>
+                      <Text style={styles.savedFoodsRowName} numberOfLines={1}>{name}</Text>
+                      <Text style={styles.savedFoodsRowCalories}>
+                        {caloriesForServing !== null
+                          ? `${servingGrams}g, ${caloriesForServing} calories`
+                          : `${servingGrams}g, —`}
+                      </Text>
+                    </View>
+                    <View style={styles.savedFoodsRowActions}>
+                    <TouchableOpacity
+                      style={styles.savedFoodsActionButton}
+                      onPress={() => {
+                        setEditingSavedFoodName(name);
+                        setSavedFoodEditName(name);
+                        const per100 = getCaloriesPer100gForSavedFood(name);
+                        const serv = getServingGramsForSavedFood(name);
+                        setSavedFoodEditCalories(
+                          per100 !== null ? String(Math.round((per100 * serv) / 100)) : ""
+                        );
+                        setSavedFoodEditServingGrams(String(serv));
+                      }}
+                    >
+                      <Image
+                        source={require("./assets/Edit_duotone_line.png")}
+                        style={styles.savedFoodsActionIconImage}
+                        resizeMode="contain"
+                      />
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.savedFoodsActionButton}
+                      onPress={() => setSavedFoodDeleteConfirm(isDeleting ? null : name)}
+                    >
+                      <Image
+                        source={require("./assets/Trash_light.png")}
+                        style={styles.savedFoodsActionIconImage}
+                        resizeMode="contain"
+                      />
+                    </TouchableOpacity>
+                  </View>
+                  </View>
+                  {isDeleting && (
+                    <View style={styles.savedFoodsDeleteConfirm}>
+                      <Text style={styles.savedFoodsDeleteConfirmText}>Delete "{name}"?</Text>
+                      <View style={styles.savedFoodsDeleteConfirmActions}>
+                        <TouchableOpacity
+                          style={styles.savedFoodsDeleteConfirmCancel}
+                          onPress={() => setSavedFoodDeleteConfirm(null)}
+                        >
+                          <Text style={styles.savedFoodsDeleteConfirmCancelText}>Cancel</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={styles.savedFoodsDeleteConfirmOk}
+                          onPress={() => handleDeleteSavedFood(name)}
+                        >
+                          <Text style={styles.savedFoodsDeleteConfirmOkText}>Delete</Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  )}
+                </View>
+              );
+            });
+          })()}
+        </ScrollView>
+
+        <Modal
+          visible={editingSavedFoodName !== null}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setEditingSavedFoodName(null)}
+        >
+          <View style={styles.savedFoodsEditModalOverlay}>
+            <View style={styles.savedFoodsEditModal}>
+              <Text style={styles.savedFoodsEditModalTitle}>Edit food</Text>
+              <Text style={styles.savedFoodsEditModalLabel}>Name</Text>
+              <TextInput
+                style={styles.savedFoodsEditModalInput}
+                value={savedFoodEditName}
+                onChangeText={setSavedFoodEditName}
+                placeholder="Food name"
+                autoCapitalize="words"
+              />
+              <Text style={styles.savedFoodsEditModalLabel}>Serving size (g)</Text>
+              <TextInput
+                style={styles.savedFoodsEditModalInput}
+                value={savedFoodEditServingGrams}
+                onChangeText={setSavedFoodEditServingGrams}
+                placeholder="e.g. 100, 20, 1"
+                keyboardType="numeric"
+              />
+              <Text style={styles.savedFoodsEditModalLabel}>Calories (per serving)</Text>
+              <TextInput
+                style={styles.savedFoodsEditModalInput}
+                value={savedFoodEditCalories}
+                onChangeText={setSavedFoodEditCalories}
+                placeholder="e.g. 150"
+                keyboardType="numeric"
+              />
+              <View style={styles.savedFoodsEditModalActions}>
+                <TouchableOpacity
+                  style={styles.savedFoodsEditModalCancel}
+                  onPress={() => setEditingSavedFoodName(null)}
+                >
+                  <Text style={styles.savedFoodsEditModalCancelText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.savedFoodsEditModalSave}
+                  onPress={handleSaveSavedFoodEdit}
+                >
+                  <Text style={styles.savedFoodsEditModalSaveText}>Save</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+      </SafeAreaView>
+    );
+  }
+
   if (view === "add") {
     // Parse current line to extract prefix (quantity/unit) and food name part
     const lines = entryText.split("\n");
@@ -3541,6 +3933,7 @@ function AppContent() {
           </View>
 
           <ScrollView
+            ref={addScrollRef}
             style={styles.addScroll}
             contentContainerStyle={styles.addScrollContent}
             keyboardShouldPersistTaps="handled"
@@ -3574,6 +3967,39 @@ function AppContent() {
                 autoFocus={!isTemplateMode}
                 scrollEnabled={false}
               />
+              {suggestions.length > 0 && (
+                <View style={styles.suggestionsContainer}>
+                  {suggestions.map((name) => {
+                    const lines = entryText.split("\n");
+                    const currentLine = lines[lines.length - 1] || "";
+                    const prefixMatch = currentLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
+                    const prefix = prefixMatch ? prefixMatch[0] : "";
+                    return (
+                      <TouchableOpacity
+                        key={name}
+                        style={styles.suggestionChip}
+                        onPress={() => {
+                          const text = entryText;
+                          const textLines = text.split("\n");
+                          const lastIdx = textLines.length - 1;
+                          const currLine = textLines[lastIdx] ?? "";
+                          const prefixMatch2 = currLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
+                          const prefix2 = prefixMatch2 ? prefixMatch2[0] : "";
+                          const replacedLine = prefix2 + name;
+                          const replacedLines = [
+                            ...textLines.slice(0, lastIdx),
+                            replacedLine
+                          ];
+                          const nextText = replacedLines.join("\n");
+                          setEntryText(nextText);
+                        }}
+                      >
+                        <Text style={styles.suggestionText}>{prefix ? prefix + name : name}</Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              )}
             </View>
 
             {mealTemplates.length > 0 && (
@@ -3605,46 +4031,6 @@ function AppContent() {
                     </View>
                   ))}
                 </View>
-              </View>
-            )}
-
-            {suggestions.length > 0 && (
-              <View style={styles.suggestionsContainer}>
-                {suggestions.map((name) => {
-                  // Extract prefix from current line for display
-                  const lines = entryText.split("\n");
-                  const currentLine = lines[lines.length - 1] || "";
-                  const prefixMatch = currentLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
-                  const prefix = prefixMatch ? prefixMatch[0] : "";
-                  
-                  return (
-                    <TouchableOpacity
-                      key={name}
-                      style={styles.suggestionChip}
-                      onPress={() => {
-                        const text = entryText;
-                        const textLines = text.split("\n");
-                        const lastIdx = textLines.length - 1;
-                        const currLine = textLines[lastIdx] ?? "";
-                        
-                        // Extract prefix (quantity/unit) from current line
-                        const prefixMatch2 = currLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
-                        const prefix2 = prefixMatch2 ? prefixMatch2[0] : "";
-                        
-                        // Replace only the food name part, keeping the prefix
-                        const replacedLine = prefix2 + name;
-                        const replacedLines = [
-                          ...textLines.slice(0, lastIdx),
-                          replacedLine
-                        ];
-                        const nextText = replacedLines.join("\n");
-                        setEntryText(nextText);
-                      }}
-                    >
-                      <Text style={styles.suggestionText}>{prefix ? prefix + name : name}</Text>
-                    </TouchableOpacity>
-                  );
-                })}
               </View>
             )}
 
@@ -3732,6 +4118,12 @@ function AppContent() {
             setKnownFoods(updatedKnownFoods);
             await persistKnownFoods(updatedKnownFoods);
           }
+        }
+
+        if (!(overrideKey in foodServingGrams)) {
+          const nextServing = { ...foodServingGrams, [overrideKey]: inferDefaultServingGrams(updatedItem.name) };
+          setFoodServingGrams(nextServing);
+          await persistFoodServingGrams(nextServing);
         }
 
         setFoodSaveMessage("Changes saved");
@@ -3937,6 +4329,7 @@ function AppContent() {
             <>
               {foodInsights.healthQuotient > 0 && (() => {
                 const { label, color } = getHealthQuotientLevel(foodInsights.healthQuotient);
+                const topQualities = getTopQualities(selectedFoodItem.nutrients);
                 return (
                 <View style={styles.foodDetailHealthSection}>
                   <Text style={styles.foodDetailSectionTitle}>Health Quotient</Text>
@@ -3944,17 +4337,23 @@ function AppContent() {
                     <Text style={[styles.foodDetailHealthQuotientValue, { color }]}>
                       {label}
                     </Text>
-                    <View style={styles.foodDetailHealthQuotientBar}>
-                      <View
-                        style={[
-                          styles.foodDetailHealthQuotientFill,
-                          {
-                            width: `${foodInsights.healthQuotient}%`,
-                            backgroundColor: color
-                          }
-                        ]}
-                      />
-                    </View>
+                    {topQualities.length > 0 && (
+                      <View style={styles.foodDetailHealthQualities}>
+                        {topQualities.map((quality, idx) => (
+                          <View
+                            key={idx}
+                            style={[
+                              styles.foodDetailHealthQualityPill,
+                              { backgroundColor: color }
+                            ]}
+                          >
+                            <Text style={styles.foodDetailHealthQualityPillText}>
+                              {quality}
+                            </Text>
+                          </View>
+                        ))}
+                      </View>
+                    )}
                   </View>
                 </View>
                 );
@@ -4578,6 +4977,15 @@ function AppContent() {
               style={styles.menuItem}
               onPress={() => {
                 closeSidebar();
+                setTimeout(() => setView("savedFoods"), 220);
+              }}
+            >
+              <Text style={styles.menuItemText}>Saved foods</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                closeSidebar();
                 setTimeout(() => setView("personal"), 220);
               }}
             >
@@ -4752,16 +5160,20 @@ function AppContent() {
                     const progress = target > 0 ? Math.min(1, current / target) : 0;
                     return (
                       <View key={item.key} style={styles.nutritionItem}>
-                        <Text style={styles.nutritionLabel}>{item.label}</Text>
+                        <View style={styles.nutritionLabelWrap}>
+                          <Text style={styles.nutritionLabel}>{item.label}</Text>
+                        </View>
                         <CircularProgressRing
                           progress={progress}
                           value={current}
                           size={72}
                           suffix={item.unit}
                         />
-                        <Text style={styles.nutritionTarget}>
-                          / {Math.round(target)}
-                        </Text>
+                        <View style={styles.nutritionTargetWrap}>
+                          <Text style={styles.nutritionTarget}>
+                            / {Math.round(target)}
+                          </Text>
+                        </View>
                       </View>
                     );
                   });
@@ -4899,7 +5311,7 @@ function AppContent() {
                     return (
                       <TouchableOpacity
                         key={key}
-                        style={styles.analysisMacroCard}
+                    style={styles.analysisMacroCard}
                         onPress={() => {
                           setSelectedNutrient({
                             type: "macro",
@@ -4911,15 +5323,31 @@ function AppContent() {
                         }}
                         activeOpacity={0.8}
                       >
-                        <Text style={styles.analysisMacroName}>
-                          {label} ({unit})
-                        </Text>
-                        <View style={styles.analysisMacroRingRow}>
-                          <CircularProgressRing progress={progress} value={current} />
+                        <View style={styles.analysisMacroContent}>
+                          <View style={styles.analysisMacroHeaderRow}>
+                            <Text style={styles.analysisMacroName}>{label} ({unit})</Text>
+                            <View style={styles.analysisMacroHeaderRight}>
+                              <Text style={styles.analysisMacroCurrent}>
+                                {Math.round(current)}
+                              </Text>
+                              <Text style={styles.analysisMacroSlashTarget}>
+                                {" "}
+                                / {Math.round(target)}
+                              </Text>
+                            </View>
+                          </View>
+                          <View style={styles.analysisMacroProgressBar}>
+                            <View
+                              style={[
+                                styles.analysisMacroProgressFill,
+                                { width: `${Math.min(100, progress * 100)}%` }
+                              ]}
+                            />
+                          </View>
                         </View>
-                        <Text style={styles.analysisMacroTarget}>
-                          / {target}
-                        </Text>
+                        <View style={styles.analysisMacroChevronWrap}>
+                          <Text style={styles.analysisMacroChevron}>›</Text>
+                        </View>
                       </TouchableOpacity>
                     );
                   });
@@ -5521,6 +5949,180 @@ const styles = StyleSheet.create({
     color: "#92400E",
     fontWeight: "500"
   },
+  savedFoodsSearchWrap: {
+    paddingHorizontal: 12,
+    paddingTop: 8,
+    paddingBottom: 12
+  },
+  savedFoodsSearchInput: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    fontSize: 16,
+    color: "#111827",
+    borderWidth: 1,
+    borderColor: "#E5E7EB"
+  },
+  savedFoodsListContent: {
+    paddingHorizontal: 12,
+    paddingBottom: 24
+  },
+  savedFoodsEmpty: {
+    color: "#6B7280",
+    fontSize: 15,
+    textAlign: "center",
+    marginTop: 32,
+    paddingHorizontal: 24
+  },
+  savedFoodsRow: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    marginBottom: 10,
+    shadowColor: "#000",
+    shadowOpacity: 0.04,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2
+  },
+  savedFoodsRowTop: {
+    flexDirection: "row",
+    alignItems: "center"
+  },
+  savedFoodsRowLeft: {
+    flex: 1,
+    marginRight: 12,
+    justifyContent: "center"
+  },
+  savedFoodsRowName: {
+    fontSize: 16,
+    fontWeight: "500",
+    color: "#111827",
+    marginBottom: 2
+  },
+  savedFoodsRowCalories: {
+    fontSize: 14,
+    color: "#6B7280",
+    fontWeight: "400"
+  },
+  savedFoodsRowActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 16
+  },
+  savedFoodsActionButton: {
+    padding: 8,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  savedFoodsActionIconImage: {
+    width: 24,
+    height: 24
+  },
+  savedFoodsDeleteConfirm: {
+    marginTop: 8,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#E5E7EB"
+  },
+  savedFoodsDeleteConfirmText: {
+    fontSize: 14,
+    color: "#374151",
+    marginBottom: 10
+  },
+  savedFoodsDeleteConfirmActions: {
+    flexDirection: "row",
+    gap: 12,
+    justifyContent: "flex-end"
+  },
+  savedFoodsDeleteConfirmCancel: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    backgroundColor: "#F3F4F6"
+  },
+  savedFoodsDeleteConfirmCancelText: {
+    fontSize: 14,
+    color: "#374151",
+    fontWeight: "500"
+  },
+  savedFoodsDeleteConfirmOk: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    backgroundColor: "#DC2626"
+  },
+  savedFoodsDeleteConfirmOkText: {
+    fontSize: 14,
+    color: "#FFFFFF",
+    fontWeight: "600"
+  },
+  savedFoodsEditModalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.4)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 24
+  },
+  savedFoodsEditModal: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 16,
+    padding: 24,
+    width: "100%",
+    maxWidth: 360
+  },
+  savedFoodsEditModalTitle: {
+    fontSize: 18,
+    fontWeight: "600",
+    color: "#111827",
+    marginBottom: 20
+  },
+  savedFoodsEditModalLabel: {
+    fontSize: 12,
+    fontWeight: "500",
+    color: "#6B7280",
+    marginBottom: 6
+  },
+  savedFoodsEditModalInput: {
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    borderRadius: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    fontSize: 16,
+    color: "#111827",
+    marginBottom: 16
+  },
+  savedFoodsEditModalActions: {
+    flexDirection: "row",
+    gap: 12,
+    justifyContent: "flex-end",
+    marginTop: 8
+  },
+  savedFoodsEditModalCancel: {
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    backgroundColor: "#F3F4F6"
+  },
+  savedFoodsEditModalCancelText: {
+    fontSize: 15,
+    color: "#374151",
+    fontWeight: "500"
+  },
+  savedFoodsEditModalSave: {
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    backgroundColor: "#2563EB"
+  },
+  savedFoodsEditModalSaveText: {
+    fontSize: 15,
+    color: "#FFFFFF",
+    fontWeight: "600"
+  },
   feedbackModalOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.4)",
@@ -5666,9 +6268,9 @@ const styles = StyleSheet.create({
   },
   nutritionCard: {
     backgroundColor: "#FFFFFF",
-    borderRadius: 14,
+    borderRadius: 18,
     paddingVertical: 28,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     flexDirection: "row",
     justifyContent: "space-between",
     shadowColor: "#000",
@@ -5681,22 +6283,34 @@ const styles = StyleSheet.create({
     alignItems: "center",
     flex: 1
   },
-  nutritionLabel: {
-    color: "#000000",
-    fontSize: 13,
-    fontWeight: "600",
+  nutritionLabelWrap: {
+    width: 72,
+    alignItems: "center",
+    justifyContent: "center",
     marginBottom: 12
+  },
+  nutritionLabel: {
+    color: "#333333",
+    fontSize: 12,
+    fontWeight: "500",
+    textAlign: "center"
   },
   nutritionValue: {
     color: "#111827",
     fontWeight: "700",
     fontSize: 16
   },
-  nutritionTarget: {
-    color: "#888888",
-    fontSize: 13,
-    fontWeight: "400",
+  nutritionTargetWrap: {
+    width: 72,
+    alignItems: "center",
+    justifyContent: "center",
     marginTop: 8
+  },
+  nutritionTarget: {
+    color: "#6B7280",
+    fontSize: 11,
+    fontWeight: "400",
+    textAlign: "center"
   },
   upgradeProButton: {
     alignSelf: "center",
@@ -6012,32 +6626,63 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12
   },
   analysisMacroList: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    justifyContent: "space-between",
-    gap: 12
+    flexDirection: "column",
+    gap: 10
   },
   analysisMacroCard: {
-    width: "48%",
-    minWidth: 0,
-    flexDirection: "column",
+    width: "100%",
+    flexDirection: "row",
     backgroundColor: "#FFFFFF",
     borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 12,
-    minHeight: 200,
+    paddingVertical: 26,
+    paddingHorizontal: 20,
     shadowColor: "#000",
     shadowOpacity: 0.06,
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 3 },
     elevation: 2
   },
+  analysisMacroContent: {
+    flex: 1
+  },
+  analysisMacroHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 6
+  },
   analysisMacroName: {
     fontSize: 14,
     fontWeight: "600",
     color: "#111827",
-    marginBottom: 10,
-    textAlign: "center"
+    flexShrink: 1,
+    marginRight: 8
+  },
+  analysisMacroChevron: {
+    fontSize: 16,
+    color: "#9CA3AF",
+    fontWeight: "500"
+  },
+  analysisMacroHeaderRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    marginRight: 4
+  },
+  analysisMacroChevronWrap: {
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: 14
+  },
+  analysisMacroCurrent: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#111827"
+  },
+  analysisMacroSlashTarget: {
+    fontSize: 14,
+    fontWeight: "400",
+    color: "#9CA3AF"
   },
   analysisMacroRingRow: {
     flexDirection: "row",
@@ -6049,13 +6694,14 @@ const styles = StyleSheet.create({
   },
   analysisMacroProgressBar: {
     height: 8,
-    backgroundColor: "#E5E7EB",
+    backgroundColor: "#E0E0E0",
     borderRadius: 4,
-    overflow: "hidden"
+    overflow: "hidden",
+    marginTop: 8
   },
   analysisMacroProgressFill: {
     height: "100%",
-    backgroundColor: "#2563EB",
+    backgroundColor: "#4263EB",
     borderRadius: 4
   },
   analysisMacroRingCenter: {
@@ -6480,12 +7126,12 @@ const styles = StyleSheet.create({
   macroPill: {
     backgroundColor: "#E5E7EB",
     paddingVertical: 4,
-    paddingHorizontal: 6,
+    paddingHorizontal: 10,
     borderRadius: 999
   },
   macroText: {
     color: "#374151",
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: "600"
   },
   itemCalories: {
@@ -7233,10 +7879,24 @@ const styles = StyleSheet.create({
     elevation: 2
   },
   foodDetailHealthQuotientValue: {
-    fontSize: 16,
+    fontSize: 22,
     fontWeight: "600",
-    color: "#111827",
-    marginBottom: 8
+    marginBottom: 10
+  },
+  foodDetailHealthQualities: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8
+  },
+  foodDetailHealthQualityPill: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 999
+  },
+  foodDetailHealthQualityPillText: {
+    fontSize: 12,
+    fontWeight: "500",
+    color: "#FFFFFF"
   },
   foodDetailHealthQuotientBar: {
     height: 8,

@@ -1,6 +1,16 @@
 import OpenAI from "openai";
 import { NutrientTotals } from "../utils/types";
 
+export type UserContext = {
+  goal?: string | null;
+  age?: number | null;
+  weightKg?: number | null;
+  heightCm?: number | null;
+  genderAtBirth?: "male" | "female" | null;
+  activityLevel?: string | null;
+  bmi?: number | null;
+};
+
 export type FoodInsightsRequest = {
   foodName: string;
   nutrients: NutrientTotals;
@@ -8,7 +18,8 @@ export type FoodInsightsRequest = {
   unit: string;
   grams: number;
   mealType?: string; // e.g., "breakfast", "lunch", "dinner", "snack"
-  userGoal?: string; // e.g., "reduce_cholesterol_maintain_weight"
+  userGoal?: string; // deprecated: use userContext.goal
+  userContext?: UserContext; // User profile: goal, age, weight, height, gender, activity, BMI
   otherFoodsToday?: Array<{ name: string; mealType?: string }>; // Other foods logged today
   sameMealFoods?: string[]; // Foods from the same meal (for pairing checks)
 };
@@ -30,7 +41,7 @@ const schema = {
   properties: {
     insights: {
       type: "string",
-      description: "A brief 2-3 sentence insight about this food item, its nutritional benefits, and how it fits into a healthy diet"
+      description: "A brief 2-3 sentence insight about this food item, its nutritional benefits, and how it fits into a healthy diet. If the user's food description mentions healthy prep (air fried, baked, healthy oils), compliment those choices."
     },
     tips: {
       type: "array",
@@ -55,12 +66,14 @@ const calculateHealthQuotient = (nutrients: NutrientTotals, foodName: string): n
   const name = foodName.toLowerCase();
 
   // Check for highly processed foods
-  const processedKeywords = ["processed", "packaged", "fast food", "fried", "candy", "soda", "sugar"];
+  // "air fried" is healthy; only penalize deep-fried (exclude "air fried" from fried penalty)
+  const processedKeywords = ["processed", "packaged", "fast food", "candy", "soda", "sugar"];
   const isProcessed = processedKeywords.some(keyword => name.includes(keyword));
   if (isProcessed) score -= 20;
+  if (name.includes("fried") && !name.includes("air fried")) score -= 15;
 
-  // Check for whole foods
-  const wholeFoodKeywords = ["fresh", "organic", "whole", "raw", "steamed", "grilled", "baked"];
+  // Check for whole foods and healthy preparation
+  const wholeFoodKeywords = ["fresh", "organic", "whole", "raw", "steamed", "grilled", "baked", "air fried", "avocado oil", "olive oil", "coconut oil"];
   const isWholeFood = wholeFoodKeywords.some(keyword => name.includes(keyword));
   if (isWholeFood) score += 15;
 
@@ -69,8 +82,8 @@ const calculateHealthQuotient = (nutrients: NutrientTotals, foodName: string): n
   const proteinPerCal = (nutrients.protein_g || 0) / calories * 100;
   const fiberPerCal = (nutrients.fiber_g || 0) / calories * 100;
   
-  if (proteinPerCal > 0.5) score += 10;
-  if (fiberPerCal > 0.3) score += 10;
+  if (proteinPerCal > 0.5 && nutrients.protein_g > 0) score += 10;
+  if (fiberPerCal > 0.3 && nutrients.fiber_g > 0) score += 10;
   
   // Micronutrient richness
   const hasVitamins = (nutrients.vitamin_c_mg || 0) > 0 || 
@@ -107,6 +120,27 @@ export const getFoodInsights = async (
 
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+  // Build user context string from profile (or fallback if not provided)
+  const ctx = request.userContext;
+  const goalFromCtx = ctx?.goal ?? request.userGoal;
+  const userContextLines: string[] = [];
+  if (goalFromCtx) {
+    const goalLabel = goalFromCtx.replace(/_/g, " ");
+    userContextLines.push(`User's goal: ${goalLabel}`);
+  }
+  if (ctx?.age != null) userContextLines.push(`${ctx.age} years old`);
+  if (ctx?.weightKg != null) userContextLines.push(`${ctx.weightKg}kg`);
+  if (ctx?.heightCm != null) userContextLines.push(`${ctx.heightCm}cm height`);
+  if (ctx?.genderAtBirth) userContextLines.push(ctx.genderAtBirth === "male" ? "Male" : "Female");
+  if (ctx?.activityLevel) userContextLines.push(`Activity level: ${ctx.activityLevel}`);
+  if (ctx?.bmi != null) {
+    const bmiCategory = ctx.bmi < 18.5 ? "underweight" : ctx.bmi < 25 ? "healthy" : ctx.bmi < 30 ? "overweight" : "obese";
+    userContextLines.push(`BMI: ${ctx.bmi.toFixed(1)} (${bmiCategory})`);
+  }
+  const userContextStr = userContextLines.length > 0
+    ? userContextLines.join(", ")
+    : "User profile not provided";
+
   const system = [
     "You are a nutrition expert providing personalized food insights.",
     "Analyze the food item and provide:",
@@ -115,7 +149,8 @@ export const getFoodInsights = async (
     "3. A health quotient score (0-100) based on nutritional density, processing level, and overall healthfulness",
     "",
     "IMPORTANT CONTEXT TO CONSIDER:",
-    "- User's goal: reduce cholesterol and maintain weight (Male, 44 years, 73kg)",
+    `- User profile: ${userContextStr}`,
+    "- Food description: The user's exact food entry (e.g. 'Air fried fries with Avocado oil') often contains cooking method, oils, and preparation. PARSE this carefully and COMPLIMENT healthy choices: air frying (vs deep frying), healthy oils (avocado, olive, coconut), baking/steaming/grilling, organic, fresh, etc.",
     "- Meal timing: Consider when the food is being consumed (breakfast vs dinner matters)",
     "- Other foods logged today: A list of ALL other foods the user has logged today (check this list carefully!)",
     "- Same meal foods: Foods from the SAME meal as the current food (especially important for pairing suggestions)",
@@ -127,6 +162,7 @@ export const getFoodInsights = async (
     "4. If the food is already logged, DO NOT suggest adding it - instead COMPLIMENT the user for the good pairing",
     "",
     "Tips should be specific and contextual:",
+    "- FOOD DESCRIPTION: If the user's entry mentions healthy prep (air fried, baked, steamed, grilled), healthy oils (avocado, olive, coconut), or quality (organic, fresh), COMPLIMENT them in insights or tips. E.g. 'Air fried fries with Avocado oil' → compliment air frying (less oil than deep frying) and avocado oil (heart-healthy monounsaturated fat).",
     "- If the food is typically paired with something (e.g., oats with berries/chia), FIRST check if user already had those in the same meal or today. If yes, compliment them!",
     "- For coffee/caffeine: Consider meal timing - 'Try not to drink after 2 pm' is more relevant for breakfast coffee than dinner",
     "- For cholesterol reduction goal: Suggest foods that help lower cholesterol, mention if current food supports this goal",
@@ -134,6 +170,8 @@ export const getFoodInsights = async (
     "- Consider meal context: Breakfast foods vs dinner foods have different timing considerations",
     "",
     "Examples of contextual tips:",
+    "- 'Great choice air frying and using avocado oil—both reduce added fat compared to deep frying and support heart health!' (when food description says 'air fried' and 'avocado oil')",
+    "- 'Baking/steaming instead of frying is a smart way to cut calories while keeping flavor.' (when description mentions baked, steamed, etc.)",
     "- 'Great choice pairing oats with berries and chia seeds - this combination provides fiber and omega-3s that support heart health!' (if berries/chia are in sameMealFoods or otherFoodsToday)",
     "- 'Oats pair well with berries and chia seeds for added fiber and omega-3s' (ONLY if berries/chia are NOT in sameMealFoods or otherFoodsToday)",
     "- 'Since this is breakfast, try not to have coffee after 2 pm if you plan to have more later'",
@@ -166,8 +204,8 @@ export const getFoodInsights = async (
   if (request.mealType) {
     contextParts.push(`Meal: ${request.mealType}`);
   }
-  if (request.userGoal) {
-    contextParts.push(`User's goal: ${request.userGoal}`);
+  if (goalFromCtx) {
+    contextParts.push(`User's goal: ${goalFromCtx.replace(/_/g, " ")}`);
   }
   if (request.sameMealFoods && request.sameMealFoods.length > 0) {
     contextParts.push(`Foods in the SAME meal: ${request.sameMealFoods.join(", ")}`);
@@ -177,12 +215,13 @@ export const getFoodInsights = async (
     contextParts.push(`Other foods logged today (from other meals): ${foodsList}`);
   }
 
-  const userMessage = `Food: ${request.foodName}
+  const userMessage = `Food (user's exact entry): ${request.foodName}
 Quantity: ${request.quantity} ${request.unit} (${Math.round(request.grams)}g)
 Nutrition per serving: ${nutrientsSummary}
 ${contextParts.length > 0 ? `\nContext:\n${contextParts.join("\n")}` : ""}
 
 CRITICAL INSTRUCTIONS:
+- PARSE the food description for cooking method, oils, and prep (air fried, baked, avocado oil, olive oil, etc.). If present, COMPLIMENT these healthy choices in your insights or tips.
 - Before suggesting pairing this food with something (e.g., berries, chia seeds), CHECK the "Foods in the SAME meal" and "Other foods logged today" lists
 - If a suggested pairing food is already in those lists, DO NOT suggest adding it - instead COMPLIMENT the user for already pairing it well
 - Use fuzzy matching for food names (e.g., "berries", "berry", "blueberries" all match)
