@@ -879,23 +879,53 @@ function parseToParsedFoods(text: string): ParsedFood[] {
       continue;
     }
 
-    // Generic "<num> <food>" or "<food> <num>"
-    const numMatch = lower.match(
-      /^(\d+(?:\.\d+)?)\s+(.+)$|^(.+?)\s+(\d+(?:\.\d+)?)\s*$/
+    // Check for patterns with unit words: "<num> <unit> <food>" or "<food> <num> <unit>"
+    // Units: packet, packets, pc, pcs, piece, pieces
+    const unitWords = ["packet", "packets", "pc", "pcs", "piece", "pieces"];
+    let numUnitMatch = null;
+    let hasUnit = false;
+    let num = NaN;
+    let foodPart = "";
+    
+    // Try "<num> <unit> <food>" first
+    const numUnitFoodMatch = lower.match(
+      /^(\d+(?:\.\d+)?)\s+(packet|packets|pc|pcs|piece|pieces)\s+(.+)$/
     );
-    if (numMatch) {
-      const num = parseFloat(numMatch[1] || numMatch[4]);
-      const foodPart = (numMatch[2] || numMatch[3] || "").trim();
-      if (!foodPart) continue;
+    if (numUnitFoodMatch) {
+      num = parseFloat(numUnitFoodMatch[1]);
+      hasUnit = unitWords.includes(numUnitFoodMatch[2]);
+      foodPart = numUnitFoodMatch[3].trim();
+    } else {
+      // Try "<food> <num> <unit>"
+      const foodNumUnitMatch = lower.match(
+        /^(.+?)\s+(\d+(?:\.\d+)?)\s+(packet|packets|pc|pcs|piece|pieces)\s*$/
+      );
+      if (foodNumUnitMatch) {
+        num = parseFloat(foodNumUnitMatch[2]);
+        hasUnit = unitWords.includes(foodNumUnitMatch[3]);
+        foodPart = foodNumUnitMatch[1].trim();
+      } else {
+        // Try "<num> <food>" or "<food> <num>" (no unit)
+        const numMatch = lower.match(
+          /^(\d+(?:\.\d+)?)\s+(.+)$|^(.+?)\s+(\d+(?:\.\d+)?)\s*$/
+        );
+        if (numMatch) {
+          num = parseFloat(numMatch[1] || numMatch[4]);
+          foodPart = (numMatch[2] || numMatch[3] || "").trim();
+        }
+      }
+    }
+    
+    if (!Number.isNaN(num) && foodPart) {
       const name = capitalizeFirst(foodPart);
       results.push({
         name,
         originalText: chunk,
         quantity: Number.isFinite(num) ? num : undefined,
-        unit: undefined,
+        unit: hasUnit ? "piece" : undefined,
         approx: !Number.isFinite(num),
         role: detectFoodRole(name),
-        confidence: 0.8,
+        confidence: hasUnit ? 0.85 : 0.8,
       });
       continue;
     }
@@ -957,8 +987,11 @@ function enrichParsedFoods(parsedFoods: ParsedFood[]): MealItem[] {
         const key = Object.keys(DEFAULT_GRAMS_PER_PIECE).find(
           (k) => k !== "*" && lowerName.includes(k)
         );
-        const perPiece =
-          (key && DEFAULT_GRAMS_PER_PIECE[key]) || DEFAULT_GRAMS_PER_PIECE["*"];
+        let perPiece = key && DEFAULT_GRAMS_PER_PIECE[key];
+        // If no specific per-piece weight found, use inferDefaultServingGrams for better estimation
+        if (!perPiece) {
+          perPiece = inferDefaultServingGrams(f.name);
+        }
         grams = perPiece * pieces;
         quantity = pieces;
         unit = "piece";
@@ -968,9 +1001,9 @@ function enrichParsedFoods(parsedFoods: ParsedFood[]): MealItem[] {
         grams = quantity;
         approx = approx || false;
       } else {
-        // Fallback main: assume one 100g serving
-        grams = 100;
-        quantity = 100;
+        // Fallback main: use inferDefaultServingGrams for better estimation
+        grams = inferDefaultServingGrams(f.name);
+        quantity = grams;
         unit = "g";
         approx = true;
       }
