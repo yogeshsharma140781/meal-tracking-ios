@@ -642,28 +642,36 @@ const UNIT_TO_GRAMS: Record<string, number> = {
 /**
  * Calculate similarity score between two strings (0-1, higher = more similar).
  * Uses a simple approach: checks word overlap and string containment.
+ * Requires the first word of the input to appear in the candidate so that
+ * e.g. "maggie masala" does not match "Masala dosa" (only "masala" in common).
  */
 function calculateSimilarity(input: string, candidate: string): number {
-  const inputWords = input.toLowerCase().split(/\s+/);
-  const candidateWords = candidate.toLowerCase().split(/\s+/);
-  
+  const inputWords = input.toLowerCase().split(/\s+/).filter(Boolean);
+  const candidateWords = candidate.toLowerCase().split(/\s+/).filter(Boolean);
+  const candidateLower = candidate.toLowerCase();
+
   // Exact match gets highest score
-  if (input.toLowerCase() === candidate.toLowerCase()) return 1.0;
-  
+  if (input.toLowerCase() === candidateLower) return 1.0;
+
+  // Require first word of input to appear in candidate to avoid wrong matches
+  // (e.g. "maggie masala" must not match "Masala dosa")
+  if (inputWords.length > 0 && !candidateLower.includes(inputWords[0])) return 0;
+
   // Check if input is contained in candidate or vice versa
-  if (candidate.toLowerCase().includes(input.toLowerCase())) return 0.9;
-  if (input.toLowerCase().includes(candidate.toLowerCase())) return 0.85;
-  
+  if (candidateLower.includes(input.toLowerCase())) return 0.9;
+  if (input.toLowerCase().includes(candidateLower)) return 0.85;
+
   // Calculate word overlap
   const inputSet = new Set(inputWords);
   const candidateSet = new Set(candidateWords);
   let matchingWords = 0;
-  inputSet.forEach(word => {
+  inputSet.forEach((word) => {
     if (candidateSet.has(word)) matchingWords++;
   });
-  
+
   // Score based on proportion of matching words
-  const overlapRatio = matchingWords / Math.max(inputWords.length, candidateWords.length);
+  const overlapRatio =
+    matchingWords / Math.max(inputWords.length, candidateWords.length);
   return overlapRatio * 0.8; // Cap at 0.8 for word-based matching
 }
 
