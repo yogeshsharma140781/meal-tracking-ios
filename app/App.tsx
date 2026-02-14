@@ -640,72 +640,6 @@ const UNIT_TO_GRAMS: Record<string, number> = {
 };
 
 /**
- * Calculate similarity score between two strings (0-1, higher = more similar).
- * Uses a simple approach: checks word overlap and string containment.
- * Requires the first word of the input to appear in the candidate so that
- * e.g. "maggie masala" does not match "Masala dosa" (only "masala" in common).
- */
-function calculateSimilarity(input: string, candidate: string): number {
-  const inputWords = input.toLowerCase().split(/\s+/).filter(Boolean);
-  const candidateWords = candidate.toLowerCase().split(/\s+/).filter(Boolean);
-  const candidateLower = candidate.toLowerCase();
-
-  // Exact match gets highest score
-  if (input.toLowerCase() === candidateLower) return 1.0;
-
-  // Require first word of input to appear in candidate to avoid wrong matches
-  // (e.g. "maggie masala" must not match "Masala dosa")
-  if (inputWords.length > 0 && !candidateLower.includes(inputWords[0])) return 0;
-
-  // Check if input is contained in candidate or vice versa
-  if (candidateLower.includes(input.toLowerCase())) return 0.9;
-  if (input.toLowerCase().includes(candidateLower)) return 0.85;
-
-  // Calculate word overlap
-  const inputSet = new Set(inputWords);
-  const candidateSet = new Set(candidateWords);
-  let matchingWords = 0;
-  inputSet.forEach((word) => {
-    if (candidateSet.has(word)) matchingWords++;
-  });
-
-  // Score based on proportion of matching words
-  const overlapRatio =
-    matchingWords / Math.max(inputWords.length, candidateWords.length);
-  return overlapRatio * 0.8; // Cap at 0.8 for word-based matching
-}
-
-/**
- * Find best fuzzy match for a food name in known foods.
- * Returns the canonical name if similarity > threshold, otherwise null.
- */
-function findFuzzyMatch(
-  foodName: string,
-  nameToCanonical: Map<string, string>,
-  threshold: number = 0.7
-): string | null {
-  let bestMatch: string | null = null;
-  let bestScore = threshold;
-  
-  // First try exact normalized match
-  const normalizedInput = normalizeFoodNameForDedup(foodName);
-  if (normalizedInput && nameToCanonical.has(normalizedInput)) {
-    return nameToCanonical.get(normalizedInput) || null;
-  }
-  
-  // Fuzzy search through all candidates
-  for (const [normalizedKey, canonical] of nameToCanonical.entries()) {
-    const score = calculateSimilarity(foodName, canonical);
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatch = canonical;
-    }
-  }
-  
-  return bestMatch;
-}
-
-/**
  * Try to resolve food text from known foods + nutrients cache.
  * Returns MealItem[] if all lines can be resolved, null otherwise.
  */
@@ -1129,18 +1063,12 @@ function parseFoodLine(
     }
   }
 
-  // Try exact match first
-  let normalizedKey = normalizeFoodNameForDedup(foodPart);
-  let canonical = normalizedKey ? nameToCanonical.get(normalizedKey) : null;
-  
-  // If no exact match, try fuzzy matching
-  if (!canonical) {
-    canonical = findFuzzyMatch(foodPart, nameToCanonical, 0.7);
-    if (canonical) {
-      normalizedKey = normalizeFoodNameForDedup(canonical);
-    }
-  }
-  
+  // Only exact (normalized) match: use a saved food only when it matches exactly.
+  // If the user chose a recommendation from the suggestions list, the line will
+  // already contain the exact saved food name, so this will match.
+  const normalizedKey = normalizeFoodNameForDedup(foodPart);
+  const canonical = normalizedKey ? nameToCanonical.get(normalizedKey) : null;
+
   if (!canonical || !normalizedKey) return null;
   const nutrientsPer100g = foodNutrients[normalizedKey];
   if (!nutrientsPer100g) return null;
@@ -5617,7 +5545,7 @@ function AppContent() {
 
                 <View style={styles.insightsPaywallLogoRow}>
                   <Image
-                    source={require("./assets/Logo.png")}
+                    source={require("./assets/icon.png")}
                     style={styles.insightsPaywallLogoImage}
                     resizeMode="contain"
                   />
