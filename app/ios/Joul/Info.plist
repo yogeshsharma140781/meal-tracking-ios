@@ -44,6 +44,12 @@
       <key>NSAllowsLocalNetworking</key>
       <true/>
     </dict>
+    <key>NSFaceIDUsageDescription</key>
+    <string>Allow $(PRODUCT_NAME) to access your Face ID biometric data.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Allow Joul to access your camera so it can analyze meal photos.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>Allow Joul to access your photo library so you can choose meal photos for AI analysis.</string>
     <key>RCTNewArchEnabled</key>
     <true/>
     <key>UILaunchStoryboardName</key>

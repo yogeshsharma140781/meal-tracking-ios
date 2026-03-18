@@ -14,7 +14,23 @@
       "icon": "./assets/icon.png"
     },
     "plugins": [
-      "@react-native-community/datetimepicker"
+      "./app.plugin.js",
+      "@react-native-community/datetimepicker",
+      ["expo-notifications", { "sounds": [] }],
+      "expo-secure-store",
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "Allow Joul to access your camera so it can analyze meal photos.",
+          "photosPermission": "Allow Joul to access your photo library so you can choose meal photos for AI analysis."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Joul to access your camera so it can analyze meal photos."
+        }
+      ]
     ]
   }
 }

@@ -16,24 +16,44 @@ import {
   Image,
   Animated,
   Dimensions,
-  Easing
+  Easing,
+  AppState,
+  Switch,
+  ActivityIndicator,
+  Alert
 } from "react-native";
+import { WebView } from "react-native-webview";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import Svg, { Circle } from "react-native-svg";
+import DateTimePicker from "@react-native-community/datetimepicker";
+import Svg, { Circle, Path } from "react-native-svg";
+import * as Notifications from "expo-notifications";
+import { CameraView, useCameraPermissions } from "expo-camera";
+import * as ImagePicker from "expo-image-picker";
 import { SubscriptionProvider, useSubscription } from "./SubscriptionContext";
+import { setSecureJSON, getSecureJSON, SECURE_KEYS } from "./secureStorage";
+import {
+  DEFAULT_MEAL_REMINDER,
+  updateMealReminderSchedule,
+  requestMealReminderPermission,
+  initializeNotificationHandler,
+  MEAL_REMINDER_ID,
+  type MealReminderSettings
+} from "./mealReminderNotifications";
 
-// Tab icon using PNG assets (pass -active or -inactive based on state)
+// Tab icon rendered from local image asset with tint support.
 function TabIcon({
   source,
   size = 24,
+  tintColor,
 }: {
   source: number;
   size?: number;
+  tintColor?: string;
 }) {
   return (
     <Image
       source={source}
-      style={{ width: size, height: size }}
+      style={{ width: size, height: size, tintColor }}
       resizeMode="contain"
     />
   );
@@ -53,41 +73,60 @@ function CircularProgressRing({
   size?: number;
   suffix?: string;
 }) {
+  const polarToCartesian = (cx: number, cy: number, r: number, angleDeg: number) => {
+    const rad = (angleDeg * Math.PI) / 180;
+    return {
+      x: cx + r * Math.cos(rad),
+      y: cy + r * Math.sin(rad),
+    };
+  };
+
+  const describeArc = (
+    cx: number,
+    cy: number,
+    r: number,
+    startAngleDeg: number,
+    endAngleDeg: number
+  ) => {
+    const start = polarToCartesian(cx, cy, r, startAngleDeg);
+    const end = polarToCartesian(cx, cy, r, endAngleDeg);
+    const sweep = endAngleDeg - startAngleDeg;
+    const largeArcFlag = sweep > 180 ? 1 : 0;
+    return `M ${start.x} ${start.y} A ${r} ${r} 0 ${largeArcFlag} 1 ${end.x} ${end.y}`;
+  };
+
   const stroke = Math.max(6, (RING_STROKE / RING_SIZE) * size);
   const radius = (size - stroke) / 2;
-  const circumference = 2 * Math.PI * radius;
-  const arcLength = circumference * (270 / 360);
-  const gapLength = circumference * (90 / 360);
-  const offset = circumference * (135 / 360);
+  const center = size / 2;
+  const startAngle = 135;
+  const totalAngle = 270;
+  const trackEndAngle = startAngle + totalAngle;
 
   const safeProgress = Math.min(1, Math.max(0, Number.isFinite(progress) ? progress : 0));
   const displayValue = Math.round(Number.isFinite(value) ? value : 0);
   const displayText = `${displayValue}${suffix}`;
+  const progressEndAngle = startAngle + totalAngle * safeProgress;
+  const trackPath = describeArc(center, center, radius, startAngle, trackEndAngle);
+  const progressPath =
+    safeProgress > 0 ? describeArc(center, center, radius, startAngle, progressEndAngle) : "";
 
   return (
     <View style={{ width: size, height: size, position: "relative" }} pointerEvents="none">
       <Svg width={size} height={size} style={{ position: "absolute" }}>
-        <Circle
-          cx={size / 2}
-          cy={size / 2}
-          r={radius}
+        <Path
+          d={trackPath}
           stroke="#E0E0E0"
           strokeWidth={stroke}
           fill="none"
-          strokeDasharray={`${arcLength} ${gapLength}`}
-          strokeDashoffset={-offset}
+          strokeLinecap="round"
         />
         {safeProgress > 0.001 && (
-          <Circle
-            cx={size / 2}
-            cy={size / 2}
-            r={radius}
+          <Path
+            d={progressPath}
             stroke="#4263EB"
             strokeWidth={stroke}
             fill="none"
             strokeLinecap="round"
-            strokeDasharray={`${safeProgress * arcLength} ${circumference}`}
-            strokeDashoffset={-offset}
           />
         )}
       </Svg>
@@ -249,10 +288,10 @@ const CollapsibleField: React.FC<CollapsibleFieldProps> = ({
   );
 };
 
-const DELETE_REVEAL_WIDTH = 100;
 const SWIPE_SENSITIVITY = 1.3; // Slower, smoother tracking
+const DELETE_THRESHOLD = 120; // Swipe threshold in pixels to trigger delete
 
-/** Swipeable item card: tap opens detail, swipe left reveals red delete. */
+/** Swipeable item card: tap opens detail, swipe left to delete. */
 const SwipeableItemCard: React.FC<{
   item: { id: string; name: string; quantity: number; unit: string; grams: number; nutrients: { calories_kcal: number; protein_g: number; carbs_g: number; fat_g: number } };
   onOpenDetail: () => void;
@@ -262,6 +301,9 @@ const SwipeableItemCard: React.FC<{
 }> = ({ item, onOpenDetail, onDelete, cardStyle, cardContent }) => {
   const translateX = useRef(new Animated.Value(0)).current;
   const lastOffset = useRef(0);
+  const cardWidthRef = useRef(0);
+  const screenWidth = Dimensions.get("window").width;
+  
   const panResponder = useMemo(
     () =>
       PanResponder.create({
@@ -271,51 +313,77 @@ const SwipeableItemCard: React.FC<{
         onPanResponderMove: (_, g) => {
           const { dx } = g;
           const amplified = lastOffset.current + dx * SWIPE_SENSITIVITY;
-          const newVal = Math.max(-DELETE_REVEAL_WIDTH, Math.min(0, amplified));
+          // Allow swiping up to full screen width
+          const newVal = Math.max(-screenWidth, Math.min(0, amplified));
           translateX.setValue(newVal);
         },
         onPanResponderRelease: (_, g) => {
           const { dx, vx } = g;
           const current = lastOffset.current + dx * SWIPE_SENSITIVITY;
-          const shouldReveal = dx < -10 || vx < -0.2 || current < -DELETE_REVEAL_WIDTH * 0.4;
-          const target = shouldReveal ? -DELETE_REVEAL_WIDTH : 0;
-          lastOffset.current = target;
-          Animated.timing(translateX, {
-            toValue: target,
-            duration: 320,
-            easing: Easing.out(Easing.cubic),
-            useNativeDriver: true,
-          }).start();
+          
+          // Check if user swiped far enough to auto-delete (single longer swipe)
+          const shouldDelete = current < -DELETE_THRESHOLD || (dx < -DELETE_THRESHOLD && vx < -0.3);
+          
+          if (shouldDelete) {
+            // Animate off screen and then delete
+            Animated.timing(translateX, {
+              toValue: -screenWidth,
+              duration: 250,
+              easing: Easing.out(Easing.cubic),
+              useNativeDriver: true,
+            }).start(() => {
+              onDelete();
+            });
+          } else {
+            // Snap back if not swiped far enough
+            lastOffset.current = 0;
+            Animated.timing(translateX, {
+              toValue: 0,
+              duration: 320,
+              easing: Easing.out(Easing.cubic),
+              useNativeDriver: true,
+            }).start();
+          }
         },
       }),
-    [translateX]
+    [translateX, onDelete, screenWidth]
   );
+  
   return (
-    <View style={{ marginBottom: 14, overflow: "hidden" }} {...panResponder.panHandlers}>
+    <View 
+      style={{ marginBottom: 14, overflow: "hidden" }} 
+      {...panResponder.panHandlers}
+      onLayout={(event) => {
+        cardWidthRef.current = event.nativeEvent.layout.width;
+      }}
+    >
       <View
         style={{
           position: "absolute",
-          right: 2,
+          left: 0,
+          right: 0,
           top: 0,
           bottom: 0,
-          width: DELETE_REVEAL_WIDTH,
           backgroundColor: "#DC2626",
+          borderTopLeftRadius: 16,
+          borderBottomLeftRadius: 16,
           borderTopRightRadius: 16,
           borderBottomRightRadius: 16,
           justifyContent: "center",
-          alignItems: "center",
+          alignItems: "flex-end",
+          paddingRight: 16,
           zIndex: 0,
         }}
       >
         <TouchableOpacity
           onPress={onDelete}
-          style={{ flex: 1, justifyContent: "center", alignItems: "center", width: "100%" }}
+          style={{ justifyContent: "center", alignItems: "center" }}
         >
           <Image
-          source={require("./assets/trash-icon.png")}
-          style={{ width: 28, height: 28 }}
-          resizeMode="contain"
-        />
+            source={require("./assets/trash-icon.png")}
+            style={{ width: 28, height: 28 }}
+            resizeMode="contain"
+          />
         </TouchableOpacity>
       </View>
       <Animated.View style={[{ zIndex: 1 }, { transform: [{ translateX }] }]}>
@@ -400,12 +468,18 @@ type ParsedFood = {
 
 type UserProfile = {
   dateOfBirth: string | null; // YYYY-MM-DD format
-  genderAtBirth: "male" | "female" | null;
+  genderAtBirth: "male" | "female" | "other" | null;
   heightCm: number | null;
   heightUnit: "cm" | "in";
   weightKg: number | null;
   goal: string | null;
   activityLevel: "low" | "medium" | "high" | null;
+  customTargets?: {
+    calories_kcal: number;
+    protein_g: number;
+    carbs_g: number;
+    fat_g: number;
+  } | null;
 };
 
 type MealResponse = {
@@ -505,13 +579,14 @@ const getTopQualities = (nutrients: NutrientTotals): string[] => {
   const calories = nutrients.calories_kcal || 1;
   const proteinPerCal = (nutrients.protein_g || 0) / calories * 100;
   const fiberPerCal = (nutrients.fiber_g || 0) / calories * 100;
-  const carbsRatio = (nutrients.carbs_g || 0) / calories;
-  const fatRatio = (nutrients.fat_g || 0) / calories;
-  
+  // Fraction of calories from carbs (4 kcal/g) and fat (9 kcal/g) — not grams/calories
+  const carbsCalorieFraction = ((nutrients.carbs_g || 0) * 4) / calories;
+  const fatCalorieFraction = ((nutrients.fat_g || 0) * 9) / calories;
+
   if (proteinPerCal > 0.5 && nutrients.protein_g > 0) qualities.push("High Protein");
   if (fiberPerCal > 0.3 && nutrients.fiber_g > 0) qualities.push("High Fiber");
-  if (carbsRatio < 0.4 && nutrients.carbs_g > 0) qualities.push("Low carbs");
-  if (fatRatio < 0.2 && nutrients.fat_g > 0) qualities.push("Low Fat");
+  if (carbsCalorieFraction < 0.4 && nutrients.carbs_g > 0) qualities.push("Low carbs");
+  if (fatCalorieFraction < 0.2 && nutrients.fat_g > 0) qualities.push("Low Fat");
   if ((nutrients.vitamin_c_mg || 0) > 10 || (nutrients.vitamin_a_mcg || 0) > 100) qualities.push("Rich in Vitamins");
   if ((nutrients.potassium_mg || 0) > 200 || (nutrients.magnesium_mg || 0) > 30) qualities.push("Rich in Minerals");
   
@@ -630,6 +705,7 @@ const inferDefaultServingGrams = (name: string): number => {
 /** Unit to grams for volume measures (approximate) */
 const UNIT_TO_GRAMS: Record<string, number> = {
   cup: 240, cups: 240,
+  bowl: 220, bowls: 220,
   tbsp: 15, tablespoon: 15, tablespoons: 15,
   tsp: 5, teaspoon: 5, teaspoons: 5,
   ml: 1, mls: 1, milliliter: 1, milliliters: 1,
@@ -638,6 +714,16 @@ const UNIT_TO_GRAMS: Record<string, number> = {
   piece: 50, pieces: 50, serving: 100, servings: 100,
   slice: 30, slices: 30
 };
+
+/** Convert quantity + unit to grams for a given food (for default per-piece/portion). */
+function quantityUnitToGrams(quantity: number, unit: string, foodName: string): number {
+  const u = (unit || "g").toLowerCase().replace(/\s+/g, "");
+  if (u === "g" || u === "gram" || u === "grams") return quantity;
+  if (u === "ml" || u === "mls" || u === "milliliter" || u === "milliliters") return quantity;
+  const perUnit = UNIT_TO_GRAMS[u];
+  if (perUnit != null) return quantity * perUnit;
+  return quantity * inferDefaultServingGrams(foodName);
+}
 
 /**
  * Try to resolve food text from known foods + nutrients cache.
@@ -740,6 +826,30 @@ function isBreadLike(name: string): boolean {
   return BREAD_LIKE_KEYWORDS.some((k) => lower.includes(k));
 }
 
+function normalizeParsedUnit(raw: string): string {
+  const u = raw.trim().toLowerCase();
+  const map: Record<string, string> = {
+    pc: "piece",
+    pcs: "piece",
+    pieces: "piece",
+    grams: "g",
+    gram: "g",
+    gms: "g",
+    milliliter: "ml",
+    milliliters: "ml",
+    mls: "ml",
+    cups: "cup",
+    bowls: "bowl",
+    servings: "serving",
+    tablespoons: "tbsp",
+    tablespoon: "tbsp",
+    teaspoons: "tsp",
+    teaspoon: "tsp",
+    slices: "slice"
+  };
+  return map[u] || u;
+}
+
 function parseToParsedFoods(text: string): ParsedFood[] {
   const chunks = text
     .split(/[\n,]/)
@@ -822,29 +932,36 @@ function parseToParsedFoods(text: string): ParsedFood[] {
     }
 
     // Check for patterns with unit words: "<num> <unit> <food>" or "<food> <num> <unit>"
-    // Units: packet, packets, pc, pcs, piece, pieces
-    const unitWords = ["packet", "packets", "pc", "pcs", "piece", "pieces"];
+    const unitWords = [
+      "packet", "packets",
+      "pc", "pcs", "piece", "pieces",
+      "g", "gram", "grams",
+      "ml", "milliliter", "milliliters",
+      "cup", "cups", "bowl", "bowls", "serving", "servings",
+      "tbsp", "tablespoon", "tablespoons", "tsp", "teaspoon", "teaspoons",
+      "slice", "slices"
+    ];
     let numUnitMatch = null;
-    let hasUnit = false;
+    let parsedUnit: string | undefined;
     let num = NaN;
     let foodPart = "";
     
     // Try "<num> <unit> <food>" first
     const numUnitFoodMatch = lower.match(
-      /^(\d+(?:\.\d+)?)\s+(packet|packets|pc|pcs|piece|pieces)\s+(.+)$/
+      /^(\d+(?:\.\d+)?)\s+([a-z]+)\s+(.+)$/
     );
-    if (numUnitFoodMatch) {
+    if (numUnitFoodMatch && unitWords.includes(numUnitFoodMatch[2])) {
       num = parseFloat(numUnitFoodMatch[1]);
-      hasUnit = unitWords.includes(numUnitFoodMatch[2]);
+      parsedUnit = normalizeParsedUnit(numUnitFoodMatch[2]);
       foodPart = numUnitFoodMatch[3].trim();
     } else {
       // Try "<food> <num> <unit>"
       const foodNumUnitMatch = lower.match(
-        /^(.+?)\s+(\d+(?:\.\d+)?)\s+(packet|packets|pc|pcs|piece|pieces)\s*$/
+        /^(.+?)\s+(\d+(?:\.\d+)?)\s+([a-z]+)\s*$/
       );
-      if (foodNumUnitMatch) {
+      if (foodNumUnitMatch && unitWords.includes(foodNumUnitMatch[3])) {
         num = parseFloat(foodNumUnitMatch[2]);
-        hasUnit = unitWords.includes(foodNumUnitMatch[3]);
+        parsedUnit = normalizeParsedUnit(foodNumUnitMatch[3]);
         foodPart = foodNumUnitMatch[1].trim();
       } else {
         // Try "<num> <food>" or "<food> <num>" (no unit)
@@ -864,10 +981,10 @@ function parseToParsedFoods(text: string): ParsedFood[] {
         name,
         originalText: chunk,
         quantity: Number.isFinite(num) ? num : undefined,
-        unit: hasUnit ? "piece" : undefined,
+        unit: parsedUnit,
         approx: !Number.isFinite(num),
         role: detectFoodRole(name),
-        confidence: hasUnit ? 0.85 : 0.8,
+        confidence: parsedUnit ? 0.85 : 0.8,
       });
       continue;
     }
@@ -909,8 +1026,8 @@ function enrichParsedFoods(parsedFoods: ParsedFood[]): MealItem[] {
         (key && DEFAULT_GRAMS_PER_PIECE[key]) || DEFAULT_GRAMS_PER_PIECE["*"];
       totalMainPieces += pieces;
       totalMainGrams += perPiece * pieces;
-    } else if (f.unit === "g" && qty) {
-      totalMainGrams += qty;
+    } else if (f.unit && qty) {
+      totalMainGrams += quantityUnitToGrams(qty, f.unit, f.name);
     }
   }
 
@@ -924,7 +1041,7 @@ function enrichParsedFoods(parsedFoods: ParsedFood[]): MealItem[] {
     let approx = !!f.approx;
 
     if (f.role === "main") {
-      if (isBreadLike(lowerName) || (quantity && quantity > 0 && (unit === "piece" || !unit))) {
+      if (isBreadLike(lowerName) || (quantity && quantity > 0 && unit === "piece")) {
         const pieces = quantity && quantity > 0 ? quantity : 1;
         const key = Object.keys(DEFAULT_GRAMS_PER_PIECE).find(
           (k) => k !== "*" && lowerName.includes(k)
@@ -938,9 +1055,9 @@ function enrichParsedFoods(parsedFoods: ParsedFood[]): MealItem[] {
         quantity = pieces;
         unit = "piece";
         approx = approx || !f.quantity;
-      } else if (unit === "g" && quantity && quantity > 0) {
-        // Explicit gram-based main, e.g. "150g chicken"
-        grams = quantity;
+      } else if (unit && quantity && quantity > 0) {
+        // Preserve explicit unit from input (cup, bowl, serving, g, ml, etc.)
+        grams = quantityUnitToGrams(quantity, unit, f.name);
         approx = approx || false;
       } else {
         // Fallback main: use inferDefaultServingGrams for better estimation
@@ -1089,13 +1206,14 @@ function parseFoodLine(
 const HEADER_TO_CONTENT_GAP = 18;
 
 const defaultProfile: UserProfile = {
-  dateOfBirth: null,
-  genderAtBirth: null,
+  dateOfBirth: "1990-01-01",
+  genderAtBirth: "female",
   heightCm: null,
   heightUnit: "cm",
   weightKg: null,
   goal: null,
-  activityLevel: null
+  activityLevel: "medium",
+  customTargets: null
 };
 
 const getAgeFromDOB = (dob: string | null): number | null => {
@@ -1111,13 +1229,33 @@ const getAgeFromDOB = (dob: string | null): number | null => {
 };
 
 const getMacroTargets = (profile: UserProfile) => {
+  if (
+    profile.customTargets &&
+    Number.isFinite(profile.customTargets.calories_kcal) &&
+    Number.isFinite(profile.customTargets.protein_g) &&
+    Number.isFinite(profile.customTargets.carbs_g) &&
+    Number.isFinite(profile.customTargets.fat_g)
+  ) {
+    return {
+      calories_kcal: Math.max(800, Math.round(profile.customTargets.calories_kcal)),
+      protein_g: Math.max(20, Math.round(profile.customTargets.protein_g)),
+      carbs_g: Math.max(20, Math.round(profile.customTargets.carbs_g)),
+      fat_g: Math.max(10, Math.round(profile.customTargets.fat_g))
+    };
+  }
+
   // Calculate BMR using Mifflin-St Jeor Equation
-  const calculateBMR = (weightKg: number, heightCm: number, age: number, isMale: boolean): number => {
-    if (isMale) {
-      return 10 * weightKg + 6.25 * heightCm - 5 * age + 5;
-    } else {
-      return 10 * weightKg + 6.25 * heightCm - 5 * age - 161;
-    }
+  const calculateBMR = (
+    weightKg: number,
+    heightCm: number,
+    age: number,
+    gender: "male" | "female" | "other" | null
+  ): number => {
+    const male = 10 * weightKg + 6.25 * heightCm - 5 * age + 5;
+    const female = 10 * weightKg + 6.25 * heightCm - 5 * age - 161;
+    if (gender === "male") return male;
+    if (gender === "female") return female;
+    return (male + female) / 2;
   };
 
   // Activity multipliers: use mid-range, not upper end (so targets aren't at the high end)
@@ -1131,12 +1269,11 @@ const getMacroTargets = (profile: UserProfile) => {
   const age = profile.dateOfBirth ? getAgeFromDOB(profile.dateOfBirth) : 44;
   const weightKg = profile.weightKg ?? 73;
   const heightCm = profile.heightCm ?? 175;
-  const isMale = profile.genderAtBirth === "male";
   const activityLevel = profile.activityLevel ?? "medium";
   const multiplier = activityMultipliers[activityLevel] ?? 1.4;
 
   if (age && weightKg && heightCm) {
-    const bmr = calculateBMR(weightKg, heightCm, age, isMale);
+    const bmr = calculateBMR(weightKg, heightCm, age, profile.genderAtBirth);
     let tdee = bmr * multiplier;
 
     // Adjust calories based on goal
@@ -1209,6 +1346,12 @@ const FOOD_NUTRIENTS_KEY = "@mealtracking_foodNutrients";
 const FOOD_OVERRIDES_KEY = "@mealtracking_foodOverrides";
 const FOOD_SERVING_GRAMS_KEY = "@mealtracking_foodServingGrams";
 const MEAL_TEMPLATES_KEY = "@mealtracking_mealTemplates";
+const MEAL_REMINDER_STORAGE_KEY = "@mealtracking_mealReminder";
+const REMINDER_DEVICE_ID_KEY = "@mealtracking_reminderDeviceId";
+const REMINDER_PUSH_TOKEN_KEY = "@mealtracking_expoPushToken";
+const INSIGHTS_LAST_VIEWED_KEY = "@mealtracking_insightsLastViewed";
+const HAS_LOGGED_MEAL_KEY = "@mealtracking_hasLoggedMeal";
+const NEW_USER_PAYWALL_DISMISSED_KEY = "@mealtracking_newUserPaywallDismissed";
 
 type MealTemplate = {
   id: string;
@@ -1374,12 +1517,12 @@ const formatHeaderLabel = (dateKey: string): string => {
   return `${mon}, ${jan} ${d.getDate()}`;
 };
 
-const INSIGHT_TIP_BAR_COLORS = { positive: "#00C853", improvement: "#FF9800" } as const;
-
-/** Renders a tip with a colored vertical bar (green = positive, orange = improvement) and bold first phrase. */
+/** Renders a tip with a heart icon above the text (green = positive, orange = improvement) and bold first phrase. */
 const renderInsightTip = (tip: InsightTip, key: number, itemStyle: object) => {
   const { text, type } = tip;
-  const barColor = INSIGHT_TIP_BAR_COLORS[type];
+  const heartIcon = type === "positive" 
+    ? require("./assets/Greenheart.png")
+    : require("./assets/Orangeheart.png");
   const emDash = text.indexOf("—");
   const spaceHyphen = text.indexOf(" - ");
   let splitAt = -1;
@@ -1404,7 +1547,7 @@ const renderInsightTip = (tip: InsightTip, key: number, itemStyle: object) => {
       );
   return (
     <View key={key} style={styles.insightsTipRow}>
-      <View style={[styles.insightsTipBar, { backgroundColor: barColor }]} />
+      <Image source={heartIcon} style={styles.insightsTipHeart} resizeMode="contain" />
       <View style={styles.insightsTipTextWrap}>
         {textContent}
       </View>
@@ -1594,6 +1737,327 @@ function getPastDatesWithMeals(
 
 type InsightTip = { text: string; type: "positive" | "improvement" };
 type InsightResult = { summary: string; tips: InsightTip[] };
+type MealInsight = { text: string; type: "positive" | "improvement"; suggestions?: string[] } | null;
+
+/**
+ * Analyze a single meal and provide insights about missing nutrients, high sodium, or imbalances.
+ * Returns the most important insight for the meal, or null if the meal looks balanced.
+ */
+/**
+ * Extract cooking method and preparation details from food name
+ */
+function extractCookingMethod(foodName: string): {
+  method: string | null;
+  oil: string | null;
+  isHomeCooked: boolean;
+} {
+  const lower = foodName.toLowerCase();
+  const methods: string[] = [];
+  let oil: string | null = null;
+  let isHomeCooked = false;
+
+  // Check for cooking methods
+  if (/\b(air\s*fried|air\s*fry)\b/i.test(lower)) {
+    methods.push("air fried");
+  }
+  if (/\b(baked|roasted|roast)\b/i.test(lower)) {
+    methods.push("baked");
+  }
+  if (/\b(steamed|steam)\b/i.test(lower)) {
+    methods.push("steamed");
+  }
+  if (/\b(grilled|grill)\b/i.test(lower)) {
+    methods.push("grilled");
+  }
+  if (/\b(boiled|boil)\b/i.test(lower)) {
+    methods.push("boiled");
+  }
+  if (/\b(fried|deep\s*fried|pan\s*fried)\b/i.test(lower)) {
+    methods.push("fried");
+  }
+
+  // Check for home cooked indicators
+  if (/\b(home\s*cooked|homemade|home\s*made|made\s*at\s*home)\b/i.test(lower)) {
+    isHomeCooked = true;
+  }
+
+  // Check for cooking oils/fats
+  const oilPatterns = [
+    { pattern: /\b(avocado\s*oil|avocado)\b/i, name: "avocado oil" },
+    { pattern: /\b(olive\s*oil|olive)\b/i, name: "olive oil" },
+    { pattern: /\b(coconut\s*oil|coconut)\b/i, name: "coconut oil" },
+    { pattern: /\b(ghee|clarified\s*butter)\b/i, name: "ghee" },
+    { pattern: /\b(butter)\b/i, name: "butter" },
+    { pattern: /\b(sunflower\s*oil)\b/i, name: "sunflower oil" },
+    { pattern: /\b(canola\s*oil)\b/i, name: "canola oil" },
+    { pattern: /\b(vegetable\s*oil)\b/i, name: "vegetable oil" },
+  ];
+
+  for (const { pattern, name } of oilPatterns) {
+    if (pattern.test(lower)) {
+      oil = name;
+      break;
+    }
+  }
+
+  return {
+    method: methods.length > 0 ? methods[0] : null,
+    oil,
+    isHomeCooked
+  };
+}
+
+function getMealInsight(
+  mealItems: MealItem[],
+  mealLabel: string,
+  userProfile: UserProfile
+): MealInsight {
+  if (mealItems.length === 0) return null;
+
+  // Calculate meal totals
+  const mealTotals = mealItems.reduce((acc, item) => sumTotals(acc, item.nutrients), emptyTotals());
+  const mealMicros: Record<MicroKey, number> = {} as Record<MicroKey, number>;
+  for (const k of MICRO_KEYS) mealMicros[k] = 0;
+  for (const item of mealItems) {
+    const n = item.nutrients as Record<string, number>;
+    for (const k of MICRO_KEYS) mealMicros[k] += n[k] ?? 0;
+  }
+
+  const targets = getMacroTargets(userProfile);
+  const mealCalories = mealTotals.calories_kcal;
+  const mealProtein = mealTotals.protein_g;
+  const mealCarbs = mealTotals.carbs_g;
+  const mealFat = mealTotals.fat_g;
+  const mealSodium = mealMicros.sodium_mg ?? 0;
+  const mealFiber = mealMicros.fiber_g ?? 0;
+
+  // Calculate calorie breakdown
+  const caloriesFromProtein = mealProtein * 4;
+  const caloriesFromCarbs = mealCarbs * 4;
+  const caloriesFromFat = mealFat * 9;
+  const proteinPercent = mealCalories > 0 ? (caloriesFromProtein / mealCalories) * 100 : 0;
+  const carbsPercent = mealCalories > 0 ? (caloriesFromCarbs / mealCalories) * 100 : 0;
+  const fatPercent = mealCalories > 0 ? (caloriesFromFat / mealCalories) * 100 : 0;
+
+  // Find highest calorie contributors
+  const itemCalories = mealItems.map(item => {
+    const itemNutrients = item.nutrients as Record<string, number>;
+    return {
+      name: item.name,
+      calories: item.nutrients.calories_kcal,
+      protein: item.nutrients.protein_g,
+      fat: item.nutrients.fat_g,
+      carbs: item.nutrients.carbs_g,
+      sodium: itemNutrients.sodium_mg ?? 0
+    };
+  }).sort((a, b) => b.calories - a.calories);
+
+  // Estimate meal target (roughly 20-25% of daily for main meals, 10-15% for snacks)
+  const isSnack = mealLabel.toLowerCase().includes("snack");
+  const mealTargetRatio = isSnack ? 0.12 : 0.22; // 12% for snacks, 22% for main meals
+  const mealTargetCalories = targets.calories_kcal * mealTargetRatio;
+  const mealTargetProtein = targets.protein_g * mealTargetRatio;
+  const mealTargetFiber = isSnack ? 2 : 5; // Rough targets: 2g for snacks, 5g for main meals
+
+  // Priority 1: High sodium (most actionable)
+  if (mealSodium > 800) {
+    // Find which items contribute most to sodium
+    const highSodiumItems = itemCalories.filter(item => item.sodium > 300).slice(0, 2);
+    let sodiumSource = "";
+    if (highSodiumItems.length > 0) {
+      const itemNames = highSodiumItems.map(item => capitalizeFirst(stripParenthetical(item.name))).join(", ");
+      sodiumSource = ` (mainly from ${itemNames})`;
+    }
+    const suggestions = [
+      "Choose lower-sodium options next time (fresh foods over packaged)",
+      "Add more vegetables without added salt",
+      "Use herbs and spices instead of salt for flavor"
+    ];
+    return {
+      text: `This meal is high in sodium (${Math.round(mealSodium)}mg)${sodiumSource}. Consider balancing with lower-sodium foods in other meals today.`,
+      type: "improvement",
+      suggestions
+    };
+  }
+
+  // Priority 2: Very low protein (important for satiety)
+  if (mealTargetProtein > 0 && mealProtein < mealTargetProtein * 0.5) {
+    const suggestions = [
+      "Add eggs, yogurt, or cottage cheese",
+      "Include beans, lentils, or tofu",
+      "Add nuts, seeds, or nut butter",
+      "Include fish, chicken, or lean meat"
+    ];
+    return {
+      text: `This meal is low in protein (${Math.round(mealProtein)}g, only ${Math.round(proteinPercent)}% of calories). Adding a protein source can help keep you satisfied longer.`,
+      type: "improvement",
+      suggestions
+    };
+  }
+
+  // Priority 3: Very low fiber
+  if (mealFiber < mealTargetFiber * 0.5 && mealCalories > 150) {
+    const suggestions = [
+      "Add fruits or vegetables",
+      "Include whole grains (oats, whole wheat bread)",
+      "Add beans, lentils, or chickpeas",
+      "Include nuts or seeds"
+    ];
+    return {
+      text: `This meal could use more fiber (only ${Math.round(mealFiber)}g). Adding fruits, vegetables, or whole grains supports digestion and heart health.`,
+      type: "improvement",
+      suggestions
+    };
+  }
+
+  // Priority 4: Very high calories relative to meal target (only for main meals)
+  if (!isSnack && mealCalories > mealTargetCalories * 1.5 && mealTargetCalories > 0) {
+    // Analyze what makes it calorie-dense
+    const calorieDensityReasons: string[] = [];
+    const topContributors = itemCalories.slice(0, 2).map(item => capitalizeFirst(stripParenthetical(item.name)));
+    
+    if (fatPercent > 45) {
+      calorieDensityReasons.push(`high in fat (${Math.round(fatPercent)}% of calories, ${Math.round(mealFat)}g)`);
+    }
+    if (carbsPercent > 65) {
+      calorieDensityReasons.push(`high in carbohydrates (${Math.round(carbsPercent)}% of calories, ${Math.round(mealCarbs)}g)`);
+    }
+    if (itemCalories.length > 0 && itemCalories[0].calories > mealCalories * 0.5) {
+      calorieDensityReasons.push(`large portion sizes`);
+    }
+
+    let reasonText = "";
+    if (calorieDensityReasons.length > 0) {
+      reasonText = ` This is mainly due to ${calorieDensityReasons.join(" and ")}`;
+      if (topContributors.length > 0) {
+        reasonText += `, with ${topContributors.join(" and ")} being the main contributors`;
+      }
+      reasonText += ".";
+    }
+
+    const suggestions: string[] = [];
+    if (fatPercent > 45) {
+      suggestions.push("Consider reducing added fats (oils, butter, creamy sauces)");
+    }
+    if (carbsPercent > 65) {
+      suggestions.push("Reduce refined carbs or choose whole grain options");
+    }
+    suggestions.push("Add more vegetables to increase volume without many calories");
+    suggestions.push("Choose lighter options for other meals today");
+
+    return {
+      text: `This meal is quite calorie-dense (${Math.round(mealCalories)} calories, ${Math.round((mealCalories / mealTargetCalories) * 100)}% of your meal target).${reasonText} Consider balancing with lighter meals later today.`,
+      type: "improvement",
+      suggestions
+    };
+  }
+
+
+  // Priority 5: Very high fat (even if calories are okay)
+  if (fatPercent > 50 && mealCalories > 200) {
+    const highFatItems = itemCalories.filter(item => {
+      const itemFat = item.fat;
+      const itemCal = item.calories;
+      return itemCal > 0 && (itemFat * 9 / itemCal) > 0.5;
+    }).slice(0, 2);
+    let fatSource = "";
+    if (highFatItems.length > 0) {
+      const itemNames = highFatItems.map(item => capitalizeFirst(stripParenthetical(item.name))).join(", ");
+      fatSource = ` (mainly from ${itemNames})`;
+    }
+    return {
+      text: `This meal is very high in fat (${Math.round(fatPercent)}% of calories, ${Math.round(mealFat)}g)${fatSource}. Consider balancing with leaner options or adding more vegetables.`,
+      type: "improvement",
+      suggestions: [
+        "Choose lean protein sources (fish, chicken, beans) over high-fat options",
+        "Reduce added oils, butter, or creamy sauces",
+        "Add more vegetables and whole grains for balance"
+      ]
+    };
+  }
+
+  // Check for healthy cooking methods and provide positive feedback
+  const cookingMethodInsights: string[] = [];
+  const healthyOils: string[] = [];
+  const unhealthyOils: string[] = [];
+  let hasHomeCooked = false;
+  let hasAirFried = false;
+  let hasBakedOrSteamed = false;
+
+  for (const item of mealItems) {
+    const cooking = extractCookingMethod(item.name);
+    
+    if (cooking.isHomeCooked) {
+      hasHomeCooked = true;
+    }
+    if (cooking.method === "air fried") {
+      hasAirFried = true;
+    }
+    if (cooking.method === "baked" || cooking.method === "steamed" || cooking.method === "grilled") {
+      hasBakedOrSteamed = true;
+    }
+    if (cooking.oil) {
+      const healthyOilList = ["avocado oil", "olive oil", "coconut oil"];
+      if (healthyOilList.includes(cooking.oil)) {
+        healthyOils.push(cooking.oil);
+      } else if (cooking.oil === "ghee" || cooking.oil === "butter") {
+        unhealthyOils.push(cooking.oil);
+      }
+    }
+  }
+
+  // Add positive feedback for healthy cooking choices
+  if (hasHomeCooked && mealSodium < 600) {
+    cookingMethodInsights.push("Great choice cooking at home—home-cooked meals typically have lower sodium and give you more control over ingredients.");
+  }
+  if (hasAirFried) {
+    cookingMethodInsights.push("Air frying is a smart choice—it gives you that crispy texture with much less oil than traditional frying!");
+  }
+  if (hasBakedOrSteamed && fatPercent < 40) {
+    cookingMethodInsights.push("Baking, steaming, or grilling helps keep meals lower in fat while preserving flavor—excellent cooking method!");
+  }
+  if (healthyOils.length > 0) {
+    const uniqueHealthyOils = [...new Set(healthyOils)];
+    const oilText = uniqueHealthyOils.length === 1 
+      ? uniqueHealthyOils[0] 
+      : uniqueHealthyOils.join(" and ");
+    cookingMethodInsights.push(`Using ${oilText} is a heart-healthy choice—these oils are rich in monounsaturated fats that support cardiovascular health.`);
+  }
+  if (unhealthyOils.length > 0 && healthyOils.length === 0) {
+    // Only suggest if no healthy oils were found
+    const unhealthyOilText = unhealthyOils[0];
+    if (unhealthyOilText === "ghee") {
+      cookingMethodInsights.push("Consider trying avocado or olive oil instead of ghee for a healthier fat option with similar flavor.");
+    }
+  }
+
+  // Priority 6: Good balance (positive feedback) - include cooking method insights
+  if (mealProtein >= mealTargetProtein * 0.7 && mealFiber >= mealTargetFiber * 0.7 && mealSodium < 600) {
+    let text = `This meal looks well-balanced with good protein (${Math.round(mealProtein)}g) and fiber (${Math.round(mealFiber)}g)—great choices!`;
+    if (cookingMethodInsights.length > 0) {
+      text += ` ${cookingMethodInsights[0]}`;
+    }
+    return {
+      text,
+      type: "positive"
+    };
+  }
+
+  // If meal has issues but has healthy cooking methods, add positive note
+  if (cookingMethodInsights.length > 0) {
+    // Return a positive insight even if there are other issues, prioritizing healthy cooking
+    return {
+      text: cookingMethodInsights[0],
+      type: "positive"
+    };
+  }
+
+  // Fallback: always provide a light, encouraging insight for logged meals.
+  return {
+    text: "Nice work logging this meal. It looks reasonably balanced overall. Keep including protein, fiber, and colorful whole foods across the day.",
+    type: "positive"
+  };
+}
 
 function getDayInsights(
   dayData: DayData,
@@ -1678,9 +2142,19 @@ function getDayInsights(
     tips.push({ text: "Fiber was a bit low—more vegetables, fruits, beans, or whole grains would help gut and heart health.", type: "improvement" });
   }
 
-  // Sodium tips
+  // Sodium tips - check for home-cooked meals
+  const hasHomeCookedMeals = Object.values(mealItems).some(items => 
+    items.some(item => extractCookingMethod(item.name).isHomeCooked)
+  );
+  
   if (sodium > 2300) {
-    tips.push({ text: "Sodium leaned high today; using fewer packaged foods and more home-cooked meals can bring this down.", type: "improvement" });
+    if (hasHomeCookedMeals) {
+      tips.push({ text: "Sodium was high today, but great job cooking at home—home-cooked meals typically have less sodium than restaurant or packaged foods.", type: "improvement" });
+    } else {
+      tips.push({ text: "Sodium leaned high today; using fewer packaged foods and more home-cooked meals can bring this down.", type: "improvement" });
+    }
+  } else if (hasHomeCookedMeals && sodium < 1500) {
+    tips.push({ text: "Excellent—your home-cooked meals are keeping sodium in a healthy range. This supports heart health and blood pressure management.", type: "positive" });
   }
 
   // Omega-3 tips
@@ -1688,11 +2162,30 @@ function getDayInsights(
     tips.push({ text: "Good job adding some omega-3–rich foods or supplements today; they support heart and brain health.", type: "positive" });
   }
 
-  // Goal-specific tips
+  // Goal-specific tips - check for healthy cooking oils
+  const allMealItems = Object.values(mealItems).flat();
+  const healthyOilsUsed: string[] = [];
+  const unhealthyOilsUsed: string[] = [];
+  
+  for (const item of allMealItems) {
+    const cooking = extractCookingMethod(item.name);
+    if (cooking.oil) {
+      const healthyOilList = ["avocado oil", "olive oil", "coconut oil"];
+      if (healthyOilList.includes(cooking.oil) && !healthyOilsUsed.includes(cooking.oil)) {
+        healthyOilsUsed.push(cooking.oil);
+      } else if ((cooking.oil === "ghee" || cooking.oil === "butter") && !unhealthyOilsUsed.includes(cooking.oil)) {
+        unhealthyOilsUsed.push(cooking.oil);
+      }
+    }
+  }
+
   const goal = userProfile.goal ?? "";
   if ((goal.includes("cholesterol") || goal.includes("heart")) && totals.fat_g > 0) {
-    if (totals.fat_g > (targets.fat_g ?? 0) * 1.2) {
-      tips.push({ text: "For heart and cholesterol health, keep favoring unsaturated fats (nuts, seeds, fish, olive oil) over deep-fried or very creamy foods.", type: "improvement" });
+    if (healthyOilsUsed.length > 0) {
+      const oilText = healthyOilsUsed.length === 1 ? healthyOilsUsed[0] : healthyOilsUsed.join(" and ");
+      tips.push({ text: `Great choice using ${oilText}—these heart-healthy oils are rich in monounsaturated fats that support cardiovascular health.`, type: "positive" });
+    } else if (totals.fat_g > (targets.fat_g ?? 0) * 1.2) {
+      tips.push({ text: "For heart and cholesterol health, keep favoring unsaturated fats (nuts, seeds, fish, olive oil, avocado oil) over deep-fried or very creamy foods.", type: "improvement" });
     } else {
       tips.push({ text: "Your fat choices today look good for heart health—keep leaning on unsaturated fat sources.", type: "positive" });
     }
@@ -1850,6 +2343,142 @@ function aggregateWeekData(
   return { totals, microTotals, foods, mealsLogged, daysWithMeals };
 }
 
+type MealTrendInsight = { text: string; type: "positive" | "improvement" } | null;
+
+/**
+ * Analyze meal-by-meal trends over the past week.
+ * Returns insights about which meals are heavier, less balanced, or need improvement.
+ */
+function getMealTrendInsights(
+  dataByDate: Record<string, DayData>,
+  todayKey: string,
+  userProfile: UserProfile
+): MealTrendInsight[] {
+  const insights: MealTrendInsight[] = [];
+  const targets = getMacroTargets(userProfile);
+  const mealTargetRatio = 0.22; // 22% for main meals
+  const mealTargetCalories = targets.calories_kcal * mealTargetRatio;
+  const mealTargetProtein = targets.protein_g * mealTargetRatio;
+
+  // Aggregate data by meal type
+  const mealStats: Record<string, { calories: number[]; protein: number[]; fiber: number[]; sodium: number[]; count: number }> = {
+    "Breakfast": { calories: [], protein: [], fiber: [], sodium: [], count: 0 },
+    "Lunch": { calories: [], protein: [], fiber: [], sodium: [], count: 0 },
+    "Dinner": { calories: [], protein: [], fiber: [], sodium: [], count: 0 },
+    "Afternoon Snack": { calories: [], protein: [], fiber: [], sodium: [], count: 0 },
+    "Evening Snack": { calories: [], protein: [], fiber: [], sodium: [], count: 0 }
+  };
+
+  // Collect data from past 7 days
+  for (let i = 1; i <= 7; i++) {
+    const dk = addDays(todayKey, -i);
+    const day = dataByDate[dk];
+    if (!day || !dayHasMeals(day)) continue;
+
+    for (const meal of day.meals) {
+      const items = day.mealItems[meal.id] ?? [];
+      if (items.length === 0 && meal.nutrients.calories_kcal === 0) continue;
+
+      const mealTotals = meal.nutrients;
+      const mealMicros = getMicroTotalsFromItems({ [meal.id]: items });
+      const mealLabel = meal.label;
+
+      if (mealStats[mealLabel]) {
+        mealStats[mealLabel].calories.push(mealTotals.calories_kcal);
+        mealStats[mealLabel].protein.push(mealTotals.protein_g);
+        mealStats[mealLabel].fiber.push(mealMicros.fiber_g ?? 0);
+        mealStats[mealLabel].sodium.push(mealMicros.sodium_mg ?? 0);
+        mealStats[mealLabel].count += 1;
+      }
+    }
+  }
+
+  // Analyze trends for each meal type
+  for (const [mealLabel, stats] of Object.entries(mealStats)) {
+    if (stats.count < 3) continue; // Need at least 3 instances to show a trend
+
+    const avgCalories = stats.calories.reduce((a, b) => a + b, 0) / stats.count;
+    const avgProtein = stats.protein.reduce((a, b) => a + b, 0) / stats.count;
+    const avgFiber = stats.fiber.reduce((a, b) => a + b, 0) / stats.count;
+    const avgSodium = stats.sodium.reduce((a, b) => a + b, 0) / stats.count;
+    const isSnack = mealLabel.toLowerCase().includes("snack");
+    const targetCal = isSnack ? mealTargetCalories * 0.5 : mealTargetCalories;
+    const targetProt = isSnack ? mealTargetProtein * 0.5 : mealTargetProtein;
+
+    // Check if meal is consistently heavy
+    if (!isSnack && avgCalories > targetCal * 1.3) {
+      insights.push({
+        text: `On average, your ${mealLabel.toLowerCase()}s are heavier (${Math.round(avgCalories)} calories). Consider lighter options or adding more vegetables for volume.`,
+        type: "improvement"
+      });
+    }
+
+    // Check if meal consistently lacks protein
+    if (avgProtein < targetProt * 0.6 && targetProt > 0) {
+      insights.push({
+        text: `Try adding protein to your ${mealLabel.toLowerCase()}s—they average only ${Math.round(avgProtein)}g. Adding eggs, yogurt, beans, or lean meat can help with satiety.`,
+        type: "improvement"
+      });
+    }
+
+    // Check if meal consistently lacks fiber
+    if (!isSnack && avgFiber < 3 && avgCalories > 200) {
+      insights.push({
+        text: `Your ${mealLabel.toLowerCase()}s could use more fiber (averaging ${Math.round(avgFiber)}g). Add fruits, vegetables, or whole grains for better balance.`,
+        type: "improvement"
+      });
+    }
+
+    // Check if meal is consistently high in sodium
+    if (avgSodium > 800) {
+      insights.push({
+        text: `Your ${mealLabel.toLowerCase()}s tend to be high in sodium (averaging ${Math.round(avgSodium)}mg). Try fresh foods over packaged options.`,
+        type: "improvement"
+      });
+    }
+  }
+
+  // Compare meal sizes to find the heaviest
+  const mainMeals = ["Breakfast", "Lunch", "Dinner"].map(label => ({
+    label,
+    avgCal: mealStats[label]?.count >= 3
+      ? mealStats[label].calories.reduce((a, b) => a + b, 0) / mealStats[label].count
+      : 0
+  })).filter(m => m.avgCal > 0).sort((a, b) => b.avgCal - a.avgCal);
+
+  if (mainMeals.length >= 2) {
+    const heaviest = mainMeals[0];
+    const lightest = mainMeals[mainMeals.length - 1];
+    if (heaviest.avgCal > lightest.avgCal * 1.4) {
+      insights.push({
+        text: `On average, your ${heaviest.label.toLowerCase()}s are heavier than your ${lightest.label.toLowerCase()}s. Consider redistributing calories for more balanced energy throughout the day.`,
+        type: "improvement"
+      });
+    }
+  }
+
+  // Positive feedback for balanced meals
+  const balancedMeals = Object.entries(mealStats).filter(([label, stats]) => {
+    if (stats.count < 3) return false;
+    const avgCal = stats.calories.reduce((a, b) => a + b, 0) / stats.count;
+    const avgProt = stats.protein.reduce((a, b) => a + b, 0) / stats.count;
+    const avgFib = stats.fiber.reduce((a, b) => a + b, 0) / stats.count;
+    const isSnack = label.toLowerCase().includes("snack");
+    const targetCal = isSnack ? mealTargetCalories * 0.5 : mealTargetCalories;
+    const targetProt = isSnack ? mealTargetProtein * 0.5 : mealTargetProtein;
+    return avgCal > 0 && avgProt >= targetProt * 0.7 && avgFib >= (isSnack ? 1.5 : 3);
+  });
+
+  if (balancedMeals.length >= 2) {
+    insights.push({
+      text: `Great job keeping your ${balancedMeals.map(([label]) => label.toLowerCase()).join(" and ")} balanced with good protein and fiber!`,
+      type: "positive"
+    });
+  }
+
+  return insights.slice(0, 4); // Limit to 4 most important insights
+}
+
 function getWeekInsights(
   dataByDate: Record<string, DayData>,
   todayKey: string,
@@ -1969,13 +2598,22 @@ function getWeekInsights(
     }
   }
 
+  // Add meal trend insights if user has logged for at least a week
+  if (daysWithMeals >= 7) {
+    const trendInsights = getMealTrendInsights(dataByDate, todayKey, userProfile);
+    // Add trend insights at the beginning (after the first positive tip)
+    if (trendInsights.length > 0) {
+      tips.splice(1, 0, ...trendInsights);
+    }
+  }
+
   // De-duplicate by text and limit
   const seen = new Set<string>();
   const uniqueTips = tips.filter((t) => {
     if (seen.has(t.text)) return false;
     seen.add(t.text);
     return true;
-  }).slice(0, 6);
+  }).slice(0, 8); // Increased limit to accommodate trend insights
 
   return { summary, tips: uniqueTips };
 }
@@ -2009,14 +2647,20 @@ function getContributors(
 }
 
 function AppContent() {
-  const { isPro, isLoading: subscriptionLoading, presentPaywall, presentCustomerCenter, resetSubscriptionForTesting } = useSubscription();
-  const [view, setView] = useState<"home" | "add" | "meal" | "export" | "personal" | "savedFoods">("home");
+  const { isPro, isLoading: subscriptionLoading, presentPaywall, presentCustomerCenter } = useSubscription();
+  const [view, setView] = useState<"home" | "add" | "meal" | "export" | "personal" | "savedFoods" | "terms" | "privacy" | "onboarding">("home");
+  const [showTermsPrivacySubmenu, setShowTermsPrivacySubmenu] = useState(false);
+  const [webViewLoading, setWebViewLoading] = useState(true);
+  const [webViewError, setWebViewError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>("meals");
   const [selectedNutrient, setSelectedNutrient] = useState<SelectedNutrient | null>(null);
   const [selectedMealId, setSelectedMealId] = useState<string | null>(null);
   const [selectedFoodItem, setSelectedFoodItem] = useState<MealItem | null>(null);
   const [editableFoodNutrients, setEditableFoodNutrients] = useState<NutrientTotals | null>(null);
   const [originalFoodNutrients, setOriginalFoodNutrients] = useState<NutrientTotals | null>(null);
+  const [editableQuantity, setEditableQuantity] = useState<number>(1);
+  const [editableUnit, setEditableUnit] = useState<string>("g");
+  const [showFoodUnitDropdown, setShowFoodUnitDropdown] = useState(false);
   const [foodSaveMessage, setFoodSaveMessage] = useState<string | null>(null);
   const [foodSaving, setFoodSaving] = useState(false);
   const [knownFoods, setKnownFoods] = useState<string[]>([]);
@@ -2034,6 +2678,13 @@ function AppContent() {
   } | null>(null);
   const [loadingInsights, setLoadingInsights] = useState(false);
   const [entryText, setEntryText] = useState("");
+  const [mealPhotoUri, setMealPhotoUri] = useState<string | null>(null);
+  const [mealPhotoAnalyzing, setMealPhotoAnalyzing] = useState(false);
+  const [mealPhotoProgress, setMealPhotoProgress] = useState(0);
+  const [mealPhotoStatusText, setMealPhotoStatusText] = useState("Analyzing photo...");
+  const [addComposerTab, setAddComposerTab] = useState<"photo" | "text">("text");
+  const [addKeyboardOffset, setAddKeyboardOffset] = useState(0);
+  const [hasAutoOpenedCamera, setHasAutoOpenedCamera] = useState(false);
   const [dataByDate, setDataByDate] = useState<Record<string, DayData>>({});
   const [selectedDate, setSelectedDate] = useState<string>(() => toDateKey(new Date()));
   const [hydrated, setHydrated] = useState(false);
@@ -2041,6 +2692,9 @@ function AppContent() {
   const [loading, setLoading] = useState(false);
   const [menuVisible, setMenuVisible] = useState(false);
   const [insightsSubTab, setInsightsSubTab] = useState<"day" | "week">("day");
+  const [insightsLastViewed, setInsightsLastViewed] = useState<string>("");
+  const [hasNewDayInsights, setHasNewDayInsights] = useState(false);
+  const [hasNewWeekInsights, setHasNewWeekInsights] = useState(false);
   const [exportRange, setExportRange] = useState<"7" | "30" | "custom">("7");
   const [exportStartDate, setExportStartDate] = useState<string>(() => {
     const d = new Date();
@@ -2052,7 +2706,7 @@ function AppContent() {
   const [heightUnit, setHeightUnit] = useState<"cm" | "in">("cm");
   const [heightValue, setHeightValue] = useState<string>("");
   const [weightValue, setWeightValue] = useState<string>("");
-  const [dobValue, setDobValue] = useState<string>("");
+  const [dobValue, setDobValue] = useState<string>("01/01/1990");
   const [dobDay, setDobDay] = useState<string>("14");
   const [dobMonth, setDobMonth] = useState<string>("Jul");
   const [dobYear, setDobYear] = useState<string>("1981");
@@ -2062,18 +2716,117 @@ function AppContent() {
   const [showGoalDropdown, setShowGoalDropdown] = useState(false);
   const [showActivityDropdown, setShowActivityDropdown] = useState(false);
   const [weightUnit, setWeightUnit] = useState<"kg" | "lbs">("kg");
+  const [onboardingStep, setOnboardingStep] = useState(0);
+  const [customCaloriesInput, setCustomCaloriesInput] = useState("");
+  const [customProteinInput, setCustomProteinInput] = useState("");
+  const [customCarbsInput, setCustomCarbsInput] = useState("");
+  const [customFatInput, setCustomFatInput] = useState("");
+  const [customTargetError, setCustomTargetError] = useState<string | null>(null);
+  const [showOnboardingDobPicker, setShowOnboardingDobPicker] = useState(false);
+  const [showOnboardingGenderDropdown, setShowOnboardingGenderDropdown] = useState(false);
+  const [showOnboardingHeightUnitDropdown, setShowOnboardingHeightUnitDropdown] = useState(false);
+  const [showOnboardingWeightUnitDropdown, setShowOnboardingWeightUnitDropdown] = useState(false);
+  const [showOnboardingActivityDropdown, setShowOnboardingActivityDropdown] = useState(false);
+  const [onboardingDobDraft, setOnboardingDobDraft] = useState<Date>(new Date(1990, 0, 1));
   const [yesterdayInsightDismissed, setYesterdayInsightDismissed] = useState<string>("");
   const [feedbackModalVisible, setFeedbackModalVisible] = useState(false);
   const [feedbackRating, setFeedbackRating] = useState<number>(0);
   const [feedbackText, setFeedbackText] = useState("");
+  const [newUserPaywallVisible, setNewUserPaywallVisible] = useState(false);
   const [editingSavedFoodName, setEditingSavedFoodName] = useState<string | null>(null);
   const [savedFoodEditName, setSavedFoodEditName] = useState("");
   const [savedFoodEditCalories, setSavedFoodEditCalories] = useState("");
   const [savedFoodEditServingGrams, setSavedFoodEditServingGrams] = useState("");
   const [savedFoodDeleteConfirm, setSavedFoodDeleteConfirm] = useState<string | null>(null);
   const [savedFoodsSearchQuery, setSavedFoodsSearchQuery] = useState("");
+  const [mealReminderSettings, setMealReminderSettings] = useState<MealReminderSettings>(DEFAULT_MEAL_REMINDER);
+  const reminderDeviceIdRef = useRef<string | null>(null);
+  const reminderPushTokenRef = useRef<string | null>(null);
+  const [showReminderTimePicker, setShowReminderTimePicker] = useState(false);
 
   const addScrollRef = useRef<ScrollView>(null);
+  const addInputRef = useRef<TextInput>(null);
+  const cameraRef = useRef<CameraView>(null);
+  const hasShownLaunchPaywallRef = useRef(false);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+
+  const maybeShowNoFoodFoundAlert = useCallback((message: string) => {
+    const lower = message.toLowerCase();
+    if (
+      lower.includes("could not identify foods") ||
+      lower.includes("no food") ||
+      lower.includes("no foods")
+    ) {
+      Alert.alert("No food found", "No food was found in this image. Please try another photo.");
+    }
+  }, []);
+
+  // Track when user logs their first meal (only run once after hydration)
+  // TEMPORARILY DISABLED - will re-enable after app loads
+  // const hasCheckedMealLoggedRef = useRef(false);
+  // useEffect(() => {
+  //   if (!hydrated || hasCheckedMealLoggedRef.current) return;
+  //   hasCheckedMealLoggedRef.current = true;
+  //   
+  //   // Delay to ensure dataByDate is loaded
+  //   setTimeout(async () => {
+  //     try {
+  //       const hasLoggedMeal = await AsyncStorage.getItem(HAS_LOGGED_MEAL_KEY);
+  //       if (hasLoggedMeal === "true") return; // Already marked
+  //       
+  //       // Check if user has any meals in data
+  //       const hasMealsInData = Object.values(dataByDate).some(day => dayHasMeals(day));
+  //       if (hasMealsInData) {
+  //         await AsyncStorage.setItem(HAS_LOGGED_MEAL_KEY, "true");
+  //       }
+  //     } catch (err) {
+  //       console.warn("Error checking meal logged:", err);
+  //     }
+  //   }, 2000); // Wait 2 seconds after hydration for data to load
+  // }, [hydrated]);
+
+  // Check on app launch if we should show paywall (only run once after hydration)
+  // TEMPORARILY DISABLED - will re-enable after app loads
+  // const hasCheckedPaywallRef = useRef(false);
+  // useEffect(() => {
+  //   if (!hydrated || isPro || hasCheckedPaywallRef.current) return;
+  //   hasCheckedPaywallRef.current = true;
+  //   
+  //   // Delay to ensure dataByDate is loaded
+  //   setTimeout(async () => {
+  //     try {
+  //       const hasLoggedMeal = await AsyncStorage.getItem(HAS_LOGGED_MEAL_KEY);
+  //       const paywallDismissed = await AsyncStorage.getItem(NEW_USER_PAYWALL_DISMISSED_KEY);
+  //       
+  //       // Check if user has any meals in loaded data
+  //       const hasMealsInData = Object.values(dataByDate).some(day => dayHasMeals(day));
+  //       
+  //       // Show paywall if user has logged meal but hasn't dismissed paywall
+  //       if (hasMealsInData && hasLoggedMeal === "true" && !paywallDismissed) {
+  //         // Show paywall after a short delay to ensure app is fully loaded
+  //         setTimeout(() => {
+  //           setNewUserPaywallVisible(true);
+  //         }, 500);
+  //       }
+  //     } catch (err) {
+  //       console.warn("Error checking new user paywall:", err);
+  //     }
+  //   }, 2000); // Wait 2 seconds after hydration for data to load
+  // }, [hydrated, isPro]);
+
+  useEffect(() => {
+    if (!hydrated || subscriptionLoading) return;
+    if (isPro) return;
+    if (view === "onboarding") return;
+    if (hasShownLaunchPaywallRef.current) return;
+    hasShownLaunchPaywallRef.current = true;
+    const timer = setTimeout(() => {
+      presentPaywall().catch((err) => {
+        console.warn("Failed to present launch paywall:", err);
+      });
+    }, 450);
+    return () => clearTimeout(timer);
+  }, [hydrated, isPro, presentPaywall, subscriptionLoading, view]);
 
   useEffect(() => {
     if (view !== "add") return;
@@ -2086,6 +2839,37 @@ function AppContent() {
       }
     );
     return () => sub.remove();
+  }, [view]);
+
+  useEffect(() => {
+    if (view !== "add" || isTemplateMode || addComposerTab !== "text") return;
+    const timer = setTimeout(() => addInputRef.current?.focus(), 120);
+    return () => clearTimeout(timer);
+  }, [view, isTemplateMode, addComposerTab]);
+
+  useEffect(() => {
+    if (view !== "add" || isTemplateMode) return;
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+    const showSub = Keyboard.addListener(showEvent, (event) => {
+      const h = event?.endCoordinates?.height ?? 0;
+      setAddKeyboardOffset(Math.max(0, h));
+    });
+    const hideSub = Keyboard.addListener(hideEvent, () => setAddKeyboardOffset(0));
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, [view, isTemplateMode]);
+
+  useEffect(() => {
+    if (view !== "personal") return;
+    const targets = getMacroTargets(userProfile);
+    setCustomCaloriesInput(String(Math.round(targets.calories_kcal)));
+    setCustomProteinInput(String(Math.round(targets.protein_g)));
+    setCustomCarbsInput(String(Math.round(targets.carbs_g)));
+    setCustomFatInput(String(Math.round(targets.fat_g)));
+    setCustomTargetError(null);
   }, [view]);
 
   const todayKey = toDateKey(new Date());
@@ -2162,8 +2946,17 @@ function AppContent() {
 
   const persistProfile = useCallback(async (profile: UserProfile) => {
     try {
+      // Store user profile securely (contains sensitive info like DOB, gender, health data)
+      await setSecureJSON(SECURE_KEYS.USER_PROFILE, profile);
+      // Also keep in AsyncStorage as fallback for migration
       await AsyncStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profile));
-    } catch (_) {}
+    } catch (err) {
+      console.warn("Failed to persist profile securely, using fallback:", err);
+      // Fallback to AsyncStorage if secure storage fails
+      try {
+        await AsyncStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profile));
+      } catch (_) {}
+    }
   }, []);
 
   const persistKnownFoods = useCallback(
@@ -2211,6 +3004,15 @@ function AppContent() {
     []
   );
 
+  const persistMealReminder = useCallback(
+    async (settings: MealReminderSettings) => {
+      try {
+        await AsyncStorage.setItem(MEAL_REMINDER_STORAGE_KEY, JSON.stringify(settings));
+      } catch (_) {}
+    },
+    []
+  );
+
   const buildKnownFoodsFromData = useCallback(
     async (allData: Record<string, DayData>) => {
       try {
@@ -2250,6 +3052,25 @@ function AppContent() {
     },
     []
   );
+
+  // Initialize notification handler on app start (non-blocking)
+  useEffect(() => {
+    // Only initialize after app is hydrated and ready
+    if (!hydrated) return;
+    
+    // Delay initialization to ensure native modules are fully loaded
+    const timer = setTimeout(() => {
+      try {
+        // Additional check to ensure we're not in a background/terminating state
+        if (AppState.currentState === "active" || AppState.currentState === "inactive") {
+          initializeNotificationHandler();
+        }
+      } catch (err) {
+        console.warn("Failed to initialize notification handler:", err);
+      }
+    }, 500); // Increased delay to ensure native modules are ready
+    return () => clearTimeout(timer);
+  }, [hydrated]);
 
   // Loading screen image is loaded via require() - no need for async loading
 
@@ -2386,12 +3207,25 @@ function AppContent() {
       
       // Load user profile
       try {
-        const profileRaw = await AsyncStorage.getItem(PROFILE_STORAGE_KEY);
-        if (!cancelled) {
+        // Try secure storage first, then fallback to AsyncStorage
+        let profileParsed = await getSecureJSON<UserProfile>(SECURE_KEYS.USER_PROFILE);
+        if (!profileParsed) {
+          // Fallback to AsyncStorage for migration
+          const profileRaw = await AsyncStorage.getItem(PROFILE_STORAGE_KEY);
           if (profileRaw) {
-            const profileParsed = JSON.parse(profileRaw);
+            profileParsed = JSON.parse(profileRaw);
+            // Migrate to secure storage
+            if (profileParsed) {
+              try {
+                await setSecureJSON(SECURE_KEYS.USER_PROFILE, profileParsed);
+              } catch (_) {}
+            }
+          }
+        }
+        if (!cancelled) {
+          if (profileParsed) {
             setUserProfile(profileParsed);
-            if (profileParsed.dateOfBirth) {
+            if (profileParsed && profileParsed.dateOfBirth) {
               const dateParts = profileParsed.dateOfBirth.split("-");
               if (dateParts.length === 3) {
                 const [y, m, d] = dateParts;
@@ -2422,9 +3256,9 @@ function AppContent() {
               setWeightValue(Math.round(profileParsed.weightKg).toString());
             }
           } else {
-            // First‑time user: no profile saved yet — open Personal Details screen
-            console.log("No existing user profile found; opening personal details on first launch");
-            setView("personal");
+            // First-time user: no profile saved yet -> onboarding
+            setOnboardingStep(0);
+            setView("onboarding");
           }
         }
       } catch (err) {
@@ -2471,6 +3305,16 @@ function AppContent() {
         }
       } catch (err) {
         console.warn("Error loading yesterday insight dismissed state:", err);
+      }
+
+      // Load insights last viewed date
+      try {
+        const lastViewedRaw = await AsyncStorage.getItem(INSIGHTS_LAST_VIEWED_KEY);
+        if (!cancelled && lastViewedRaw) {
+          setInsightsLastViewed(lastViewedRaw);
+        }
+      } catch (err) {
+        console.warn("Error loading insights last viewed date:", err);
       }
 
       // Load per‑food nutrient overrides
@@ -2557,6 +3401,23 @@ function AppContent() {
       } catch (err) {
         console.warn("Error loading meal templates:", err);
       }
+
+      // Load meal reminder settings
+      try {
+        const reminderRaw = await AsyncStorage.getItem(MEAL_REMINDER_STORAGE_KEY);
+        if (!cancelled && reminderRaw) {
+          const parsed = JSON.parse(reminderRaw) as MealReminderSettings;
+          if (parsed && typeof parsed.enabled === "boolean") {
+            setMealReminderSettings({
+              enabled: parsed.enabled,
+              hour: typeof parsed.hour === "number" ? Math.max(0, Math.min(23, parsed.hour)) : 12,
+              minute: typeof parsed.minute === "number" ? Math.max(0, Math.min(59, parsed.minute)) : 0
+            });
+          }
+        }
+      } catch (err) {
+        console.warn("Error loading meal reminder settings:", err);
+      }
       
       // Ensure loading screen shows for at least MIN_LOADING_TIME
       const elapsed = Date.now() - startTime;
@@ -2571,7 +3432,7 @@ function AppContent() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, []); // Only run once on mount - empty dependency array
 
   // Migrate: add inferred serving sizes for existing known foods that don't have one
   useEffect(() => {
@@ -2590,6 +3451,224 @@ function AppContent() {
       persistFoodServingGrams(next);
     }
   }, [hydrated, knownFoods]);
+
+  // Meal reminder: schedule or cancel based on settings and whether user logged a meal today
+  const dataByDateRef = useRef(dataByDate);
+  const mealReminderSettingsRef = useRef(mealReminderSettings);
+  dataByDateRef.current = dataByDate;
+  mealReminderSettingsRef.current = mealReminderSettings;
+
+  const getOrCreateReminderDeviceId = useCallback(async (): Promise<string> => {
+    if (reminderDeviceIdRef.current) return reminderDeviceIdRef.current;
+    const existing = await AsyncStorage.getItem(REMINDER_DEVICE_ID_KEY);
+    if (existing) {
+      reminderDeviceIdRef.current = existing;
+      return existing;
+    }
+    const created = `dev_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    reminderDeviceIdRef.current = created;
+    await AsyncStorage.setItem(REMINDER_DEVICE_ID_KEY, created);
+    return created;
+  }, []);
+
+  const getExpoPushTokenForReminderSync = useCallback(
+    async (enabled: boolean): Promise<string | null> => {
+      if (reminderPushTokenRef.current) return reminderPushTokenRef.current;
+
+      const stored = await AsyncStorage.getItem(REMINDER_PUSH_TOKEN_KEY);
+      if (stored) {
+        reminderPushTokenRef.current = stored;
+        return stored;
+      }
+
+      // If reminders are disabled and there is no stored token, don't force permission prompt.
+      if (!enabled) return null;
+
+      const granted = await requestMealReminderPermission();
+      if (!granted) return null;
+
+      try {
+        const tokenResponse = await Notifications.getExpoPushTokenAsync();
+        const token = tokenResponse?.data?.trim();
+        if (!token) return null;
+        reminderPushTokenRef.current = token;
+        await AsyncStorage.setItem(REMINDER_PUSH_TOKEN_KEY, token);
+        return token;
+      } catch (err) {
+        console.warn("Failed to fetch Expo push token:", err);
+        return null;
+      }
+    },
+    []
+  );
+
+  const syncMealReminderStateToBackend = useCallback(
+    async (settings: MealReminderSettings, hasLoggedMealToday: boolean): Promise<void> => {
+      const token = await getExpoPushTokenForReminderSync(settings.enabled);
+      if (!token) return;
+
+      const deviceId = await getOrCreateReminderDeviceId();
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+      const statusDayKey = toDateKey(new Date());
+
+      try {
+        await fetch(`${API_BASE_URL}/notifications/state`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            deviceId,
+            expoPushToken: token,
+            timezone,
+            reminderEnabled: settings.enabled,
+            reminderHour: settings.hour,
+            reminderMinute: settings.minute,
+            hasLoggedMealToday,
+            statusDayKey
+          })
+        });
+      } catch (err) {
+        console.warn("Failed to sync reminder state to backend:", err);
+      }
+    },
+    [getExpoPushTokenForReminderSync, getOrCreateReminderDeviceId]
+  );
+
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      const todayKey = toDateKey(new Date());
+      const dayData = dataByDateRef.current[todayKey] ?? getDefaultDayData();
+      const hasMealsToday = dayHasMeals(dayData);
+      updateMealReminderSchedule(mealReminderSettingsRef.current, hasMealsToday).catch((err) => {
+        console.warn("Failed to update meal reminder schedule:", err);
+      });
+      syncMealReminderStateToBackend(mealReminderSettingsRef.current, hasMealsToday).catch((err) => {
+        console.warn("Failed to sync reminder state:", err);
+      });
+    } catch (err) {
+      console.warn("Error in meal reminder effect:", err);
+    }
+  }, [hydrated, mealReminderSettings, dataByDate, syncMealReminderStateToBackend]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state !== "active") return;
+      try {
+        const todayKey = toDateKey(new Date());
+        const dayData = dataByDateRef.current[todayKey] ?? getDefaultDayData();
+        const hasMealsToday = dayHasMeals(dayData);
+        updateMealReminderSchedule(mealReminderSettingsRef.current, hasMealsToday).catch((err) => {
+          console.warn("Failed to update meal reminder schedule on app resume:", err);
+        });
+        syncMealReminderStateToBackend(mealReminderSettingsRef.current, hasMealsToday).catch((err) => {
+          console.warn("Failed to sync reminder state on app resume:", err);
+        });
+      } catch (err) {
+        console.warn("Error updating meal reminder on app resume:", err);
+      }
+    });
+    return () => sub.remove();
+  }, [hydrated, syncMealReminderStateToBackend]);
+
+  // Handle notification taps - navigate to home when user taps notification
+  useEffect(() => {
+    if (!hydrated) return;
+
+    // Check if app was launched from a notification
+    const isMealReminderResponse = (response: Notifications.NotificationResponse | null): boolean => {
+      if (!response) return false;
+      const identifier = response.notification.request.identifier || "";
+      if (identifier.startsWith(MEAL_REMINDER_ID)) return true;
+      const data = response.notification.request.content.data as Record<string, unknown> | undefined;
+      return data?.type === "meal_reminder";
+    };
+
+    Notifications.getLastNotificationResponseAsync()
+      .then((response) => {
+        if (isMealReminderResponse(response)) {
+          setView("home");
+        }
+      })
+      .catch(() => {});
+
+    // Listen for notification taps while app is running
+    const subscription = Notifications.addNotificationResponseReceivedListener((response) => {
+      if (isMealReminderResponse(response)) {
+        setView("home");
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [hydrated]);
+
+  // Check for new insights
+  useEffect(() => {
+    if (!hydrated || Object.keys(dataByDate).length === 0) return;
+
+    const past = getPastDatesWithMeals(dataByDate, todayKey);
+    const latestDayWithMeals = past.length > 0 ? past[0] : null;
+    
+    // Check for new day insights - if there's a day with meals newer than last viewed
+    if (latestDayWithMeals) {
+      if (!insightsLastViewed || latestDayWithMeals > insightsLastViewed) {
+        setHasNewDayInsights(true);
+      } else {
+        setHasNewDayInsights(false);
+      }
+    } else {
+      setHasNewDayInsights(false);
+    }
+
+    // Check for new week insights (if there are 7+ days of data)
+    const { daysWithMeals } = aggregateWeekData(dataByDate, todayKey);
+    if (daysWithMeals >= 7) {
+      // Check if there's any new data in the past 7 days since last view
+      const sevenDaysAgo = addDays(todayKey, -6); // Past 7 days including today
+      let hasNewWeekData = false;
+      
+      if (!insightsLastViewed) {
+        // Never viewed before, so any data in past 7 days is new
+        hasNewWeekData = true;
+      } else {
+        // Check if any day in past 7 days is newer than last viewed
+        for (let i = 0; i <= 6; i++) {
+          const dateKey = addDays(todayKey, -i);
+          if (dateKey > insightsLastViewed) {
+            const day = dataByDate[dateKey];
+            if (day && dayHasMeals(day)) {
+              hasNewWeekData = true;
+              break;
+            }
+          }
+        }
+      }
+      
+      setHasNewWeekInsights(hasNewWeekData);
+    } else {
+      setHasNewWeekInsights(false);
+    }
+  }, [hydrated, dataByDate, todayKey, insightsLastViewed]);
+
+  // Mark insights as viewed when user opens Insights tab or switches sub-tabs
+  useEffect(() => {
+    if (activeTab === "insights" && hydrated) {
+      const markAsViewed = async () => {
+        try {
+          await AsyncStorage.setItem(INSIGHTS_LAST_VIEWED_KEY, todayKey);
+          setInsightsLastViewed(todayKey);
+          // Clear indicators when viewing the tab
+          setHasNewDayInsights(false);
+          setHasNewWeekInsights(false);
+        } catch (err) {
+          console.warn("Failed to save insights viewed date:", err);
+        }
+      };
+      markAsViewed();
+    }
+  }, [activeTab, insightsSubTab, hydrated, todayKey]);
 
   // Debug: Log view changes
   useEffect(() => {
@@ -2632,7 +3711,7 @@ function AppContent() {
 
   const slideAnim = useRef(new Animated.Value(0)).current;
   const screenWidth = Dimensions.get("window").width;
-  const SIDEBAR_WIDTH = Math.min(280, screenWidth * 0.78);
+  const SIDEBAR_WIDTH = screenWidth;
   const sidebarAnim = useRef(new Animated.Value(-SIDEBAR_WIDTH)).current;
 
   useEffect(() => {
@@ -2835,11 +3914,194 @@ function AppContent() {
     }
   }, [selectedFoodItem]);
 
+  const analyzeMealPhoto = useCallback(
+    async (imageBase64: string, mimeType?: string) => {
+      let progressTimer: ReturnType<typeof setInterval> | null = null;
+      try {
+        setMealPhotoAnalyzing(true);
+        setMealPhotoProgress(6);
+        setMealPhotoStatusText("Analyzing photo...");
+        setError(null);
+
+        progressTimer = setInterval(() => {
+          setMealPhotoProgress((prev) => {
+            if (prev >= 92) return prev;
+            return Math.min(92, prev + Math.max(2, Math.round((92 - prev) * 0.18)));
+          });
+        }, 320);
+
+        const res = await fetch(`${API_BASE_URL}/meals/photo-describe`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            imageBase64,
+            mimeType: mimeType || "image/jpeg"
+          })
+        });
+
+        if (!res.ok) {
+          const payload = await res.json().catch(() => ({}));
+          throw new Error(payload?.error || "Failed to analyze meal photo.");
+        }
+
+        const payload = (await res.json()) as {
+          descriptionText?: string;
+          items?: Array<{ quantity?: number; unit?: string; name?: string }>;
+        };
+
+        const fromDescription = (payload.descriptionText || "").trim();
+        const fromItems = (payload.items || [])
+          .filter((item) => item && item.name && String(item.name).trim().length > 0)
+          .map((item) => `${item.quantity || 1} ${item.unit || "serving"} ${String(item.name).trim()}`)
+          .join("\n");
+        const nextDescription = fromDescription || fromItems;
+
+        if (!nextDescription) {
+          throw new Error("Could not identify foods in that image. Try retaking with better lighting.");
+        }
+
+        setMealPhotoStatusText("Applying detected foods...");
+        setMealPhotoProgress(98);
+        setEntryText((prev) => (prev.trim() ? `${prev.trim()}\n${nextDescription}` : nextDescription));
+        setAddComposerTab("text");
+        setTimeout(() => addInputRef.current?.focus(), 120);
+      } finally {
+        if (progressTimer) {
+          clearInterval(progressTimer);
+        }
+        setMealPhotoProgress(100);
+        setTimeout(() => {
+          setMealPhotoAnalyzing(false);
+          setMealPhotoStatusText("Analyzing photo...");
+          setMealPhotoProgress(0);
+        }, 250);
+      }
+    },
+    []
+  );
+
+  const handleTakeMealPhoto = useCallback(async () => {
+    Keyboard.dismiss();
+    try {
+      const permission = cameraPermission?.granted
+        ? cameraPermission
+        : await requestCameraPermission();
+      if (!permission?.granted) {
+        setError("Camera permission is required to analyze meal photos.");
+        return;
+      }
+      if (!cameraRef.current) {
+        setError("Camera is still loading. Please try again.");
+        return;
+      }
+
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.25,
+        base64: true,
+        skipProcessing: true
+      });
+      if (!photo?.base64) {
+        setError("Could not process that image. Please try again.");
+        return;
+      }
+
+      // Keep payload safely below backend/OpenAI limits.
+      if (photo.base64.length > 5_500_000) {
+        setError("Photo is too large to analyze. Please move a bit farther away and retake.");
+        return;
+      }
+      setMealPhotoUri(photo.uri || null);
+      await analyzeMealPhoto(photo.base64, "image/jpeg");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to analyze meal photo.";
+      setError(message);
+      maybeShowNoFoodFoundAlert(message);
+      setMealPhotoAnalyzing(false);
+      setMealPhotoProgress(0);
+    }
+  }, [analyzeMealPhoto, cameraPermission, maybeShowNoFoodFoundAlert, requestCameraPermission]);
+
+  const handlePickMealPhotoFromGallery = useCallback(async () => {
+    Keyboard.dismiss();
+    try {
+      const mediaPermission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!mediaPermission.granted) {
+        setError("Photo library permission is required to choose meal photos.");
+        return;
+      }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: false,
+        quality: 0.25,
+        base64: true,
+        selectionLimit: 1
+      });
+      if (result.canceled) return;
+
+      const asset = result.assets?.[0];
+      if (!asset?.base64) {
+        setError("Could not process that image. Please try another photo.");
+        return;
+      }
+
+      if (asset.base64.length > 5_500_000) {
+        setError("Photo is too large to analyze. Please choose a smaller image.");
+        return;
+      }
+
+      setMealPhotoUri(asset.uri || null);
+      await analyzeMealPhoto(asset.base64, asset.mimeType || "image/jpeg");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to analyze meal photo.";
+      setError(message);
+      maybeShowNoFoodFoundAlert(message);
+      setMealPhotoAnalyzing(false);
+      setMealPhotoProgress(0);
+    }
+  }, [analyzeMealPhoto, maybeShowNoFoodFoundAlert]);
+
+  const handleSelectPhotoTab = useCallback(async () => {
+    if (mealPhotoAnalyzing) return;
+    if (isPro) {
+      setAddComposerTab("photo");
+      return;
+    }
+    const purchased = await presentPaywall();
+    if (purchased) {
+      setAddComposerTab("photo");
+    }
+  }, [isPro, mealPhotoAnalyzing, presentPaywall]);
+
+  useEffect(() => {
+    if (view !== "add" || isTemplateMode || addComposerTab !== "photo") return;
+    if (hasAutoOpenedCamera) return;
+    setHasAutoOpenedCamera(true);
+    if (!cameraPermission?.granted) {
+      requestCameraPermission().catch(() => {
+        setError("Camera permission is required to analyze meal photos.");
+      });
+    }
+  }, [
+    view,
+    isTemplateMode,
+    addComposerTab,
+    hasAutoOpenedCamera,
+    cameraPermission?.granted,
+    requestCameraPermission
+  ]);
+
   const openAdd = (mealId: string) => {
     setSelectedMealId(mealId);
     setError(null);
     setIsTemplateMode(false);
     setEditingTemplateId(null);
+    setMealPhotoUri(null);
+    setMealPhotoAnalyzing(false);
+    setMealPhotoProgress(0);
+    setAddComposerTab("text");
+    setAddKeyboardOffset(0);
+    setHasAutoOpenedCamera(false);
     setView("add");
   };
 
@@ -2971,7 +4233,30 @@ function AppContent() {
       }
 
       await persistData(next);
+      
+      // Mark that user has logged a meal
+      try {
+        const hasLoggedMeal = await AsyncStorage.getItem(HAS_LOGGED_MEAL_KEY);
+        if (!hasLoggedMeal) {
+          await AsyncStorage.setItem(HAS_LOGGED_MEAL_KEY, "true");
+        }
+      } catch (err) {
+        console.warn("Error marking meal as logged:", err);
+      }
+      
+      if (selectedDate === todayKey) {
+        updateMealReminderSchedule(mealReminderSettings, true).catch((err) => {
+          console.warn("Failed to cancel meal reminder after logging meal:", err);
+        });
+        syncMealReminderStateToBackend(mealReminderSettings, true).catch((err) => {
+          console.warn("Failed to sync reminder state after logging meal:", err);
+        });
+      }
       setEntryText("");
+      setMealPhotoUri(null);
+      setMealPhotoAnalyzing(false);
+      setMealPhotoProgress(0);
+      setAddComposerTab("text");
       setView("home");
     } catch (err) {
       let message = "Unknown error";
@@ -3119,7 +4404,7 @@ function AppContent() {
     }
   }, []);
 
-  const handleSaveProfile = async () => {
+  const buildProfileFromInputs = (): UserProfile => {
     const heightNum = heightValue ? parseFloat(heightValue) : null;
     const heightInCm = heightNum 
       ? (heightUnit === "in" ? heightNum * 2.54 : heightNum)
@@ -3144,7 +4429,7 @@ function AppContent() {
         }
       }
     }
-    
+
     const updatedProfile: UserProfile = {
       dateOfBirth: formattedDate,
       genderAtBirth: userProfile.genderAtBirth,
@@ -3152,13 +4437,486 @@ function AppContent() {
       heightUnit: heightUnit,
       weightKg: weightInKg,
       goal: userProfile.goal,
-      activityLevel: userProfile.activityLevel
+      activityLevel: userProfile.activityLevel,
+      customTargets: userProfile.customTargets ?? null
+    };
+    return updatedProfile;
+  };
+
+  const handleSaveProfile = async () => {
+    const calories = parseFloat(customCaloriesInput);
+    const protein = parseFloat(customProteinInput);
+    const carbs = parseFloat(customCarbsInput);
+    const fat = parseFloat(customFatInput);
+    const hasCustomInputs = [calories, protein, carbs, fat].every((n) => Number.isFinite(n));
+    if (hasCustomInputs) {
+      if (calories < 800 || calories > 6000) {
+        setCustomTargetError("Calories must be between 800 and 6000.");
+        return;
+      }
+      if (protein < 20 || protein > 400 || carbs < 20 || carbs > 700 || fat < 10 || fat > 250) {
+        setCustomTargetError("Protein/carbs/fat values are out of range.");
+        return;
+      }
+      setCustomTargetError(null);
+    }
+
+    const baseProfile = buildProfileFromInputs();
+    const updatedProfile: UserProfile = {
+      ...baseProfile,
+      customTargets: hasCustomInputs
+        ? {
+            calories_kcal: Math.round(calories),
+            protein_g: Math.round(protein),
+            carbs_g: Math.round(carbs),
+            fat_g: Math.round(fat)
+          }
+        : null
     };
     
     setUserProfile(updatedProfile);
     await persistProfile(updatedProfile);
+    await persistMealReminder(mealReminderSettings);
+    try {
+      const todayKey = toDateKey(new Date());
+      const dayData = dataByDate[todayKey] ?? getDefaultDayData();
+      const hasMealsToday = dayHasMeals(dayData);
+      updateMealReminderSchedule(mealReminderSettings, hasMealsToday).catch((err) => {
+        console.warn("Failed to update meal reminder schedule after saving profile:", err);
+      });
+      syncMealReminderStateToBackend(mealReminderSettings, hasMealsToday).catch((err) => {
+        console.warn("Failed to sync reminder state after saving profile:", err);
+      });
+    } catch (err) {
+      console.warn("Error updating meal reminder schedule:", err);
+    }
     setView("home");
   };
+
+  const handleFinishOnboarding = async () => {
+    const calories = parseFloat(customCaloriesInput);
+    const protein = parseFloat(customProteinInput);
+    const carbs = parseFloat(customCarbsInput);
+    const fat = parseFloat(customFatInput);
+    if (!Number.isFinite(calories) || !Number.isFinite(protein) || !Number.isFinite(carbs) || !Number.isFinite(fat)) {
+      setCustomTargetError("Please enter all recommendation values.");
+      return;
+    }
+    if (calories < 800 || calories > 6000) {
+      setCustomTargetError("Calories must be between 800 and 6000.");
+      return;
+    }
+    if (protein < 20 || protein > 400 || carbs < 20 || carbs > 700 || fat < 10 || fat > 250) {
+      setCustomTargetError("Protein/carbs/fat values are out of range.");
+      return;
+    }
+    setCustomTargetError(null);
+    const updatedProfile = {
+      ...buildProfileFromInputs(),
+      customTargets: {
+        calories_kcal: Math.round(calories),
+        protein_g: Math.round(protein),
+        carbs_g: Math.round(carbs),
+        fat_g: Math.round(fat)
+      }
+    };
+    setUserProfile(updatedProfile);
+    await persistProfile(updatedProfile);
+    setView("home");
+    if (!isPro) {
+      hasShownLaunchPaywallRef.current = true;
+      setTimeout(() => {
+        presentPaywall().catch((err) => {
+          console.warn("Failed to present paywall after onboarding:", err);
+        });
+      }, 220);
+    }
+  };
+
+  if (view === "onboarding") {
+    const goalOptions = [
+      { id: "weight_loss", label: "Lose weight" },
+      { id: "weight_gain", label: "Gain weight" },
+      { id: "maintain_weight", label: "Maintain weight" },
+      { id: "muscle_gain", label: "Build muscle" },
+      { id: "reduce_cholesterol", label: "Reduce cholesterol" },
+      { id: "diabetes_management", label: "Manage diabetes" },
+      { id: "heart_health", label: "Healthy heart" }
+    ] as const;
+    const activityOptions = [
+      { id: "low", label: "Low" },
+      { id: "medium", label: "Moderate" },
+      { id: "high", label: "High" }
+    ] as const;
+    const genderOptions = [
+      { id: "male", label: "Male" },
+      { id: "female", label: "Female" },
+      { id: "other", label: "Other" }
+    ] as const;
+    const genderLabel =
+      genderOptions.find((g) => g.id === userProfile.genderAtBirth)?.label || "Select";
+    const activityLabel =
+      activityOptions.find((a) => a.id === userProfile.activityLevel)?.label || "Select";
+    const dobDate = (() => {
+      const m = dobValue.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (!m) return new Date(1980, 0, 1);
+      const day = parseInt(m[1], 10);
+      const month = parseInt(m[2], 10);
+      const year = parseInt(m[3], 10);
+      if (!Number.isFinite(day) || !Number.isFinite(month) || !Number.isFinite(year)) {
+        return new Date(1980, 0, 1);
+      }
+      return new Date(year, Math.max(0, month - 1), Math.max(1, day));
+    })();
+    const onboardingDobIso = (() => {
+      const m = dobValue.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (!m) return null;
+      const day = parseInt(m[1], 10);
+      const month = parseInt(m[2], 10);
+      const year = parseInt(m[3], 10);
+      if (!Number.isFinite(day) || !Number.isFinite(month) || !Number.isFinite(year)) return null;
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    })();
+    const onboardingAge = onboardingDobIso ? getAgeFromDOB(onboardingDobIso) : null;
+    const targets = getMacroTargets({
+      ...userProfile,
+      heightCm: heightValue ? (heightUnit === "in" ? parseFloat(heightValue) * 2.54 : parseFloat(heightValue)) : null,
+      weightKg: weightValue ? (weightUnit === "lbs" ? parseFloat(weightValue) / 2.20462 : parseFloat(weightValue)) : null
+    });
+    const canContinueFromGoal = Boolean(userProfile.goal);
+    const canContinueFromProfile =
+      Boolean(dobValue && userProfile.genderAtBirth && heightValue && weightValue && userProfile.activityLevel);
+
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.onboardingContainer}>
+          {onboardingStep === 0 && (
+            <>
+              <Text style={styles.onboardingTitle}>Let’s personalize your plan</Text>
+              <Text style={styles.onboardingSubtitle}>
+                A few quick questions to tailor calories, macros, and meal suggestions.
+              </Text>
+              <TouchableOpacity
+                style={styles.primaryButton}
+                onPress={() => setOnboardingStep(1)}
+              >
+                <Text style={styles.primaryButtonText}>Get started</Text>
+              </TouchableOpacity>
+            </>
+          )}
+
+          {onboardingStep === 1 && (
+            <>
+              <Text style={styles.onboardingTitle}>What’s your main goal?</Text>
+              <View style={styles.onboardingList}>
+                {goalOptions.map((g) => (
+                  <TouchableOpacity
+                    key={g.id}
+                    style={styles.onboardingListRow}
+                    onPress={() => setUserProfile((prev) => ({ ...prev, goal: g.id }))}
+                  >
+                    <Text style={styles.onboardingListText}>{g.label}</Text>
+                    <Text style={styles.onboardingListCheck}>
+                      {userProfile.goal === g.id ? "✓" : ""}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <Text style={styles.onboardingFootnote}>You can change this anytime</Text>
+              <TouchableOpacity
+                style={[styles.primaryButton, !canContinueFromGoal && styles.primaryButtonDisabled]}
+                onPress={() => canContinueFromGoal && setOnboardingStep(2)}
+                disabled={!canContinueFromGoal}
+              >
+                <Text style={styles.primaryButtonText}>Next</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setOnboardingStep(0)} style={styles.onboardingBackLink}>
+                <Text style={styles.onboardingBackLinkText}>Previous</Text>
+              </TouchableOpacity>
+            </>
+          )}
+
+          {onboardingStep === 2 && (
+            <>
+              <Text style={styles.onboardingTitle}>Basic Profile</Text>
+              <Text style={styles.onboardingSubtitleSmall}>Tell us about you</Text>
+              <View style={styles.onboardingList}>
+                <View style={styles.onboardingFieldRow}>
+                  <View style={styles.onboardingDobLabelWrap}>
+                    <Text style={styles.onboardingFieldLabel}>Date of birth</Text>
+                    {onboardingAge !== null ? (
+                      <Text style={styles.onboardingAgeText}>({onboardingAge} years)</Text>
+                    ) : null}
+                  </View>
+                  <TouchableOpacity
+                    style={styles.onboardingFieldInput}
+                    onPress={() => {
+                      setOnboardingDobDraft(dobDate);
+                      setShowOnboardingDobPicker(true);
+                    }}
+                  >
+                    <Text style={styles.onboardingFieldInputText}>{dobValue || "Select"}</Text>
+                  </TouchableOpacity>
+                </View>
+                <View style={styles.onboardingFieldRow}>
+                  <Text style={styles.onboardingFieldLabel}>Gender</Text>
+                  <TouchableOpacity
+                    style={styles.onboardingFieldInput}
+                    onPress={() => setShowOnboardingGenderDropdown(true)}
+                  >
+                    <Text style={styles.onboardingFieldInputText}>{genderLabel}</Text>
+                  </TouchableOpacity>
+                </View>
+                <View style={styles.onboardingFieldRow}>
+                  <Text style={styles.onboardingFieldLabel}>Height</Text>
+                  <View style={styles.inlineInputRow}>
+                    <TextInput
+                      value={heightValue}
+                      onChangeText={setHeightValue}
+                      placeholder="181"
+                      style={styles.onboardingFieldInputSmall}
+                      keyboardType="decimal-pad"
+                    />
+                    <TouchableOpacity
+                      style={styles.onboardingUnitText}
+                      onPress={() => setShowOnboardingHeightUnitDropdown(true)}
+                    >
+                      <Text style={styles.onboardingFieldInputText}>{heightUnit}</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+                <View style={styles.onboardingFieldRow}>
+                  <Text style={styles.onboardingFieldLabel}>Current weight</Text>
+                  <View style={styles.inlineInputRow}>
+                    <TextInput
+                      value={weightValue}
+                      onChangeText={setWeightValue}
+                      placeholder="72.5"
+                      style={styles.onboardingFieldInputSmall}
+                      keyboardType="decimal-pad"
+                    />
+                    <TouchableOpacity
+                      style={styles.onboardingUnitText}
+                      onPress={() => setShowOnboardingWeightUnitDropdown(true)}
+                    >
+                      <Text style={styles.onboardingFieldInputText}>{weightUnit}</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+                <View style={styles.onboardingFieldRow}>
+                  <Text style={styles.onboardingFieldLabel}>Activity level</Text>
+                  <TouchableOpacity
+                    style={styles.onboardingFieldInput}
+                    onPress={() => setShowOnboardingActivityDropdown(true)}
+                  >
+                    <Text style={styles.onboardingFieldInputText}>{activityLabel}</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+              <Text style={styles.onboardingFootnote}>You can change this anytime</Text>
+              <TouchableOpacity
+                style={[styles.primaryButton, !canContinueFromProfile && styles.primaryButtonDisabled]}
+                onPress={() => {
+                  if (!canContinueFromProfile) return;
+                  setCustomCaloriesInput(String(Math.round(targets.calories_kcal)));
+                  setCustomProteinInput(String(Math.round(targets.protein_g)));
+                  setCustomCarbsInput(String(Math.round(targets.carbs_g)));
+                  setCustomFatInput(String(Math.round(targets.fat_g)));
+                  setOnboardingStep(3);
+                }}
+                disabled={!canContinueFromProfile}
+              >
+                <Text style={styles.primaryButtonText}>Next</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setOnboardingStep(1)} style={styles.onboardingBackLink}>
+                <Text style={styles.onboardingBackLinkText}>Previous</Text>
+              </TouchableOpacity>
+            </>
+          )}
+
+          {onboardingStep === 3 && (
+            <>
+              <Text style={styles.onboardingTitle}>Our recommendation</Text>
+              <Text style={styles.onboardingSubtitleSmall}>Daily values based on your input</Text>
+              <View style={styles.onboardingList}>
+                <View style={styles.onboardingSummaryRow}>
+                  <Text style={styles.onboardingFieldLabel}>Calories (kcal)</Text>
+                  <TextInput
+                    value={customCaloriesInput}
+                    onChangeText={setCustomCaloriesInput}
+                    style={styles.onboardingValueInput}
+                    keyboardType="numeric"
+                  />
+                </View>
+                <View style={styles.onboardingSummaryRow}>
+                  <Text style={styles.onboardingFieldLabel}>Protein (g)</Text>
+                  <TextInput
+                    value={customProteinInput}
+                    onChangeText={setCustomProteinInput}
+                    style={styles.onboardingValueInput}
+                    keyboardType="numeric"
+                  />
+                </View>
+                <View style={styles.onboardingSummaryRow}>
+                  <Text style={styles.onboardingFieldLabel}>Carbohydrates (g)</Text>
+                  <TextInput
+                    value={customCarbsInput}
+                    onChangeText={setCustomCarbsInput}
+                    style={styles.onboardingValueInput}
+                    keyboardType="numeric"
+                  />
+                </View>
+                <View style={styles.onboardingSummaryRow}>
+                  <Text style={styles.onboardingFieldLabel}>Fat(g)</Text>
+                  <TextInput
+                    value={customFatInput}
+                    onChangeText={setCustomFatInput}
+                    style={styles.onboardingValueInput}
+                    keyboardType="numeric"
+                  />
+                </View>
+              </View>
+              <Text style={styles.onboardingFootnote}>You can change this anytime</Text>
+              {customTargetError ? <Text style={styles.addError}>{customTargetError}</Text> : null}
+              <TouchableOpacity style={styles.primaryButton} onPress={handleFinishOnboarding}>
+                <Text style={styles.primaryButtonText}>Start tracking</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setOnboardingStep(2)} style={styles.onboardingBackLink}>
+                <Text style={styles.onboardingBackLinkText}>Previous</Text>
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+        <Modal visible={showOnboardingDobPicker} transparent animationType="fade">
+          <TouchableOpacity
+            style={styles.modalOverlay}
+            activeOpacity={1}
+            onPress={() => setShowOnboardingDobPicker(false)}
+          >
+            <TouchableOpacity activeOpacity={1} style={styles.onboardingDobModal} onPress={() => {}}>
+              <View style={styles.onboardingDobModalHeader}>
+                <TouchableOpacity onPress={() => setShowOnboardingDobPicker(false)}>
+                  <Text style={styles.manageSubscriptionButtonText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => {
+                    const d = onboardingDobDraft.getDate();
+                    const m = onboardingDobDraft.getMonth() + 1;
+                    const y = onboardingDobDraft.getFullYear();
+                    setDobValue(`${String(d).padStart(2, "0")}/${String(m).padStart(2, "0")}/${y}`);
+                    setShowOnboardingDobPicker(false);
+                  }}
+                >
+                  <Text style={styles.manageSubscriptionButtonText}>Done</Text>
+                </TouchableOpacity>
+              </View>
+              <DateTimePicker
+                value={onboardingDobDraft}
+                mode="date"
+                maximumDate={new Date()}
+                display={Platform.OS === "ios" ? "spinner" : "default"}
+                onChange={(event, selectedDate) => {
+                  if (event.type === "dismissed" || !selectedDate) return;
+                  setOnboardingDobDraft(selectedDate);
+                }}
+              />
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </Modal>
+        <Modal visible={showOnboardingGenderDropdown} transparent animationType="fade">
+          <TouchableOpacity
+            style={styles.modalOverlay}
+            activeOpacity={1}
+            onPress={() => setShowOnboardingGenderDropdown(false)}
+          >
+            <View style={styles.dropdownContent}>
+              {genderOptions.map((option) => (
+                <TouchableOpacity
+                  key={option.id}
+                  style={styles.dropdownItem}
+                  onPress={() => {
+                    setUserProfile((prev) => ({ ...prev, genderAtBirth: option.id }));
+                    setShowOnboardingGenderDropdown(false);
+                  }}
+                >
+                  <Text style={styles.dropdownItemText}>{option.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </TouchableOpacity>
+        </Modal>
+        <Modal visible={showOnboardingHeightUnitDropdown} transparent animationType="fade">
+          <TouchableOpacity
+            style={styles.modalOverlay}
+            activeOpacity={1}
+            onPress={() => setShowOnboardingHeightUnitDropdown(false)}
+          >
+            <View style={styles.dropdownContent}>
+              {["cm", "in"].map((unit) => (
+                <TouchableOpacity
+                  key={unit}
+                  style={styles.dropdownItem}
+                  onPress={() => {
+                    setHeightUnit(unit as "cm" | "in");
+                    setShowOnboardingHeightUnitDropdown(false);
+                  }}
+                >
+                  <Text style={styles.dropdownItemText}>{unit}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </TouchableOpacity>
+        </Modal>
+        <Modal visible={showOnboardingWeightUnitDropdown} transparent animationType="fade">
+          <TouchableOpacity
+            style={styles.modalOverlay}
+            activeOpacity={1}
+            onPress={() => setShowOnboardingWeightUnitDropdown(false)}
+          >
+            <View style={styles.dropdownContent}>
+              {["kg", "lbs"].map((unit) => (
+                <TouchableOpacity
+                  key={unit}
+                  style={styles.dropdownItem}
+                  onPress={() => {
+                    setWeightUnit(unit as "kg" | "lbs");
+                    setShowOnboardingWeightUnitDropdown(false);
+                  }}
+                >
+                  <Text style={styles.dropdownItemText}>{unit}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </TouchableOpacity>
+        </Modal>
+        <Modal visible={showOnboardingActivityDropdown} transparent animationType="fade">
+          <TouchableOpacity
+            style={styles.modalOverlay}
+            activeOpacity={1}
+            onPress={() => setShowOnboardingActivityDropdown(false)}
+          >
+            <View style={styles.dropdownContent}>
+              {activityOptions.map((option) => (
+                <TouchableOpacity
+                  key={option.id}
+                  style={styles.dropdownItem}
+                  onPress={() => {
+                    setUserProfile((prev) => ({
+                      ...prev,
+                      activityLevel: option.id as "low" | "medium" | "high"
+                    }));
+                    setShowOnboardingActivityDropdown(false);
+                  }}
+                >
+                  <Text style={styles.dropdownItemText}>{option.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </TouchableOpacity>
+        </Modal>
+      </SafeAreaView>
+    );
+  }
 
   // Show personal details screen - CHECK THIS FIRST BEFORE ANY OTHER VIEWS
   if (view === "personal") {
@@ -3235,11 +4993,13 @@ function AppContent() {
 
     const genderOptions = [
       { label: "Male", value: "male" },
-      { label: "Female", value: "female" }
+      { label: "Female", value: "female" },
+      { label: "Other", value: "other" }
     ];
 
     const goalOptions = goals.map((g) => ({ label: g.label, value: g.id }));
     const activityOptions = activityLevels.map((a) => ({ label: a.label, value: a.id }));
+    const currentTargets = getMacroTargets(userProfile);
 
     return (
       <SafeAreaView style={styles.container}>
@@ -3261,15 +5021,17 @@ function AppContent() {
         >
           {/* SUBSCRIPTION */}
           <View style={styles.fieldRow}>
-            <Text style={styles.fieldLabel}>SUBSCRIPTION</Text>
-            <TouchableOpacity
-              style={styles.fieldValue}
-              onPress={() => presentCustomerCenter()}
-            >
-              <Text style={styles.fieldValueText}>
+            <Text style={styles.fieldLabel}>Subscription</Text>
+            <View style={styles.subscriptionRightRow}>
+              <Text style={styles.subscriptionStatusText}>
                 {subscriptionLoading ? "Loading..." : isPro ? "Pro" : "Free"}
               </Text>
-            </TouchableOpacity>
+              {!subscriptionLoading && !isPro ? (
+                <TouchableOpacity style={styles.upgradeInlineButton} onPress={() => presentPaywall()}>
+                  <Text style={styles.upgradeInlineButtonText}>Upgrade</Text>
+                </TouchableOpacity>
+              ) : null}
+            </View>
           </View>
           <TouchableOpacity
             style={styles.manageSubscriptionButton}
@@ -3278,70 +5040,53 @@ function AppContent() {
             <Text style={styles.manageSubscriptionButtonText}>Manage Subscription</Text>
           </TouchableOpacity>
 
+          <Text style={styles.personalSectionTitle}>PROFILE</Text>
+
           {/* DATE OF BIRTH */}
           {(() => {
-            let isValidDob = true;
-            if (dobValue) {
-              const match = dobValue.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-              if (!match) {
-                isValidDob = false;
-              } else {
-                const [, d, m, y] = match;
-                const day = parseInt(d, 10);
-                const month = parseInt(m, 10);
-                const year = parseInt(y, 10);
-                if (
-                  isNaN(day) ||
-                  isNaN(month) ||
-                  isNaN(year) ||
-                  day < 1 ||
-                  day > 31 ||
-                  month < 1 ||
-                  month > 12
-                ) {
-                  isValidDob = false;
-                }
-              }
-            }
-
-            const renderAge = () => {
-              if (!dobValue || !isValidDob) return null;
-              const [d, m, y] = dobValue.split("/");
-              const day = parseInt(d, 10);
-              const month = parseInt(m, 10);
-              const year = parseInt(y, 10);
-              if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
-              const iso = `${year}-${String(month).padStart(2, "0")}-${String(
-                day
-              ).padStart(2, "0")}`;
-              const age = getAgeFromDOB(iso);
-              return age ? <Text style={styles.helperText}>Age: {age} years</Text> : null;
-            };
+            const match = dobValue.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+            const day = match ? parseInt(match[1], 10) : NaN;
+            const month = match ? parseInt(match[2], 10) : NaN;
+            const year = match ? parseInt(match[3], 10) : NaN;
+            const isValidDob =
+              !!match &&
+              Number.isFinite(day) &&
+              Number.isFinite(month) &&
+              Number.isFinite(year) &&
+              day >= 1 &&
+              day <= 31 &&
+              month >= 1 &&
+              month <= 12;
+            const dobDate = isValidDob ? new Date(year, month - 1, day) : new Date(1990, 0, 1);
+            const dobIso = isValidDob
+              ? `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
+              : null;
+            const age = dobIso ? getAgeFromDOB(dobIso) : null;
 
             return (
               <>
                 <View style={styles.fieldRow}>
-                  <Text style={styles.fieldLabel}>DATE OF BIRTH</Text>
-                  <TextInput
-                    style={[
-                      styles.fieldValue,
-                      styles.fieldValueInput,
-                      !isValidDob && styles.fieldValueError
-                    ]}
-                    value={dobValue}
-                    onChangeText={setDobValue}
-                    placeholder="dd/mm/yyyy"
-                    keyboardType="numbers-and-punctuation"
-                  />
+                  <View style={styles.fieldLabelRow}>
+                    <Text style={styles.fieldLabel}>Date of birth</Text>
+                    {age ? <Text style={styles.fieldMetaText}>({age} years)</Text> : null}
+                  </View>
+                  <TouchableOpacity
+                    style={styles.fieldValue}
+                    onPress={() => {
+                      setOnboardingDobDraft(dobDate);
+                      setShowOnboardingDobPicker(true);
+                    }}
+                  >
+                    <Text style={styles.fieldValueText}>{dobValue || "Select"}</Text>
+                  </TouchableOpacity>
                 </View>
-                {renderAge()}
               </>
             );
           })()}
 
           {/* GENDER */}
           <View style={styles.fieldRow}>
-            <Text style={styles.fieldLabel}>GENDER AT BIRTH</Text>
+            <Text style={styles.fieldLabel}>Gender</Text>
             <TouchableOpacity 
               style={styles.fieldValue}
               onPress={() => setShowGenderDropdown(!showGenderDropdown)}
@@ -3350,7 +5095,9 @@ function AppContent() {
                 {userProfile.genderAtBirth
                   ? userProfile.genderAtBirth === "male"
                     ? "Male"
-                    : "Female"
+                    : userProfile.genderAtBirth === "female"
+                      ? "Female"
+                      : "Other"
                   : "Select gender"}
               </Text>
             </TouchableOpacity>
@@ -3368,7 +5115,7 @@ function AppContent() {
                       key={option.value}
                       style={styles.dropdownItem}
                       onPress={() => {
-                        setUserProfile({ ...userProfile, genderAtBirth: option.value as "male" | "female" });
+                        setUserProfile({ ...userProfile, genderAtBirth: option.value as "male" | "female" | "other" });
                         setShowGenderDropdown(false);
                       }}
                     >
@@ -3382,7 +5129,7 @@ function AppContent() {
 
           {/* HEIGHT */}
           <View style={styles.fieldRow}>
-            <Text style={styles.fieldLabel}>HEIGHT</Text>
+            <Text style={styles.fieldLabel}>Height</Text>
             <View style={styles.heightInputRow}>
               <TextInput
                 style={styles.heightInput}
@@ -3434,7 +5181,7 @@ function AppContent() {
 
           {/* WEIGHT */}
           <View style={styles.fieldRow}>
-            <Text style={styles.fieldLabel}>WEIGHT</Text>
+            <Text style={styles.fieldLabel}>Current weight</Text>
             <View style={styles.heightInputRow}>
               <TextInput
                 style={styles.heightInput}
@@ -3486,7 +5233,7 @@ function AppContent() {
 
           {/* GOAL */}
           <View style={styles.fieldRow}>
-            <Text style={styles.fieldLabel}>GOAL</Text>
+            <Text style={styles.fieldLabel}>Goal</Text>
             <TouchableOpacity 
               style={styles.fieldValue}
               onPress={() => setShowGoalDropdown(!showGoalDropdown)}
@@ -3523,7 +5270,7 @@ function AppContent() {
 
           {/* ACTIVITY LEVEL */}
           <View style={styles.fieldRow}>
-            <Text style={styles.fieldLabel}>ACTIVITY LEVEL</Text>
+            <Text style={styles.fieldLabel}>Activity level</Text>
             <TouchableOpacity 
               style={styles.fieldValue}
               onPress={() => setShowActivityDropdown(!showActivityDropdown)}
@@ -3557,6 +5304,86 @@ function AppContent() {
               </TouchableOpacity>
             </Modal>
           )}
+
+          <Modal visible={showOnboardingDobPicker} transparent animationType="fade">
+            <TouchableOpacity
+              style={styles.modalOverlay}
+              activeOpacity={1}
+              onPress={() => setShowOnboardingDobPicker(false)}
+            >
+              <TouchableOpacity activeOpacity={1} style={styles.onboardingDobModal} onPress={() => {}}>
+                <View style={styles.onboardingDobModalHeader}>
+                  <TouchableOpacity onPress={() => setShowOnboardingDobPicker(false)}>
+                    <Text style={styles.manageSubscriptionButtonText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => {
+                      const d = onboardingDobDraft.getDate();
+                      const m = onboardingDobDraft.getMonth() + 1;
+                      const y = onboardingDobDraft.getFullYear();
+                      setDobValue(`${String(d).padStart(2, "0")}/${String(m).padStart(2, "0")}/${y}`);
+                      setShowOnboardingDobPicker(false);
+                    }}
+                  >
+                    <Text style={styles.manageSubscriptionButtonText}>Done</Text>
+                  </TouchableOpacity>
+                </View>
+                <DateTimePicker
+                  value={onboardingDobDraft}
+                  mode="date"
+                  maximumDate={new Date()}
+                  display={Platform.OS === "ios" ? "spinner" : "default"}
+                  onChange={(event, selectedDate) => {
+                    if (event.type === "dismissed" || !selectedDate) return;
+                    setOnboardingDobDraft(selectedDate);
+                  }}
+                />
+              </TouchableOpacity>
+            </TouchableOpacity>
+          </Modal>
+
+          <Text style={[styles.personalSectionTitle, styles.personalSectionTitleSpaced]}>RECOMMENDATIONS</Text>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>Calories (kcal)</Text>
+            <TextInput
+              style={[styles.fieldValue, styles.fieldValueInput]}
+              value={customCaloriesInput}
+              onChangeText={setCustomCaloriesInput}
+              placeholder={String(Math.round(currentTargets.calories_kcal))}
+              keyboardType="numeric"
+            />
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>Protein (g)</Text>
+            <TextInput
+              style={[styles.fieldValue, styles.fieldValueInput]}
+              value={customProteinInput}
+              onChangeText={setCustomProteinInput}
+              placeholder={String(Math.round(currentTargets.protein_g))}
+              keyboardType="numeric"
+            />
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>Carbohydrates (g)</Text>
+            <TextInput
+              style={[styles.fieldValue, styles.fieldValueInput]}
+              value={customCarbsInput}
+              onChangeText={setCustomCarbsInput}
+              placeholder={String(Math.round(currentTargets.carbs_g))}
+              keyboardType="numeric"
+            />
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>Fat (g)</Text>
+            <TextInput
+              style={[styles.fieldValue, styles.fieldValueInput]}
+              value={customFatInput}
+              onChangeText={setCustomFatInput}
+              placeholder={String(Math.round(currentTargets.fat_g))}
+              keyboardType="numeric"
+            />
+          </View>
+          {customTargetError ? <Text style={styles.addError}>{customTargetError}</Text> : null}
         </ScrollView>
       </SafeAreaView>
     );
@@ -3831,8 +5658,291 @@ function AppContent() {
       foodNamePart.length === 0
         ? []
         : knownFoods
-            .filter((name) => name.toLowerCase().startsWith(foodNamePart))
+            .map((name) => {
+              const lower = name.toLowerCase();
+              // Priority:
+              // 1) starts with whole query
+              // 2) any word starts with query
+              // 3) query appears anywhere
+              const starts = lower.startsWith(foodNamePart);
+              const wordStarts = lower.split(/\s+/).some((w) => w.startsWith(foodNamePart));
+              const contains = lower.includes(foodNamePart);
+              const score = starts ? 0 : wordStarts ? 1 : contains ? 2 : 99;
+              return { name, score };
+            })
+            .filter((x) => x.score < 99)
+            .sort((a, b) => a.score - b.score || a.name.localeCompare(b.name))
+            .map((x) => x.name)
             .slice(0, 5);
+    const defaultSavedMeals = mealTemplates.slice(0, 5);
+
+    if (!isTemplateMode) {
+      return (
+        <SafeAreaView style={styles.container}>
+          <KeyboardAvoidingView
+            style={styles.addCameraScreen}
+            behavior={undefined}
+          >
+            <View style={[styles.addHeader, { paddingHorizontal: 12, paddingTop: 8 }]}>
+              <TouchableOpacity
+                style={styles.iconButton}
+                onPress={() => {
+                  setView("home");
+                  setEntryText("");
+                  setMealPhotoUri(null);
+                  setMealPhotoAnalyzing(false);
+                  setMealPhotoProgress(0);
+                  setAddComposerTab("text");
+                }}
+              >
+                <Text style={styles.iconText}>‹</Text>
+              </TouchableOpacity>
+              <Text style={styles.headerTitle}>Add item(s)</Text>
+              <View style={styles.iconButton} />
+            </View>
+
+            <View style={styles.addCameraStage}>
+              {addComposerTab === "photo" && isPro && cameraPermission?.granted && !(mealPhotoAnalyzing && mealPhotoUri) ? (
+                <CameraView ref={cameraRef} style={styles.addCameraImage} facing="back" />
+              ) : mealPhotoUri ? (
+                <Image source={{ uri: mealPhotoUri }} style={styles.addCameraImage} resizeMode="cover" />
+              ) : (
+                <View style={styles.addCameraPlaceholder}>
+                  <Text style={styles.addCameraPlaceholderText}>
+                    {addComposerTab === "photo" && !isPro
+                      ? "Take photo is available on Pro."
+                      : addComposerTab === "photo"
+                      ? "Camera permission is required to capture meal photos."
+                      : "Take a meal photo to start"}
+                  </Text>
+                  {addComposerTab === "photo" && !isPro ? (
+                    <TouchableOpacity style={styles.addCameraPermissionButton} onPress={() => presentPaywall()}>
+                      <Text style={styles.addCameraPermissionButtonText}>Upgrade to Pro</Text>
+                    </TouchableOpacity>
+                  ) : addComposerTab === "photo" ? (
+                    <TouchableOpacity
+                      style={styles.addCameraPermissionButton}
+                      onPress={requestCameraPermission}
+                    >
+                      <Text style={styles.addCameraPermissionButtonText}>Enable camera</Text>
+                    </TouchableOpacity>
+                  ) : null}
+                </View>
+              )}
+
+              {mealPhotoAnalyzing && (
+                <View style={styles.addCameraAnalyzingOverlay}>
+                  <ActivityIndicator size="large" color="#FFFFFF" />
+                  <Text style={styles.addCameraAnalyzingText}>
+                    {mealPhotoStatusText} {mealPhotoProgress}%
+                  </Text>
+                </View>
+              )}
+
+              {addComposerTab === "photo" && isPro && (
+                <TouchableOpacity
+                  style={styles.addShutterWrap}
+                  onPress={handleTakeMealPhoto}
+                  disabled={mealPhotoAnalyzing}
+                  activeOpacity={0.85}
+                >
+                  <View style={styles.addShutterOuter}>
+                    <View style={styles.addShutterInner} />
+                  </View>
+                </TouchableOpacity>
+              )}
+
+              {addComposerTab === "photo" && isPro && (
+                <TouchableOpacity
+                  style={[styles.addGalleryButton, mealPhotoAnalyzing && styles.addPhotoButtonDisabled]}
+                  onPress={handlePickMealPhotoFromGallery}
+                  disabled={mealPhotoAnalyzing}
+                  activeOpacity={0.85}
+                >
+                  <Image
+                    source={require("./assets/add-gallery-icon.png")}
+                    style={styles.addGalleryButtonIcon}
+                    resizeMode="contain"
+                  />
+                </TouchableOpacity>
+              )}
+            </View>
+
+            {addComposerTab === "text" && addKeyboardOffset > 0 && (
+              <View
+                pointerEvents="none"
+                style={[styles.addKeyboardUnderlay, { height: addKeyboardOffset + 36 }]}
+              />
+            )}
+
+            <View
+              style={[
+                styles.addFloatingComposer,
+                addKeyboardOffset > 0 && { bottom: Math.max(-22, addKeyboardOffset - 22) },
+                addComposerTab === "text" && styles.addFloatingComposerExpanded
+              ]}
+            >
+              <View style={styles.addComposerTabsRow}>
+                <TouchableOpacity
+                  style={styles.addComposerTab}
+                  onPress={() => setAddComposerTab("text")}
+                  disabled={mealPhotoAnalyzing}
+                  activeOpacity={1}
+                >
+                  <View
+                    style={[
+                      styles.addComposerTabContent,
+                      addComposerTab === "text" && styles.addComposerTabContentActive
+                    ]}
+                  >
+                    <TabIcon
+                      source={require("./assets/add-tab-text-grey.png")}
+                      size={26}
+                      tintColor={addComposerTab === "text" ? "#1D4ED8" : "#4B5563"}
+                    />
+                    <Text
+                      style={[
+                        styles.addComposerTabText,
+                        addComposerTab === "text" && styles.addComposerTabTextActive
+                      ]}
+                    >
+                      INPUT TEXT
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.addComposerTab}
+                  onPress={handleSelectPhotoTab}
+                  disabled={mealPhotoAnalyzing}
+                  activeOpacity={1}
+                >
+                  <View
+                    style={[
+                      styles.addComposerTabContent,
+                      addComposerTab === "photo" && styles.addComposerTabContentActive
+                    ]}
+                  >
+                    <TabIcon
+                      source={require("./assets/add-tab-camera-grey.png")}
+                      size={26}
+                      tintColor={addComposerTab === "photo" ? "#1D4ED8" : "#4B5563"}
+                    />
+                    <Text
+                      style={[
+                        styles.addComposerTabText,
+                        addComposerTab === "photo" && styles.addComposerTabTextActive
+                      ]}
+                    >
+                      TAKE PHOTO
+                    </Text>
+                    {!isPro ? (
+                      <View style={styles.addComposerProBadge}>
+                        <Text style={styles.addComposerProBadgeText}>PRO</Text>
+                      </View>
+                    ) : null}
+                  </View>
+                </TouchableOpacity>
+              </View>
+
+              {addComposerTab === "text" && (
+                <View style={styles.addFloatingTextContent}>
+                  <TextInput
+                    ref={addInputRef}
+                    value={entryText}
+                    onChangeText={setEntryText}
+                    placeholder="Describe the food items here..."
+                    placeholderTextColor="#9CA3AF"
+                    style={styles.addFloatingInput}
+                    multiline
+                    textAlignVertical="top"
+                    editable={!mealPhotoAnalyzing}
+                    scrollEnabled
+                  />
+                  <View style={styles.addSuggestionsSlot}>
+                    {suggestions.length > 0 && (
+                      <View style={[styles.suggestionsContainer, styles.addFloatingSuggestionsContainer]}>
+                        {suggestions.map((name) => (
+                          <TouchableOpacity
+                            key={name}
+                            style={styles.suggestionChip}
+                            onPress={() => {
+                              const text = entryText;
+                              const textLines = text.split("\n");
+                              const lastIdx = textLines.length - 1;
+                              const currLine = textLines[lastIdx] ?? "";
+                              const prefixMatch2 = currLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
+                              const prefix2 = prefixMatch2 ? prefixMatch2[0] : "";
+                              const replacedLine = prefix2 + name;
+                              const replacedLines = [
+                                ...textLines.slice(0, lastIdx),
+                                replacedLine
+                              ];
+                              const nextText = replacedLines.join("\n");
+                              setEntryText(nextText);
+                            }}
+                          >
+                            <Text style={styles.suggestionText}>{name}</Text>
+                          </TouchableOpacity>
+                        ))}
+                      </View>
+                    )}
+                    {suggestions.length === 0 && defaultSavedMeals.length > 0 && (
+                      <View style={[styles.suggestionsContainer, styles.addFloatingSuggestionsContainer]}>
+                        {defaultSavedMeals.map((template) => (
+                          <TouchableOpacity
+                            key={template.id}
+                            style={styles.suggestionChip}
+                            onPress={() => {
+                              setEntryText(template.items.join("\n"));
+                              setMealPhotoUri(null);
+                              setMealPhotoAnalyzing(false);
+                              setMealPhotoProgress(0);
+                            }}
+                          >
+                            <Text style={styles.suggestionText}>{template.name}</Text>
+                          </TouchableOpacity>
+                        ))}
+                      </View>
+                    )}
+                  </View>
+
+                  <View style={styles.addFloatingActions}>
+                    <TouchableOpacity
+                      style={styles.addFloatingCancel}
+                      onPress={() => {
+                        setView("home");
+                        setEntryText("");
+                        setMealPhotoUri(null);
+                        setMealPhotoAnalyzing(false);
+                        setMealPhotoProgress(0);
+                        setAddComposerTab("text");
+                        setAddKeyboardOffset(0);
+                        setHasAutoOpenedCamera(false);
+                      }}
+                    >
+                      <Text style={styles.addFloatingCancelText}>Cancel</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[
+                        styles.addFloatingConfirm,
+                        (loading || !entryText.trim()) && styles.addFloatingConfirmDisabled
+                      ]}
+                      onPress={handleAdd}
+                      disabled={loading || !entryText.trim()}
+                    >
+                      <Text style={styles.addFloatingConfirmText}>
+                        {loading ? "Adding..." : "Confirm"}
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                  {error ? <Text style={styles.addError}>{error}</Text> : null}
+                </View>
+              )}
+            </View>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      );
+    }
 
     return (
       <SafeAreaView style={[styles.container, { paddingTop: 8 }]}>
@@ -3848,6 +5958,9 @@ function AppContent() {
                 setEditingTemplateId(null);
                 setTemplateName("");
                 setEntryText("");
+                setMealPhotoUri(null);
+                setMealPhotoAnalyzing(false);
+                setMealPhotoProgress(0);
               }}
             >
               <Text style={styles.iconText}>‹</Text>
@@ -3922,53 +6035,95 @@ function AppContent() {
               </View>
             )}
             <View style={styles.addCard}>
-              <Text style={styles.addHint}>
-                {isTemplateMode ? "Food items (one per line)" : "Describe the food items and we will do the rest"}
-              </Text>
-              <TextInput
-                value={entryText}
-                onChangeText={setEntryText}
-                placeholder=""
-                style={styles.addInput}
-                multiline
-                textAlignVertical="top"
-                editable
-                autoFocus={!isTemplateMode}
-                scrollEnabled={false}
-              />
-              {suggestions.length > 0 && (
-                <View style={styles.suggestionsContainer}>
-                  {suggestions.map((name) => {
-                    const lines = entryText.split("\n");
-                    const currentLine = lines[lines.length - 1] || "";
-                    const prefixMatch = currentLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
-                    const prefix = prefixMatch ? prefixMatch[0] : "";
-                    return (
-                      <TouchableOpacity
-                        key={name}
-                        style={styles.suggestionChip}
-                        onPress={() => {
-                          const text = entryText;
-                          const textLines = text.split("\n");
-                          const lastIdx = textLines.length - 1;
-                          const currLine = textLines[lastIdx] ?? "";
-                          const prefixMatch2 = currLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
-                          const prefix2 = prefixMatch2 ? prefixMatch2[0] : "";
-                          const replacedLine = prefix2 + name;
-                          const replacedLines = [
-                            ...textLines.slice(0, lastIdx),
-                            replacedLine
-                          ];
-                          const nextText = replacedLines.join("\n");
-                          setEntryText(nextText);
-                        }}
-                      >
-                        <Text style={styles.suggestionText}>{prefix ? prefix + name : name}</Text>
-                      </TouchableOpacity>
-                    );
-                  })}
-                </View>
+              {mealPhotoUri && (
+                <>
+                  <Image source={{ uri: mealPhotoUri }} style={styles.addCardPhotoBackground} />
+                  <View style={styles.addCardPhotoOverlay} />
+                </>
               )}
+              <View style={styles.addCardContent}>
+                {!isTemplateMode && (
+                  <View style={styles.addPhotoActionsRow}>
+                    <TouchableOpacity
+                      style={[
+                        styles.addPhotoButton,
+                        mealPhotoAnalyzing && styles.addPhotoButtonDisabled
+                      ]}
+                      onPress={handleTakeMealPhoto}
+                      disabled={mealPhotoAnalyzing}
+                    >
+                      <Text style={styles.addPhotoButtonText}>
+                        {mealPhotoUri ? "Retake photo" : "Take meal photo"}
+                      </Text>
+                    </TouchableOpacity>
+                    {mealPhotoUri && (
+                      <TouchableOpacity
+                        style={styles.addPhotoClearButton}
+                        onPress={() => setMealPhotoUri(null)}
+                        disabled={mealPhotoAnalyzing}
+                      >
+                        <Text style={styles.addPhotoClearButtonText}>Remove</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                )}
+                {mealPhotoAnalyzing && (
+                  <View style={styles.addPhotoProgressRow}>
+                    <ActivityIndicator size="small" color="#2563EB" />
+                    <Text style={styles.addPhotoProgressText}>
+                      {mealPhotoStatusText} {mealPhotoProgress}%
+                    </Text>
+                  </View>
+                )}
+                <Text style={styles.addHint}>
+                  {isTemplateMode ? "Food items (one per line)" : "Describe the food items and we will do the rest"}
+                </Text>
+                <TextInput
+                  ref={addInputRef}
+                  value={entryText}
+                  onChangeText={setEntryText}
+                  placeholder=""
+                  style={[styles.addInput, mealPhotoUri && styles.addInputForeground]}
+                  multiline
+                  textAlignVertical="top"
+                  editable={!mealPhotoAnalyzing}
+                  autoFocus={!isTemplateMode}
+                  scrollEnabled={false}
+                />
+                {suggestions.length > 0 && (
+                  <View style={styles.suggestionsContainer}>
+                    {suggestions.map((name) => {
+                      const lines = entryText.split("\n");
+                      const currentLine = lines[lines.length - 1] || "";
+                      const prefixMatch = currentLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
+                      const prefix = prefixMatch ? prefixMatch[0] : "";
+                      return (
+                        <TouchableOpacity
+                          key={name}
+                          style={styles.suggestionChip}
+                          onPress={() => {
+                            const text = entryText;
+                            const textLines = text.split("\n");
+                            const lastIdx = textLines.length - 1;
+                            const currLine = textLines[lastIdx] ?? "";
+                            const prefixMatch2 = currLine.match(/^(\d+(?:\.\d+)?(?:\s*(?:g|kg|mg|ml|l|cups?|tbsp|tsp|oz|lb|pieces?|slices?|servings?))?\s+)/i);
+                            const prefix2 = prefixMatch2 ? prefixMatch2[0] : "";
+                            const replacedLine = prefix2 + name;
+                            const replacedLines = [
+                              ...textLines.slice(0, lastIdx),
+                              replacedLine
+                            ];
+                            const nextText = replacedLines.join("\n");
+                            setEntryText(nextText);
+                          }}
+                        >
+                          <Text style={styles.suggestionText}>{prefix ? prefix + name : name}</Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                )}
+              </View>
             </View>
 
             {mealTemplates.length > 0 && (
@@ -3981,6 +6136,9 @@ function AppContent() {
                         style={styles.templateChip}
                         onPress={() => {
                           setEntryText(template.items.join("\n"));
+                          setMealPhotoUri(null);
+                          setMealPhotoAnalyzing(false);
+                          setMealPhotoProgress(0);
                         }}
                       >
                         <Text style={styles.templateChipText}>{template.name}</Text>
@@ -3992,6 +6150,9 @@ function AppContent() {
                           setIsTemplateMode(true);
                           setTemplateName(template.name);
                           setEntryText(template.items.join("\n"));
+                          setMealPhotoUri(null);
+                          setMealPhotoAnalyzing(false);
+                          setMealPhotoProgress(0);
                           setView("add");
                         }}
                       >
@@ -4015,7 +6176,22 @@ function AppContent() {
 
   // Show food detail screen if a food item is selected
   if (selectedFoodItem !== null && editableFoodNutrients !== null && originalFoodNutrients !== null) {
+    const foodUnitOptions = ["g", "ml", "piece", "bowl", "cup", "serving", "tbsp", "tsp", "slice"];
+    const originalItemGrams =
+      selectedFoodItem.grams ||
+      quantityUnitToGrams(selectedFoodItem.quantity || 1, selectedFoodItem.unit || "g", selectedFoodItem.name) ||
+      100;
+    const basePer100FromOriginal = scaleTotals(originalFoodNutrients, 100 / Math.max(1, originalItemGrams));
+    const recalcNutrientsForQuantityAndUnit = (nextQty: number, nextUnit: string) => {
+      if (nextQty <= 0) return;
+      const nextGrams = quantityUnitToGrams(nextQty, nextUnit, selectedFoodItem.name);
+      if (!nextGrams || nextGrams <= 0) return;
+      setEditableFoodNutrients(scaleTotals(basePer100FromOriginal, nextGrams / 100));
+    };
+    const quantityOrUnitChanged =
+      editableQuantity !== selectedFoodItem.quantity || editableUnit !== (selectedFoodItem.unit || "g");
     const isFoodDirty =
+      quantityOrUnitChanged ||
       Math.round(editableFoodNutrients.calories_kcal) !== Math.round(originalFoodNutrients.calories_kcal) ||
       Math.round(editableFoodNutrients.protein_g) !== Math.round(originalFoodNutrients.protein_g) ||
       Math.round(editableFoodNutrients.carbs_g) !== Math.round(originalFoodNutrients.carbs_g) ||
@@ -4029,13 +6205,18 @@ function AppContent() {
 
       const oldItem = items[idx];
       const oldNutrients = oldItem.nutrients;
+      const safeQty = editableQuantity > 0 ? editableQuantity : 1;
+      const newGrams = quantityUnitToGrams(safeQty, editableUnit, selectedFoodItem.name);
       const newNutrients: NutrientTotals = {
-        ...oldNutrients,
+        ...oldItem.nutrients,
         ...editableFoodNutrients
       };
 
       const updatedItem: MealItem = {
         ...oldItem,
+        quantity: safeQty,
+        unit: editableUnit,
+        grams: newGrams,
         nutrients: newNutrients
       };
 
@@ -4065,6 +6246,8 @@ function AppContent() {
         await persistData(next);
         setSelectedFoodItem(updatedItem);
         setOriginalFoodNutrients(newNutrients);
+        setEditableQuantity(updatedItem.quantity);
+        setEditableUnit(updatedItem.unit || "g");
 
         // Remember per‑food override for future uses
         const overrideKey = normalizeFoodNameForKey(updatedItem.name);
@@ -4107,7 +6290,10 @@ function AppContent() {
           <View style={styles.fixedHeader}>
             <TouchableOpacity
               style={styles.iconButton}
-              onPress={() => setSelectedFoodItem(null)}
+              onPress={() => {
+                setShowFoodUnitDropdown(false);
+                setSelectedFoodItem(null);
+              }}
             >
               <Text style={styles.iconText}>‹</Text>
             </TouchableOpacity>
@@ -4125,6 +6311,57 @@ function AppContent() {
           showsVerticalScrollIndicator
           keyboardShouldPersistTaps="handled"
         >
+          <View style={styles.foodDetailSection}>
+            <Text style={styles.foodDetailSectionTitle}>Quantity</Text>
+            <View style={styles.foodDetailQuantityRow}>
+              <TextInput
+                style={styles.foodDetailQuantityInput}
+                keyboardType="numeric"
+                value={String(editableQuantity)}
+                onChangeText={(text) => {
+                  setFoodSaveMessage(null);
+                  const num = parseFloat(text.replace(",", "."));
+                  if (Number.isNaN(num) && text !== "" && text !== "-") return;
+                  const newQty = text === "" || text === "-" ? 0 : num;
+                  recalcNutrientsForQuantityAndUnit(newQty, editableUnit);
+                  setEditableQuantity(newQty);
+                }}
+              />
+              <TouchableOpacity
+                style={styles.foodDetailUnitButton}
+                onPress={() => setShowFoodUnitDropdown(true)}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.foodDetailUnitButtonText}>{editableUnit}</Text>
+                <Text style={styles.foodDetailUnitButtonChevron}>▾</Text>
+              </TouchableOpacity>
+            </View>
+            <Modal visible={showFoodUnitDropdown} transparent animationType="fade">
+              <TouchableOpacity
+                style={styles.modalOverlay}
+                activeOpacity={1}
+                onPress={() => setShowFoodUnitDropdown(false)}
+              >
+                <View style={styles.dropdownContent}>
+                  {foodUnitOptions.map((unit) => (
+                    <TouchableOpacity
+                      key={unit}
+                      style={styles.dropdownItem}
+                      onPress={() => {
+                        setFoodSaveMessage(null);
+                        setEditableUnit(unit);
+                        recalcNutrientsForQuantityAndUnit(editableQuantity, unit);
+                        setShowFoodUnitDropdown(false);
+                      }}
+                    >
+                      <Text style={styles.dropdownItemText}>{unit}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </TouchableOpacity>
+            </Modal>
+          </View>
+
           <View style={styles.foodDetailSection}>
             <Text style={styles.foodDetailSectionTitle}>Nutrition Facts</Text>
             <View style={styles.foodDetailMacros}>
@@ -4394,26 +6631,36 @@ function AppContent() {
   }
 
   if (view === "meal" && selectedMealId) {
+    // Recalculate selectedItems from current dataByDate to ensure it's up-to-date after deletions
+    const currentDayData = getDayData(selectedDate);
+    const currentSelectedItems = (selectedMealId && currentDayData.mealItems[selectedMealId]) || [];
+    
     const totalCalories = Math.round(
-      selectedItems.reduce((sum, item) => sum + item.nutrients.calories_kcal, 0)
+      currentSelectedItems.reduce((sum, item) => sum + item.nutrients.calories_kcal, 0)
     );
+    
     return (
       <View style={{ flex: 1, backgroundColor: "#F5F5F7" }}>
         <SafeAreaView style={{ backgroundColor: "#F5F5F7" }}>
           <View style={styles.fixedHeader}>
             <TouchableOpacity
-              style={styles.iconButton}
+              style={[styles.iconButton, { position: "absolute", left: 12, zIndex: 1 }]}
               onPress={() => setView("home")}
             >
               <Text style={styles.iconText}>‹</Text>
             </TouchableOpacity>
-            <View style={styles.headerCenter}>
+            <View style={[styles.headerCenter, { width: "100%", position: "absolute" }]}>
               <Text style={styles.headerTitle}>{selectedMealLabel}</Text>
             </View>
             <TouchableOpacity
-              style={styles.headerAddButton}
+              style={[styles.headerAddButton, { position: "absolute", right: 12, zIndex: 1 }]}
               onPress={() => {
                 setEntryText("");
+                setMealPhotoUri(null);
+                setMealPhotoAnalyzing(false);
+                setMealPhotoProgress(0);
+                setAddComposerTab("text");
+                setHasAutoOpenedCamera(false);
                 setView("add");
               }}
             >
@@ -4422,7 +6669,51 @@ function AppContent() {
           </View>
         </SafeAreaView>
         <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.mealDetailContent}>
-          {selectedItems.map((item) => (
+          {(() => {
+            const mealInsight = getMealInsight(currentSelectedItems, selectedMealLabel, userProfile);
+            if (!mealInsight) return null;
+            const heartIcon = mealInsight.type === "positive"
+              ? require("./assets/Greenheart.png")
+              : require("./assets/Orangeheart.png");
+            return (
+              <View key="meal-insight" style={styles.mealInsightCardWrapper}>
+                <View style={[styles.mealInsightCard, !isPro && styles.proFeatureBlur]}>
+                  <Image source={heartIcon} style={styles.mealInsightHeart} resizeMode="contain" />
+                  <View style={styles.mealInsightContent}>
+                    <Text style={styles.mealInsightText}>{mealInsight.text}</Text>
+                    {mealInsight.suggestions && mealInsight.suggestions.length > 0 && (
+                      <View style={styles.mealInsightSuggestions}>
+                        <Text style={styles.mealInsightSuggestionsTitle}>Suggestions:</Text>
+                        {mealInsight.suggestions.map((suggestion, idx) => (
+                          <Text key={idx} style={styles.mealInsightSuggestionItem}>
+                            • {suggestion}
+                          </Text>
+                        ))}
+                      </View>
+                    )}
+                  </View>
+                </View>
+                {!isPro && (
+                  <TouchableOpacity
+                    style={styles.proFeatureOverlayContributors}
+                    onPress={() => presentPaywall()}
+                    activeOpacity={1}
+                  >
+                    <Text style={styles.proFeatureOverlayText}>Unlock meal insights</Text>
+                    <Text style={styles.proFeatureOverlaySubtext}>AI-powered tips and recommendations</Text>
+                    <TouchableOpacity
+                      style={styles.upgradeProButton}
+                      onPress={() => presentPaywall()}
+                      activeOpacity={0.9}
+                    >
+                      <Text style={styles.upgradeProButtonText}>Upgrade to Pro</Text>
+                    </TouchableOpacity>
+                  </TouchableOpacity>
+                )}
+              </View>
+            );
+          })()}
+          {currentSelectedItems.map((item) => (
             <SwipeableItemCard
               key={item.id}
               item={item}
@@ -4430,6 +6721,9 @@ function AppContent() {
                 setSelectedFoodItem(item);
                 setEditableFoodNutrients(item.nutrients);
                 setOriginalFoodNutrients(item.nutrients);
+                setEditableQuantity(item.quantity);
+                setEditableUnit(item.unit || "g");
+                setShowFoodUnitDropdown(false);
                 fetchFoodInsights(item, selectedMealId);
               }}
               onDelete={() => handleDeleteItem(selectedMealId, item.id)}
@@ -4482,7 +6776,31 @@ function AppContent() {
           ))}
 
           {selectedItems.length === 0 && (
-            <Text style={styles.emptyText}>No items logged yet.</Text>
+            <View style={styles.emptyStateContainer}>
+              <Image
+                source={require("./assets/Emptystate.png")}
+                style={styles.emptyStateImage}
+                resizeMode="contain"
+              />
+              <Text style={styles.emptyStateText}>
+                No food logged yet in this meal
+              </Text>
+              <TouchableOpacity
+                style={styles.emptyStateButton}
+                onPress={() => {
+                  setEntryText("");
+                  setMealPhotoUri(null);
+                  setMealPhotoAnalyzing(false);
+                  setMealPhotoProgress(0);
+                  setAddComposerTab("text");
+                  setHasAutoOpenedCamera(false);
+                  setView("add");
+                }}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.emptyStateButtonText}>Add some food</Text>
+              </TouchableOpacity>
+            </View>
           )}
 
           {selectedItems.length > 0 && (
@@ -4510,11 +6828,6 @@ function AppContent() {
             </TouchableOpacity>
           )}
         </ScrollView>
-
-
-        <TouchableOpacity style={styles.doneButton} onPress={() => setView("home")}>
-          <Text style={styles.doneButtonText}>Done</Text>
-        </TouchableOpacity>
       </View>
     );
   }
@@ -4711,6 +7024,93 @@ function AppContent() {
       setLoading(false);
     }
   };
+
+  if (view === "terms" || view === "privacy") {
+    const url = view === "terms" ? "https://www.joulapp.com/terms" : "https://www.joulapp.com/Privacy";
+    const title = view === "terms" ? "Terms" : "Privacy";
+    console.log(`Loading ${title} page: ${url}`);
+
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.addHeader}>
+          <TouchableOpacity style={styles.iconButton} onPress={() => setView("home")}>
+            <Text style={styles.iconText}>‹</Text>
+          </TouchableOpacity>
+          <View style={styles.headerCenter}>
+            <Text style={styles.headerTitle}>{title}</Text>
+          </View>
+          <View style={styles.iconButton} />
+        </View>
+        <View style={{ flex: 1 }}>
+          {webViewLoading && !webViewError && (
+            <View style={{ flex: 1, justifyContent: "center", alignItems: "center", position: "absolute", top: 0, left: 0, right: 0, bottom: 0, zIndex: 1 }}>
+              <ActivityIndicator size="large" color="#4263EB" />
+            </View>
+          )}
+          {webViewError ? (
+            <View style={{ flex: 1, justifyContent: "center", alignItems: "center", padding: 20 }}>
+              <Text style={{ fontSize: 16, color: "#6B7280", textAlign: "center", marginBottom: 12 }}>
+                Unable to load page
+              </Text>
+              <Text style={{ fontSize: 14, color: "#9CA3AF", textAlign: "center", marginBottom: 20 }}>
+                {webViewError}
+              </Text>
+              <Text style={{ fontSize: 12, color: "#9CA3AF", textAlign: "center", marginBottom: 20 }}>
+                URL: {url}
+              </Text>
+              <TouchableOpacity
+                style={{ backgroundColor: "#4263EB", paddingVertical: 12, paddingHorizontal: 24, borderRadius: 8 }}
+                onPress={() => {
+                  setWebViewError(null);
+                  setWebViewLoading(true);
+                }}
+              >
+                <Text style={{ color: "#FFFFFF", fontSize: 16, fontWeight: "600" }}>Retry</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <WebView
+              key={url}
+              source={{ uri: url }}
+              style={{ flex: 1 }}
+              onLoadStart={() => {
+                console.log(`WebView load started: ${url}`);
+                setWebViewLoading(true);
+                setWebViewError(null);
+              }}
+              onLoadEnd={() => {
+                console.log(`WebView load ended: ${url}`);
+                setWebViewLoading(false);
+              }}
+              onError={(syntheticEvent) => {
+                const { nativeEvent } = syntheticEvent;
+                console.error("WebView error:", {
+                  code: nativeEvent.code,
+                  description: nativeEvent.description,
+                  domain: nativeEvent.domain,
+                  url: nativeEvent.url
+                });
+                setWebViewLoading(false);
+                setWebViewError(nativeEvent.description || `Failed to load ${url}`);
+              }}
+              onHttpError={(syntheticEvent) => {
+                const { nativeEvent } = syntheticEvent;
+                console.error("WebView HTTP error:", {
+                  statusCode: nativeEvent.statusCode,
+                  description: nativeEvent.description,
+                  url: nativeEvent.url
+                });
+                setWebViewLoading(false);
+                setWebViewError(`HTTP ${nativeEvent.statusCode}: ${nativeEvent.description || "Page not found"}`);
+              }}
+              cacheEnabled={false}
+              sharedCookiesEnabled={false}
+            />
+          )}
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   if (view === "export") {
     return (
@@ -4915,80 +7315,101 @@ function AppContent() {
                 <Text style={styles.sidebarCloseText}>✕</Text>
               </TouchableOpacity>
             </View>
-            <TouchableOpacity
-              style={styles.menuItem}
-              onPress={() => {
-                closeSidebar();
-                setTimeout(() => presentCustomerCenter(), 220);
-              }}
+            <ScrollView 
+              style={styles.sidebarScrollView}
+              contentContainerStyle={styles.sidebarScrollContent}
+              showsVerticalScrollIndicator={true}
             >
-              <Text style={styles.menuItemText}>Manage Subscription</Text>
-            </TouchableOpacity>
-            {/* DEBUG: Reset subscription for testing - REMOVE BEFORE PRODUCTION */}
-            <TouchableOpacity
-              style={[styles.menuItem, styles.debugMenuItem]}
-              onPress={async () => {
-                console.log("Reset button pressed");
-                closeSidebar();
-                try {
-                  await resetSubscriptionForTesting();
-                  console.log("Reset function completed");
-                } catch (err) {
-                  console.error("Reset button error:", err);
-                  // Force state update even if reset fails
-                  alert("Reset completed. Check console for details.");
-                }
-              }}
-            >
-              <Text style={[styles.menuItemText, styles.debugMenuItemText]}>🔧 Reset Subscription (Testing)</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.menuItem}
-              onPress={() => {
-                closeSidebar();
-                setTimeout(() => setView("savedFoods"), 220);
-              }}
-            >
-              <Text style={styles.menuItemText}>Saved foods</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.menuItem}
-              onPress={() => {
-                closeSidebar();
-                setTimeout(() => setView("personal"), 220);
-              }}
-            >
-              <Text style={styles.menuItemText}>Personal details</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.menuItem}
-              onPress={() => {
-                closeSidebar();
-                setTimeout(() => setView("export"), 220);
-              }}
-            >
-              <Text style={styles.menuItemText}>Export</Text>
-              {!isPro && (
-                <Image
-                  source={require("./assets/Pro_Badge.png")}
-                  style={styles.menuProBadge}
-                  resizeMode="contain"
-                />
+              <TouchableOpacity
+                style={styles.menuItem}
+                onPress={() => {
+                  closeSidebar();
+                  setTimeout(() => presentCustomerCenter(), 220);
+                }}
+              >
+                <Text style={styles.menuItemText}>Manage Subscription</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.menuItem}
+                onPress={() => {
+                  closeSidebar();
+                  setTimeout(() => setView("savedFoods"), 220);
+                }}
+              >
+                <Text style={styles.menuItemText}>Saved foods</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.menuItem}
+                onPress={() => {
+                  closeSidebar();
+                  setTimeout(() => setView("personal"), 220);
+                }}
+              >
+                <Text style={styles.menuItemText}>Personal details and profile</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.menuItem}
+                onPress={() => {
+                  closeSidebar();
+                  setTimeout(() => setView("export"), 220);
+                }}
+              >
+                <Text style={styles.menuItemText}>Export</Text>
+                {!isPro && (
+                  <Image
+                    source={require("./assets/Pro_Badge.png")}
+                    style={styles.menuProBadge}
+                    resizeMode="contain"
+                  />
+                )}
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.menuItem}
+                onPress={() => {
+                  closeSidebar();
+                  setTimeout(() => {
+                    setFeedbackRating(0);
+                    setFeedbackText("");
+                    setFeedbackModalVisible(true);
+                  }, 220);
+                }}
+              >
+                <Text style={styles.menuItemText}>Share feedback</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.menuItem}
+                onPress={() => {
+                  setShowTermsPrivacySubmenu(!showTermsPrivacySubmenu);
+                }}
+              >
+                <Text style={styles.menuItemText}>Terms and Privacy</Text>
+                <Text style={styles.iconText}>{showTermsPrivacySubmenu ? "›" : "›"}</Text>
+              </TouchableOpacity>
+              {showTermsPrivacySubmenu && (
+                <>
+                  <TouchableOpacity
+                    style={[styles.menuItem, styles.subMenuItem]}
+                    onPress={() => {
+                      setShowTermsPrivacySubmenu(false);
+                      closeSidebar();
+                      setTimeout(() => setView("terms"), 220);
+                    }}
+                  >
+                    <Text style={styles.subMenuItemText}>Terms</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.menuItem, styles.subMenuItem]}
+                    onPress={() => {
+                      setShowTermsPrivacySubmenu(false);
+                      closeSidebar();
+                      setTimeout(() => setView("privacy"), 220);
+                    }}
+                  >
+                    <Text style={styles.subMenuItemText}>Privacy</Text>
+                  </TouchableOpacity>
+                </>
               )}
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.menuItem}
-              onPress={() => {
-                closeSidebar();
-                setTimeout(() => {
-                  setFeedbackRating(0);
-                  setFeedbackText("");
-                  setFeedbackModalVisible(true);
-                }, 220);
-              }}
-            >
-              <Text style={styles.menuItemText}>Share feedback</Text>
-            </TouchableOpacity>
+            </ScrollView>
           </Animated.View>
         </View>
       </Modal>
@@ -5095,6 +7516,51 @@ function AppContent() {
         </KeyboardAvoidingView>
       </Modal>
 
+      {/* New User Paywall Modal */}
+      <Modal
+        visible={newUserPaywallVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={async () => {
+          await AsyncStorage.setItem(NEW_USER_PAYWALL_DISMISSED_KEY, "true");
+          setNewUserPaywallVisible(false);
+        }}
+      >
+        <View style={styles.newUserPaywallOverlay}>
+          <View style={styles.newUserPaywallContent}>
+            <TouchableOpacity
+              style={styles.newUserPaywallCloseButton}
+              onPress={async () => {
+                await AsyncStorage.setItem(NEW_USER_PAYWALL_DISMISSED_KEY, "true");
+                setNewUserPaywallVisible(false);
+              }}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.newUserPaywallCloseText}>✕</Text>
+            </TouchableOpacity>
+            <View style={styles.newUserPaywallBody}>
+              <Text style={styles.newUserPaywallTitle}>Unlock Pro Features</Text>
+              <Text style={styles.newUserPaywallSubtitle}>
+                Get AI-powered insights, advanced nutrition tracking, and more to help you reach your health goals.
+              </Text>
+              <TouchableOpacity
+                style={styles.newUserPaywallUpgradeButton}
+                onPress={async () => {
+                  const purchased = await presentPaywall();
+                  if (purchased) {
+                    await AsyncStorage.setItem(NEW_USER_PAYWALL_DISMISSED_KEY, "true");
+                    setNewUserPaywallVisible(false);
+                  }
+                }}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.newUserPaywallUpgradeButtonText}>Upgrade to Pro</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       <View style={styles.mealsSwipeArea} {...((activeTab === "meals" || activeTab === "analysis") ? mealsSwipeResponder.panHandlers : {})}>
         {activeTab === "meals" && (
           <Animated.View
@@ -5114,7 +7580,7 @@ function AppContent() {
               activeOpacity={1}
             >
               <Text style={styles.sectionLabel}>NUTRITION</Text>
-              <View style={styles.nutritionCard}>
+              <View key={`nutritionCard-${selectedDate}`} style={styles.nutritionCard}>
                 {(() => {
                   const macroTargets = getMacroTargets(userProfile);
                   const items = [
@@ -5123,21 +7589,27 @@ function AppContent() {
                     { key: "carbs_g" as const, label: "Carbs", value: totals.carbs_g, target: macroTargets.carbs_g, unit: "g" },
                     { key: "fat_g" as const, label: "Fat", value: totals.fat_g, target: macroTargets.fat_g, unit: "g" }
                   ];
-                  return items.map((item) => {
+                  return items.map((item, index) => {
                     const current = Number(item.value) || 0;
                     const target = Number(item.target) || 1;
-                    const progress = target > 0 ? Math.min(1, current / target) : 0;
+                    const progress = target > 0 ? Math.min(1, Math.max(0, current / target)) : 0;
+                    // Create a completely unique identifier for this ring instance
+                    // Include selectedDate to ensure each date gets fresh component instances
+                    const uniqueId = `${selectedDate}-${item.key}-${index}`;
                     return (
-                      <View key={item.key} style={styles.nutritionItem}>
+                      <View key={`item-${uniqueId}`} style={styles.nutritionItem}>
                         <View style={styles.nutritionLabelWrap}>
                           <Text style={styles.nutritionLabel}>{item.label}</Text>
                         </View>
-                        <CircularProgressRing
-                          progress={progress}
-                          value={current}
-                          size={72}
-                          suffix={item.unit}
-                        />
+                        <View key={`wrapper-${uniqueId}-${progress}`} style={{ width: 72, height: 72 }}>
+                          <CircularProgressRing
+                            key={`ring-${uniqueId}-${progress.toFixed(6)}-${current}`}
+                            progress={progress}
+                            value={current}
+                            size={72}
+                            suffix={item.unit}
+                          />
+                        </View>
                         <View style={styles.nutritionTargetWrap}>
                           <Text style={styles.nutritionTarget}>
                             / {Math.round(target)}
@@ -5185,7 +7657,7 @@ function AppContent() {
             <View style={styles.mealsList}>
               {meals.map((meal) => {
                 const mealItemsForMeal = mealItems[meal.id] || [];
-                const hasItems = mealItemsForMeal.length > 0 || meal.nutrients.calories_kcal > 0;
+                const hasItems = mealItemsForMeal.length > 0;
                 const iconSource = hasItems ? MEAL_ICON_COLORED : MEAL_ICON_GRAYSCALE;
                 const iconSize = meal.id === "snack-afternoon" || meal.id === "snack-evening" ? 36 : 40;
                 
@@ -5209,13 +7681,21 @@ function AppContent() {
                     />
                   </View>
                   <View style={styles.mealInfo}>
-                    <Text style={styles.mealLabel}>{meal.label}</Text>
-                    {meal.nutrients.calories_kcal > 0 ? (
+                    <View style={styles.mealLabelRow}>
+                      <Text style={styles.mealLabel}>{meal.label}</Text>
+                      <TouchableOpacity
+                        style={styles.addCircle}
+                        onPress={() => openAdd(meal.id)}
+                      >
+                        <Text style={styles.addCircleText}>+</Text>
+                      </TouchableOpacity>
+                    </View>
+                    {hasItems && meal.nutrients.calories_kcal > 0 ? (
                       <Text style={styles.mealCalories}>
                         {Math.round(meal.nutrients.calories_kcal)} Cal
                       </Text>
                     ) : null}
-                    {(meal.nutrients.protein_g > 0 || meal.nutrients.carbs_g > 0 || meal.nutrients.fat_g > 0) ? (
+                    {hasItems && (meal.nutrients.protein_g > 0 || meal.nutrients.carbs_g > 0 || meal.nutrients.fat_g > 0) ? (
                       <View style={styles.mealMacros}>
                         <View style={styles.macroPill}>
                           <Text style={styles.macroText}>
@@ -5235,12 +7715,6 @@ function AppContent() {
                       </View>
                     ) : null}
                   </View>
-                  <TouchableOpacity
-                    style={styles.addCircle}
-                    onPress={() => openAdd(meal.id)}
-                  >
-                    <Text style={styles.addCircleText}>+</Text>
-                  </TouchableOpacity>
                 </PressableCard>
                 );
               })}
@@ -5543,14 +8017,6 @@ function AppContent() {
                   <Text style={styles.insightsPaywallProBadgeText}>PRO</Text>
                 </View>
 
-                <View style={styles.insightsPaywallLogoRow}>
-                  <Image
-                    source={require("./assets/icon.png")}
-                    style={styles.insightsPaywallLogoImage}
-                    resizeMode="contain"
-                  />
-                </View>
-
                 <Text style={styles.insightsPaywallHeadline}>
                   UNLOCK PERSONALIZED{"\n"}INSIGHTS WITH PRO
                 </Text>
@@ -5580,17 +8046,27 @@ function AppContent() {
                   style={[styles.insightsSubTab, insightsSubTab === "day" && styles.insightsSubTabActive]}
                   onPress={() => setInsightsSubTab("day")}
                 >
-                  <Text style={[styles.insightsSubTabLabel, insightsSubTab === "day" && styles.insightsSubTabLabelActive]}>
-                    Day
-                  </Text>
+                  <>
+                    <Text style={[styles.insightsSubTabLabel, insightsSubTab === "day" && styles.insightsSubTabLabelActive]}>
+                      Day
+                    </Text>
+                    {hasNewDayInsights && (
+                      <View style={styles.insightsSubTabIndicator} />
+                    )}
+                  </>
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={[styles.insightsSubTab, insightsSubTab === "week" && styles.insightsSubTabActive]}
                   onPress={() => setInsightsSubTab("week")}
                 >
-                  <Text style={[styles.insightsSubTabLabel, insightsSubTab === "week" && styles.insightsSubTabLabelActive]}>
-                    Week
-                  </Text>
+                  <>
+                    <Text style={[styles.insightsSubTabLabel, insightsSubTab === "week" && styles.insightsSubTabLabelActive]}>
+                      Week
+                    </Text>
+                    {hasNewWeekInsights && (
+                      <View style={styles.insightsSubTabIndicator} />
+                    )}
+                  </>
                 </TouchableOpacity>
               </View>
             </View>
@@ -5628,6 +8104,9 @@ function AppContent() {
               })() : (() => {
                 const { daysWithMeals } = aggregateWeekData(dataByDate, todayKey);
                 const { summary, tips } = getWeekInsights(dataByDate, todayKey, userProfile);
+                const isSunday = new Date().getDay() === 0;
+                const trendInsights = daysWithMeals >= 7 ? getMealTrendInsights(dataByDate, todayKey, userProfile) : [];
+                
                 if (daysWithMeals === 0) {
                   return (
                     <Text style={styles.insightsEmpty} selectable>
@@ -5636,17 +8115,45 @@ function AppContent() {
                   );
                 }
                 return (
-                  <View style={styles.insightsCard}>
-                    <Text style={styles.insightsCardTitle} selectable>Insights for the week</Text>
-                    <Text style={styles.insightsCardSummary} selectable>{summary}</Text>
-                    {tips.length > 0 && (
-                      <View style={styles.insightsTips}>
-                        <Text style={styles.insightsTipsTitle} selectable>TIPS</Text>
-                        <View style={styles.insightsTipsDivider} />
-                        {tips.map((t, i) => renderInsightTip(t, i, styles.insightsTipItem))}
+                  <>
+                    {/* Weekly Trends Section - Show whenever there's 7+ days of data, more prominent on Sundays */}
+                    {daysWithMeals >= 7 && trendInsights.length > 0 && (
+                      <View style={styles.insightsCard}>
+                        <View style={styles.insightsCardTitleRow}>
+                          <Image 
+                            source={require("./assets/Trend.png")} 
+                            style={styles.insightsTrendIcon}
+                            resizeMode="contain"
+                          />
+                          <Text style={styles.insightsCardTitle} selectable>
+                            {isSunday ? "Weekly Trends" : "Meal Patterns"}
+                          </Text>
+                        </View>
+                        <Text style={styles.insightsCardSummary} selectable>
+                          {isSunday 
+                            ? "Here's what we noticed about your meal patterns this week:"
+                            : "Here's what we noticed about your meal patterns over the past week:"}
+                        </Text>
+                        <View style={styles.insightsTips}>
+                          <Text style={styles.insightsTipsTitle} selectable>MEAL-BY-MEAL INSIGHTS</Text>
+                          <View style={styles.insightsTipsDivider} />
+                          {trendInsights.map((t, i) => renderInsightTip(t, i, styles.insightsTipItem))}
+                        </View>
                       </View>
                     )}
-                  </View>
+                    {/* Regular Weekly Insights */}
+                    <View style={styles.insightsCard}>
+                      <Text style={styles.insightsCardTitle} selectable>Insights for the week</Text>
+                      <Text style={styles.insightsCardSummary} selectable>{summary}</Text>
+                      {tips.length > 0 && (
+                        <View style={styles.insightsTips}>
+                          <Text style={styles.insightsTipsTitle} selectable>TIPS</Text>
+                          <View style={styles.insightsTipsDivider} />
+                          {tips.map((t, i) => renderInsightTip(t, i, styles.insightsTipItem))}
+                        </View>
+                      )}
+                    </View>
+                  </>
                 );
               })()}
             </ScrollView>
@@ -5714,6 +8221,9 @@ function AppContent() {
               }
               size={28}
             />
+            {(hasNewDayInsights || hasNewWeekInsights) && (
+              <View style={styles.tabNewIndicator} />
+            )}
           </View>
           <View style={styles.tabLabelContainer}>
             <Text
@@ -5759,6 +8269,76 @@ const styles = StyleSheet.create({
     backgroundColor: "#F5F5F7",
     width: "100%",
     height: "100%"
+  },
+  aiConsentModalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.45)",
+    justifyContent: "center",
+    paddingHorizontal: 18
+  },
+  aiConsentModalCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 14,
+    padding: 18,
+    paddingBottom: 28
+  },
+  aiConsentModalTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#111827",
+    marginBottom: 10
+  },
+  aiConsentModalBody: {
+    fontSize: 14,
+    lineHeight: 21,
+    color: "#374151",
+    marginBottom: 10
+  },
+  aiConsentPrimaryButton: {
+    marginTop: 18,
+    backgroundColor: "#2563EB",
+    borderRadius: 999,
+    paddingVertical: 12,
+    alignItems: "center"
+  },
+  aiConsentPrimaryButtonText: {
+    color: "#FFFFFF",
+    fontSize: 15,
+    fontWeight: "700"
+  },
+  aiConsentSecondaryButton: {
+    marginTop: 10,
+    marginBottom: 12,
+    borderRadius: 999,
+    paddingVertical: 12,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    backgroundColor: "#FFFFFF"
+  },
+  aiConsentSecondaryButtonText: {
+    color: "#374151",
+    fontSize: 14,
+    fontWeight: "600",
+    textAlign: "center",
+    paddingHorizontal: 10
+  },
+  aiConsentBlockedContainer: {
+    flex: 1,
+    paddingHorizontal: 24,
+    justifyContent: "center"
+  },
+  aiConsentBlockedTitle: {
+    fontSize: 24,
+    fontWeight: "700",
+    color: "#111827",
+    marginBottom: 14
+  },
+  aiConsentBlockedText: {
+    fontSize: 15,
+    lineHeight: 22,
+    color: "#374151",
+    marginBottom: 10
   },
   header: {
     flexDirection: "row",
@@ -5858,7 +8438,7 @@ const styles = StyleSheet.create({
     bottom: 0,
     backgroundColor: "#FFFFFF",
     paddingTop: 56,
-    paddingHorizontal: 12,
+    paddingHorizontal: 0,
     shadowColor: "#000",
     shadowOpacity: 0.15,
     shadowRadius: 12,
@@ -5866,12 +8446,20 @@ const styles = StyleSheet.create({
     elevation: 8,
     zIndex: 1
   },
+  sidebarScrollView: {
+    flex: 1
+  },
+  sidebarScrollContent: {
+    paddingBottom: 20,
+    paddingHorizontal: 12
+  },
   sidebarHeader: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     marginBottom: 24,
     paddingBottom: 16,
+    paddingHorizontal: 12,
     borderBottomWidth: 1,
     borderBottomColor: "#E5E7EB"
   },
@@ -5905,9 +8493,39 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between"
   },
+  menuToggleItem: {
+    paddingVertical: 16,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#F3F4F6",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  subMenuToggleItem: {
+    paddingLeft: 32,
+    backgroundColor: "#F9FAFB"
+  },
+  smallSwitch: {
+    transform: [{ scaleX: 0.82 }, { scaleY: 0.82 }]
+  },
   menuItemText: {
     fontSize: 16,
     color: "#111827",
+    fontWeight: "400"
+  },
+  menuItemArrow: {
+    fontSize: 12,
+    color: "#6B7280",
+    marginLeft: 8
+  },
+  subMenuItem: {
+    paddingLeft: 32,
+    backgroundColor: "#F9FAFB"
+  },
+  subMenuItemText: {
+    fontSize: 15,
+    color: "#374151",
     fontWeight: "400"
   },
   debugMenuItem: {
@@ -6207,6 +8825,53 @@ const styles = StyleSheet.create({
     paddingBottom: 120,
     paddingHorizontal: 12
   },
+  mealInsightCardWrapper: {
+    position: "relative",
+    marginBottom: 16
+  },
+  mealInsightCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 16,
+    padding: 16,
+    flexDirection: "column",
+    shadowColor: "#000",
+    shadowOpacity: 0.08,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 3
+  },
+  mealInsightHeart: {
+    width: 24,
+    height: 24,
+    marginBottom: 12
+  },
+  mealInsightContent: {
+    flex: 1
+  },
+  mealInsightText: {
+    fontSize: 14,
+    color: "#111827",
+    lineHeight: 22,
+    marginBottom: 8
+  },
+  mealInsightSuggestions: {
+    marginTop: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: "#E5E7EB"
+  },
+  mealInsightSuggestionsTitle: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#6B7280",
+    marginBottom: 6
+  },
+  mealInsightSuggestionItem: {
+    fontSize: 13,
+    color: "#6B7280",
+    lineHeight: 20,
+    marginBottom: 4
+  },
   sectionLabelContainer: {
     flexDirection: "row",
     alignItems: "center",
@@ -6493,6 +9158,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     flexDirection: "row",
     alignItems: "center",
+    position: "relative",
     shadowColor: "#000",
     shadowOpacity: 0.08,
     shadowRadius: 10,
@@ -6511,16 +9177,25 @@ const styles = StyleSheet.create({
     fontSize: 18
   },
   mealInfo: {
-    flex: 1
+    flex: 1,
+    justifyContent: "center"
+  },
+  mealLabelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    position: "relative"
   },
   mealLabel: {
     fontSize: 16,
     color: "#111827",
-    fontWeight: "400"
+    fontWeight: "400",
+    lineHeight: 20
   },
   mealCalories: {
-    color: "#6B7280",
+    color: "#000000",
     fontSize: 12,
+    fontWeight: "700",
     marginTop: 4
   },
   mealMacros: {
@@ -6567,12 +9242,14 @@ const styles = StyleSheet.create({
   },
   tabIconWrap: {
     alignItems: "center",
-    justifyContent: "center"
+    justifyContent: "center",
+    position: "relative"
   },
   tabLabelContainer: {
     position: "relative",
     alignItems: "center",
-    justifyContent: "center"
+    justifyContent: "center",
+    minWidth: 60
   },
   tabLabel: {
     color: "#111827",
@@ -6588,6 +9265,15 @@ const styles = StyleSheet.create({
     height: 20,
     top: -26,
     right: -30
+  },
+  tabNewIndicator: {
+    position: "absolute",
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#DC2626",
+    top: -2,
+    right: -2
   },
   analysisContent: {
     paddingTop: 8,
@@ -6754,7 +9440,8 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: "center",
     paddingVertical: 10,
-    borderRadius: 22
+    borderRadius: 22,
+    position: "relative"
   },
   insightsSubTabActive: {
     backgroundColor: "#E0E7FF"
@@ -6766,6 +9453,15 @@ const styles = StyleSheet.create({
   },
   insightsSubTabLabelActive: {
     color: "#1D4ED8"
+  },
+  insightsSubTabIndicator: {
+    position: "absolute",
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "#DC2626",
+    top: 6,
+    right: 6
   },
   insightsContent: {
     paddingHorizontal: 12,
@@ -6791,11 +9487,21 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#E5E7EB"
   },
+  insightsCardTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 14
+  },
+  insightsTrendIcon: {
+    width: 24,
+    height: 24,
+    marginRight: 8
+  },
   insightsCardTitle: {
     fontSize: 20,
     fontWeight: "600",
     color: "#111827",
-    marginBottom: 14
+    flex: 1
   },
   insightsCardSummary: {
     fontSize: 16,
@@ -6819,19 +9525,18 @@ const styles = StyleSheet.create({
     marginBottom: 12
   },
   insightsTipRow: {
-    flexDirection: "row",
+    flexDirection: "column",
     alignItems: "flex-start",
-    marginBottom: 14
+    marginBottom: 20
   },
-  insightsTipBar: {
-    width: 5,
-    borderRadius: 3,
-    minHeight: 20,
-    alignSelf: "stretch",
-    marginRight: 10
+  insightsTipHeart: {
+    width: 24,
+    height: 24,
+    marginBottom: 8
   },
   insightsTipTextWrap: {
-    flex: 1
+    flex: 1,
+    width: "100%"
   },
   insightsTipItem: {
     fontSize: 14,
@@ -6919,6 +9624,221 @@ const styles = StyleSheet.create({
     paddingBottom: 24,
     justifyContent: "flex-start"
   },
+  addCameraScreen: {
+    flex: 1,
+    backgroundColor: "#000000"
+  },
+  addCameraStage: {
+    flex: 1,
+    position: "relative"
+  },
+  addCameraImage: {
+    width: "100%",
+    height: "100%"
+  },
+  addCameraPlaceholder: {
+    flex: 1,
+    backgroundColor: "#111827",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  addCameraPlaceholderText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "600"
+  },
+  addCameraPermissionButton: {
+    marginTop: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: "#2563EB"
+  },
+  addCameraPermissionButtonText: {
+    color: "#FFFFFF",
+    fontSize: 14,
+    fontWeight: "600"
+  },
+  addCameraAnalyzingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.35)",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  addCameraAnalyzingText: {
+    color: "#FFFFFF",
+    fontSize: 15,
+    fontWeight: "700",
+    marginTop: 12
+  },
+  addShutterWrap: {
+    position: "absolute",
+    bottom: 112,
+    left: 0,
+    right: 0,
+    alignItems: "center"
+  },
+  addShutterOuter: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    borderWidth: 4,
+    borderColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.25)"
+  },
+  addShutterInner: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: "#FFFFFF"
+  },
+  addGalleryButton: {
+    position: "absolute",
+    left: 86,
+    bottom: 116,
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: "rgba(255,255,255,0.92)",
+    borderWidth: 1,
+    borderColor: "rgba(17,24,39,0.12)",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#000",
+    shadowOpacity: 0.16,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3
+  },
+  addGalleryButtonIcon: {
+    width: 30,
+    height: 30
+  },
+  addFloatingComposer: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "#F3F4F6",
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 10
+  },
+  addKeyboardUnderlay: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: -40,
+    backgroundColor: "#F3F4F6"
+  },
+  addFloatingComposerExpanded: {
+    minHeight: 420
+  },
+  addFloatingTextContent: {
+    flex: 1,
+    minHeight: 0,
+    marginTop: 10
+  },
+  addComposerTabsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  addComposerTab: {
+    flex: 1,
+    alignItems: "center",
+    paddingVertical: 8
+  },
+  addComposerTabContent: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingBottom: 2
+  },
+  addComposerTabText: {
+    color: "#4B5563",
+    fontSize: 12,
+    fontWeight: "600",
+    letterSpacing: 0.2
+  },
+  addComposerTabTextActive: {
+    color: "#1D4ED8",
+    opacity: 1
+  },
+  addComposerProBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 999,
+    backgroundColor: "#111827"
+  },
+  addComposerProBadgeText: {
+    color: "#FFFFFF",
+    fontSize: 10,
+    fontWeight: "700",
+    letterSpacing: 0.8
+  },
+  addFloatingInput: {
+    marginTop: 0,
+    flex: 1,
+    minHeight: 260,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    borderRadius: 16,
+    padding: 14,
+    color: "#111827",
+    fontSize: 16
+  },
+  addFloatingActions: {
+    flexDirection: "row",
+    marginTop: 10,
+    marginBottom: 0
+  },
+  addSuggestionsSlot: {
+    height: 50,
+    marginTop: 8,
+    justifyContent: "center",
+    overflow: "hidden"
+  },
+  addFloatingSuggestionsContainer: {
+    marginTop: 0,
+    flexWrap: "nowrap",
+    alignItems: "center"
+  },
+  addFloatingCancel: {
+    flex: 1,
+    backgroundColor: "#E5E7EB",
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 12,
+    marginRight: 10
+  },
+  addFloatingCancelText: {
+    color: "#6B7280",
+    fontSize: 16,
+    fontWeight: "600"
+  },
+  addFloatingConfirm: {
+    flex: 1,
+    backgroundColor: "#2563EB",
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 12
+  },
+  addFloatingConfirmDisabled: {
+    opacity: 0.55
+  },
+  addFloatingConfirmText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "600"
+  },
   addHeader: {
     flexDirection: "row",
     alignItems: "center",
@@ -6973,11 +9893,62 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 18,
     minHeight: 240,
+    overflow: "hidden",
     shadowColor: "#000",
     shadowOpacity: 0.06,
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 4 },
     elevation: 2
+  },
+  addCardPhotoBackground: {
+    ...StyleSheet.absoluteFillObject
+  },
+  addCardPhotoOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(255,255,255,0.55)"
+  },
+  addCardContent: {
+    zIndex: 2
+  },
+  addPhotoActionsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 10
+  },
+  addPhotoButton: {
+    backgroundColor: "#EEF2FF",
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 12
+  },
+  addPhotoButtonDisabled: {
+    opacity: 0.65
+  },
+  addPhotoButtonText: {
+    color: "#1D4ED8",
+    fontSize: 13,
+    fontWeight: "600"
+  },
+  addPhotoClearButton: {
+    marginLeft: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 8
+  },
+  addPhotoClearButtonText: {
+    color: "#6B7280",
+    fontSize: 13,
+    fontWeight: "600"
+  },
+  addPhotoProgressRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 10
+  },
+  addPhotoProgressText: {
+    marginLeft: 8,
+    color: "#1D4ED8",
+    fontSize: 13,
+    fontWeight: "600"
   },
   addHint: {
     color: "#6B7280",
@@ -6988,6 +9959,11 @@ const styles = StyleSheet.create({
     minHeight: 160,
     color: "#111827",
     fontSize: 16
+  },
+  addInputForeground: {
+    backgroundColor: "rgba(255,255,255,0.82)",
+    borderRadius: 12,
+    padding: 10
   },
   templateNameContainer: {
     marginBottom: 20
@@ -7133,6 +10109,37 @@ const styles = StyleSheet.create({
     color: "#9CA3AF",
     marginTop: 24
   },
+  emptyStateContainer: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 60,
+    paddingHorizontal: 24
+  },
+  emptyStateImage: {
+    width: 200,
+    height: 200,
+    marginBottom: 12
+  },
+  emptyStateText: {
+    fontSize: 16,
+    color: "#6B7280",
+    textAlign: "center",
+    marginBottom: 24,
+    lineHeight: 22
+  },
+  emptyStateButton: {
+    backgroundColor: "#2563EB",
+    borderRadius: 999,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    minWidth: 160
+  },
+  emptyStateButtonText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "600",
+    textAlign: "center"
+  },
   exportContent: {
     paddingTop: 8,
     paddingBottom: 100,
@@ -7213,6 +10220,212 @@ const styles = StyleSheet.create({
     paddingTop: HEADER_TO_CONTENT_GAP,
     paddingBottom: 120,
     paddingHorizontal: 12
+  },
+  onboardingContainer: {
+    flex: 1,
+    paddingHorizontal: 24,
+    paddingTop: 56,
+    paddingBottom: 32,
+    justifyContent: "space-between"
+  },
+  onboardingTitle: {
+    fontSize: 24,
+    lineHeight: 34,
+    textAlign: "center",
+    color: "#111827",
+    fontWeight: "800"
+  },
+  onboardingSubtitle: {
+    marginTop: 20,
+    fontSize: 18,
+    lineHeight: 28,
+    textAlign: "center",
+    color: "#111827"
+  },
+  onboardingSubtitleSmall: {
+    marginTop: 8,
+    marginBottom: 12,
+    fontSize: 16,
+    textAlign: "center",
+    color: "#111827"
+  },
+  onboardingList: {
+    marginTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: "#D1D5DB"
+  },
+  onboardingListRow: {
+    minHeight: 52,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E5E7EB",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  onboardingListText: {
+    fontSize: 16,
+    color: "#111827",
+    fontWeight: "500"
+  },
+  onboardingListCheck: {
+    fontSize: 26,
+    color: "#111827",
+    width: 28,
+    textAlign: "center"
+  },
+  onboardingFootnote: {
+    marginTop: 22,
+    textAlign: "center",
+    fontSize: 13,
+    color: "#111827",
+    fontStyle: "italic"
+  },
+  onboardingBackLink: {
+    marginTop: 10,
+    alignItems: "center"
+  },
+  onboardingBackLinkText: {
+    fontSize: 14,
+    color: "#1885E8",
+    fontWeight: "500"
+  },
+  primaryButton: {
+    backgroundColor: "#1885E8",
+    borderRadius: 999,
+    minHeight: 56,
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 20
+  },
+  primaryButtonDisabled: {
+    opacity: 0.5
+  },
+  primaryButtonText: {
+    color: "#FFFFFF",
+    fontSize: 18,
+    fontWeight: "600"
+  },
+  onboardingFieldRow: {
+    minHeight: 56,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E5E7EB",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  onboardingFieldLabel: {
+    fontSize: 15,
+    color: "#111827",
+    fontWeight: "500"
+  },
+  onboardingDobLabelWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6
+  },
+  onboardingAgeText: {
+    fontSize: 12,
+    color: "#6B7280",
+    fontStyle: "italic",
+    fontWeight: "300"
+  },
+  onboardingFieldInput: {
+    backgroundColor: "#E5E7EB",
+    borderRadius: 999,
+    minWidth: 116,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    alignItems: "flex-end",
+    justifyContent: "center"
+  },
+  onboardingFieldInputText: {
+    color: "#111827",
+    fontSize: 14
+  },
+  onboardingFieldInputSmall: {
+    backgroundColor: "#E5E7EB",
+    borderRadius: 999,
+    minWidth: 70,
+    textAlign: "right",
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    color: "#111827",
+    fontSize: 14
+  },
+  inlineToggleRow: {
+    flexDirection: "row",
+    gap: 8
+  },
+  inlineTogglePill: {
+    backgroundColor: "#E5E7EB",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8
+  },
+  inlineTogglePillActive: {
+    backgroundColor: "#D1E7FF"
+  },
+  inlineToggleText: {
+    color: "#111827",
+    fontSize: 14,
+    fontWeight: "500"
+  },
+  inlineInputRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  onboardingUnitText: {
+    backgroundColor: "#E5E7EB",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    fontSize: 14,
+    color: "#111827"
+  },
+  onboardingSummaryRow: {
+    minHeight: 56,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E5E7EB",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  onboardingValuePill: {
+    backgroundColor: "#E5E7EB",
+    borderRadius: 999,
+    minWidth: 74,
+    textAlign: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: "#111827",
+    fontSize: 14,
+    fontWeight: "500"
+  },
+  onboardingValueInput: {
+    backgroundColor: "#E5E7EB",
+    borderRadius: 999,
+    minWidth: 74,
+    textAlign: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: "#111827",
+    fontSize: 14,
+    fontWeight: "500"
+  },
+  onboardingDobModal: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    width: "90%",
+    maxWidth: 420,
+    paddingTop: 10,
+    paddingBottom: 6
+  },
+  onboardingDobModalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingBottom: 4
   },
   personalInput: {
     backgroundColor: "#FFFFFF",
@@ -7350,6 +10563,17 @@ const styles = StyleSheet.create({
     minWidth: 60,
     alignItems: "flex-end"
   },
+  personalSectionTitle: {
+    marginTop: 8,
+    marginBottom: 12,
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#6B7280",
+    letterSpacing: 0.5
+  },
+  personalSectionTitleSpaced: {
+    marginTop: 28
+  },
   wheelPickerContainer: {
     height: ITEM_HEIGHT * VISIBLE_ITEMS,
     backgroundColor: "#FFFFFF",
@@ -7416,28 +10640,42 @@ const styles = StyleSheet.create({
     fontWeight: "400"
   },
   fieldRow: {
+    minHeight: 56,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 20
+    borderBottomWidth: 1,
+    borderBottomColor: "#E5E7EB"
   },
   fieldLabel: {
-    fontSize: 12,
-    fontWeight: "700",
+    fontSize: 15,
     color: "#111827",
-    letterSpacing: 0,
-    textTransform: "uppercase"
+    fontWeight: "500"
+  },
+  fieldLabelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6
+  },
+  fieldMetaText: {
+    fontSize: 12,
+    color: "#6B7280",
+    fontWeight: "400"
   },
   fieldValue: {
-    backgroundColor: "#F3F4F6",
-    borderRadius: 3,
-    paddingHorizontal: 12,
+    backgroundColor: "#E5E7EB",
+    borderRadius: 999,
+    paddingHorizontal: 14,
     paddingVertical: 8,
-    minWidth: 120,
-    alignItems: "flex-end"
+    minWidth: 116,
+    alignItems: "center",
+    justifyContent: "center"
   },
   fieldValueInput: {
-    textAlign: "right"
+    textAlign: "center",
+    color: "#111827",
+    fontSize: 14,
+    fontWeight: "500"
   },
   fieldValueError: {
     borderWidth: 1,
@@ -7448,27 +10686,54 @@ const styles = StyleSheet.create({
     color: "#111827",
     fontWeight: "400"
   },
+  subscriptionRightRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  subscriptionStatusText: {
+    fontSize: 14,
+    color: "#111827",
+    fontWeight: "400"
+  },
+  subscriptionPill: {
+    minWidth: 74,
+    paddingHorizontal: 12
+  },
+  upgradeInlineButton: {
+    backgroundColor: "#1885E8",
+    borderRadius: 999,
+    minHeight: 34,
+    paddingHorizontal: 14,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  upgradeInlineButtonText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "600"
+  },
   heightInputRow: {
     flexDirection: "row",
     gap: 8,
     alignItems: "center"
   },
   heightInput: {
-    backgroundColor: "#F3F4F6",
-    borderRadius: 3,
-    paddingHorizontal: 12,
+    backgroundColor: "#E5E7EB",
+    borderRadius: 999,
+    paddingHorizontal: 14,
     paddingVertical: 8,
-    width: 100,
-    fontSize: 12,
+    width: 88,
+    fontSize: 14,
     color: "#111827",
-    textAlign: "right"
+    textAlign: "center"
   },
   unitDropdown: {
-    backgroundColor: "#F3F4F6",
-    borderRadius: 3,
-    paddingHorizontal: 12,
+    backgroundColor: "#E5E7EB",
+    borderRadius: 999,
+    paddingHorizontal: 14,
     paddingVertical: 8,
-    minWidth: 60,
+    minWidth: 70,
     alignItems: "center"
   },
   modalOverlay: {
@@ -7580,6 +10845,56 @@ const styles = StyleSheet.create({
     color: "#6B7280",
     marginBottom: 16,
     letterSpacing: 0
+  },
+  foodDetailQuantityRow: {
+    flexDirection: "row",
+    gap: 12,
+    alignItems: "center",
+    marginBottom: 8
+  },
+  foodDetailQuantityInput: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    backgroundColor: "#FFFFFF",
+    fontSize: 16,
+    color: "#111827"
+  },
+  foodDetailUnitInput: {
+    minWidth: 80,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    backgroundColor: "#FFFFFF",
+    fontSize: 16,
+    color: "#111827"
+  },
+  foodDetailUnitButton: {
+    minWidth: 92,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    backgroundColor: "#FFFFFF",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  foodDetailUnitButtonText: {
+    fontSize: 16,
+    color: "#111827"
+  },
+  foodDetailUnitButtonChevron: {
+    marginLeft: 10,
+    color: "#6B7280",
+    fontSize: 14,
+    fontWeight: "600"
   },
   foodDetailMacros: {
     flexDirection: "row",
@@ -7828,6 +11143,74 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: "#FFFFFF",
     fontWeight: "600"
+  },
+  newUserPaywallOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 20
+  },
+  newUserPaywallContent: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 20,
+    width: "100%",
+    maxWidth: 400,
+    shadowColor: "#000",
+    shadowOpacity: 0.25,
+    shadowRadius: 20,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 10,
+    position: "relative"
+  },
+  newUserPaywallCloseButton: {
+    position: "absolute",
+    top: 16,
+    right: 16,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#F3F4F6",
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 1
+  },
+  newUserPaywallCloseText: {
+    fontSize: 18,
+    color: "#6B7280",
+    fontWeight: "600"
+  },
+  newUserPaywallBody: {
+    padding: 32,
+    paddingTop: 48,
+    alignItems: "center"
+  },
+  newUserPaywallTitle: {
+    fontSize: 24,
+    fontWeight: "700",
+    color: "#111827",
+    textAlign: "center",
+    marginBottom: 12
+  },
+  newUserPaywallSubtitle: {
+    fontSize: 16,
+    color: "#6B7280",
+    textAlign: "center",
+    lineHeight: 24,
+    marginBottom: 32
+  },
+  newUserPaywallUpgradeButton: {
+    backgroundColor: "#4263EB",
+    borderRadius: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 32,
+    width: "100%",
+    alignItems: "center"
+  },
+  newUserPaywallUpgradeButtonText: {
+    fontSize: 17,
+    fontWeight: "600",
+    color: "#FFFFFF"
   },
   foodDetailLoading: {
     padding: 24,

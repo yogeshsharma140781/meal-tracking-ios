@@ -2,6 +2,9 @@
 <Workspace
    version = "1.0">
    <FileRef
+      location = "group:Joul.storekit">
+   </FileRef>
+   <FileRef
       location = "group:Joul.xcodeproj">
    </FileRef>
    <FileRef

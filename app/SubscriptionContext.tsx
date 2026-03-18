@@ -52,6 +52,8 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
     }
     
     try {
+      // Use cached data if available - RevenueCat caches CustomerInfo between launches
+      // This ensures valid subscriptions are detected even if network is temporarily unavailable
       const customerInfo = await Purchases.getCustomerInfo();
       console.log("=== ENTITLEMENT CHECK ===");
       console.log("Active entitlements keys:", Object.keys(customerInfo.entitlements.active));
@@ -131,7 +133,76 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
     } catch (err) {
       console.error("Entitlement check error:", err);
       const message = err instanceof Error ? err.message : "Unknown error";
-      setState({ isPro: false, isLoading: false, error: message });
+      
+      // IMPORTANT: Don't immediately set isPro = false on errors
+      // RevenueCat caches CustomerInfo, so network errors shouldn't invalidate valid subscriptions
+      // Only update state if we're certain the subscription is expired
+      // Preserve last known state to avoid false negatives for valid subscribers
+      
+      // Check if this is a network error vs a real expiration
+      const isNetworkError = err instanceof Error && (
+        message.includes("network") || 
+        message.includes("Network") ||
+        message.includes("timeout") ||
+        message.includes("offline") ||
+        (err as any).code === "NETWORK_ERROR" ||
+        (err as any).code === "STORE_PROBLEM_ERROR"
+      );
+      
+      // IMPORTANT: On errors, try to use cached data or preserve last known state
+      // RevenueCat caches CustomerInfo, so getCustomerInfo() should work offline
+      // If it fails, it's likely a temporary issue - don't invalidate valid subscriptions
+      console.warn("Entitlement check failed - attempting to use cached data");
+      
+      // Try to get cached customer info as fallback
+      try {
+        // RevenueCat should have cached data - try to access it synchronously if possible
+        // Note: This is a best-effort attempt to get cached data
+        Purchases.getCustomerInfo()
+          .then((cachedInfo) => {
+            console.log("Got cached customer info after error");
+            const cachedEntitlement = cachedInfo.entitlements.active[ENTITLEMENT_ID];
+            if (cachedEntitlement) {
+              const expirationDate = cachedEntitlement.expirationDate;
+              if (expirationDate) {
+                const expDate = new Date(expirationDate);
+                const now = new Date();
+                if (expDate >= now) {
+                  console.log("Using cached entitlement (valid until:", expirationDate, ")");
+                  setState({ isPro: true, isLoading: false, error: null });
+                  return;
+                }
+              } else {
+                // No expiration date, assume valid
+                setState({ isPro: true, isLoading: false, error: null });
+                return;
+              }
+            }
+            // No cached entitlement found - preserve previous state if it was Pro, otherwise set to false
+            setState((prev) => ({ 
+              ...prev, // Preserve isPro state (might be true from previous session)
+              isLoading: false, 
+              error: isNetworkError ? "Network unavailable - using cached subscription status" : message 
+            }));
+          })
+          .catch(() => {
+            // Cache access also failed - preserve previous state
+            console.warn("Cache access also failed - preserving last known subscription state");
+            setState((prev) => ({ 
+              ...prev, // Preserve isPro state
+              isLoading: false, 
+              error: isNetworkError ? "Network unavailable - using cached subscription status" : message 
+            }));
+          });
+      } catch (cacheErr) {
+        // Fallback if promise-based approach fails
+        console.warn("Failed to access cache, preserving last known subscription state");
+        setState((prev) => ({ 
+          ...prev, // Preserve isPro state
+          isLoading: false, 
+          error: isNetworkError ? "Network unavailable - using cached subscription status" : message 
+        }));
+      }
     }
   }, []);
 
@@ -151,53 +222,105 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
     
     const init = async () => {
       try {
+        // Check if Purchases module is available before using it
+        if (typeof Purchases === "undefined" || !Purchases) {
+          console.error("Purchases module not available");
+          setState({ isPro: false, isLoading: false, error: "RevenueCat module not available" });
+          return;
+        }
+        
+        // Check if required functions exist
+        if (typeof Purchases.setLogLevel !== "function" || typeof Purchases.configure !== "function") {
+          console.error("Purchases functions not available");
+          setState({ isPro: false, isLoading: false, error: "RevenueCat functions not available" });
+          return;
+        }
+        
         Purchases.setLogLevel(LOG_LEVEL.VERBOSE);
         await Purchases.configure({ apiKey: REVENUECAT_API_KEY_IOS });
         if (cancelled) return;
+        // Try to get customer info immediately after configuration (uses cache)
+        try {
+          const customerInfo = await Purchases.getCustomerInfo();
+          const entitlement = customerInfo.entitlements.active[ENTITLEMENT_ID];
+          if (entitlement) {
+            const expirationDate = entitlement.expirationDate;
+            if (expirationDate) {
+              const expDate = new Date(expirationDate);
+              const now = new Date();
+              if (expDate >= now) {
+                console.log("Found valid subscription on init");
+                setState({ isPro: true, isLoading: false, error: null });
+                // Still run full checkEntitlement for complete validation
+                await checkEntitlement();
+                return;
+              }
+            } else {
+              // No expiration, assume valid
+              setState({ isPro: true, isLoading: false, error: null });
+              await checkEntitlement();
+              return;
+            }
+          }
+        } catch (cacheErr) {
+          console.warn("Initial cache check failed, proceeding with full check");
+        }
         await checkEntitlement();
       } catch (err) {
         if (!cancelled) {
           const message = err instanceof Error ? err.message : "Failed to initialize RevenueCat";
-          setState({ isPro: false, isLoading: false, error: message });
+          console.error("RevenueCat initialization error:", err);
+          // Don't immediately set isPro = false, let checkEntitlement handle it
+          // This allows the error handling in checkEntitlement to try cached data
+          await checkEntitlement();
         }
       }
     };
     init();
     
-    listener = Purchases.addCustomerInfoUpdateListener((info) => {
-      if (cancelled) return;
-      
-      // If manually reset, ignore customer info updates (keep as free user)
-      if (isManuallyResetRef.current) {
-        console.log("Ignoring customer info update - manually reset to free user");
-        return;
-      }
-      
-      console.log("=== CUSTOMER INFO UPDATE LISTENER ===");
-      console.log("Active entitlements:", Object.keys(info.entitlements.active));
-      const entitlement = info.entitlements.active[ENTITLEMENT_ID];
-      console.log("Entitlement found:", !!entitlement);
-      let isPro = typeof entitlement !== "undefined";
-      
-      // Check expiration date
-      if (isPro && entitlement) {
-        const expirationDate = entitlement.expirationDate;
-        if (expirationDate) {
-          const expDate = new Date(expirationDate);
-          const now = new Date();
-          if (expDate < now) {
-            console.warn("⚠️ Entitlement expired in listener, setting isPro to false");
-            isPro = false;
-          } else {
-            console.log("Entitlement valid until:", expirationDate);
+    // Add listener for customer info updates (e.g., when subscription changes)
+    // Note: Type definitions may not match runtime behavior - handle defensively
+    try {
+      const subscriptionResult = Purchases.addCustomerInfoUpdateListener((info) => {
+        if (cancelled) return;
+        
+        // If manually reset, ignore customer info updates (keep as free user)
+        if (isManuallyResetRef.current) {
+          console.log("Ignoring customer info update - manually reset to free user");
+          return;
+        }
+        
+        console.log("=== CUSTOMER INFO UPDATE LISTENER ===");
+        console.log("Active entitlements:", Object.keys(info.entitlements.active));
+        const entitlement = info.entitlements.active[ENTITLEMENT_ID];
+        console.log("Entitlement found:", !!entitlement);
+        let isPro = typeof entitlement !== "undefined";
+        
+        // Check expiration date
+        if (isPro && entitlement) {
+          const expirationDate = entitlement.expirationDate;
+          if (expirationDate) {
+            const expDate = new Date(expirationDate);
+            const now = new Date();
+            if (expDate < now) {
+              console.warn("⚠️ Entitlement expired in listener, setting isPro to false");
+              isPro = false;
+            } else {
+              console.log("Entitlement valid until:", expirationDate);
+            }
           }
         }
-      }
-      
-      console.log("Setting isPro to:", isPro);
-      console.log("=== END LISTENER ===");
-      setState((prev) => ({ ...prev, isPro, isLoading: false }));
-    });
+        
+        console.log("Setting isPro to:", isPro);
+        console.log("=== END LISTENER ===");
+        setState((prev) => ({ ...prev, isPro, isLoading: false }));
+      });
+      // Store subscription for cleanup (handle type mismatch defensively)
+      listener = (subscriptionResult as any) || null;
+    } catch (err) {
+      console.warn("Failed to add customer info update listener:", err);
+      listener = null;
+    }
     
     // Refresh subscription when app comes to foreground
     const handleAppStateChange = (nextAppState: AppStateStatus) => {
@@ -220,8 +343,9 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
     return () => {
       cancelled = true;
       try {
-        if (listener && typeof listener.remove === 'function') {
-          listener.remove();
+        // RevenueCat listener cleanup - check if listener exists and has remove method
+        if (listener && typeof (listener as any).remove === 'function') {
+          (listener as any).remove();
         }
       } catch (err) {
         console.warn("Error removing listener:", err);
@@ -251,8 +375,15 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
 
       // Fetch offerings so we can see what RevenueCat is returning,
       // but don't assume availablePackages is always defined.
-      const offerings = await Purchases.getOfferings();
-      console.log("Available offerings:", Object.keys(offerings.all));
+      let offerings;
+      try {
+        offerings = await Purchases.getOfferings();
+        console.log("Available offerings:", Object.keys(offerings.all));
+      } catch (offeringsError: any) {
+        console.warn("Failed to fetch offerings (this is OK if products aren't configured yet):", offeringsError?.message || offeringsError);
+        // Continue anyway - the paywall might still work with cached data
+        offerings = await Purchases.getOfferings().catch(() => ({ all: {}, current: null }));
+      }
 
       const current = offerings.current;
       if (!current) {
@@ -280,27 +411,7 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
       }
 
       console.log("Presenting paywall…");
-      const result = await RevenueCatUI.presentPaywall({
-        callbacks: {
-          onPurchaseCompleted: async () => {
-            console.log("Purchase completed callback fired");
-            // Clear manual reset flag so subscription can be detected
-            isManuallyResetRef.current = false;
-            console.log("Manual reset flag cleared - subscription will be detected");
-            // Sync purchases to ensure RevenueCat has the latest info
-            try {
-              await Purchases.syncPurchases();
-              console.log("Purchases synced");
-            } catch (syncErr) {
-              console.warn("Sync error:", syncErr);
-            }
-            // Give RevenueCat a moment to sync, then refresh
-            setTimeout(async () => {
-              await checkEntitlement();
-            }, 500);
-          }
-        }
-      });
+      const result = await RevenueCatUI.presentPaywall();
       console.log("Paywall result:", result);
       
       // If purchase was successful, sync purchases and clear manual reset flag
@@ -355,11 +466,8 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
   const presentCustomerCenter = useCallback(async () => {
     if (Platform.OS !== "ios") return;
     try {
-      await RevenueCatUI.presentCustomerCenter({
-        callbacks: {
-          onRestoreCompleted: () => checkEntitlement()
-        }
-      });
+      await RevenueCatUI.presentCustomerCenter();
+      // Refresh entitlements after customer center closes (user may have restored purchases)
       await checkEntitlement();
     } catch (err) {
       console.warn("Customer Center error:", err);

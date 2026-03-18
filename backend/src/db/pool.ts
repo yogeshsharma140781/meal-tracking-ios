@@ -1,7 +1,5 @@
-import dotenv from "dotenv";
+import "dotenv/config";
 import { Pool } from "pg";
-
-dotenv.config();
 
 export const hasDatabase = Boolean(process.env.DATABASE_URL);
 

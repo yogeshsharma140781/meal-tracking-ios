@@ -2,7 +2,7 @@ import { Router } from "express";
 import { randomUUID } from "crypto";
 import { hasDatabase, pool } from "../db/pool";
 import { FoodResolverService, NUTRIENT_DB } from "../services/foodResolver";
-import { hasOpenAi, parseMealWithAi } from "../services/aiNutrition";
+import { hasOpenAi, parseMealPhotoWithAi, parseMealWithAi } from "../services/aiNutrition";
 import { NutritionCalculator } from "../services/nutritionCalculator";
 import { AttributionEngine } from "../services/attributionEngine";
 import { NutrientTotals, emptyTotals } from "../utils/types";
@@ -417,13 +417,50 @@ mealsRouter.get("/days/:day/nutrients", async (req, res) => {
   });
 });
 
+mealsRouter.post("/photo-describe", async (req, res) => {
+  try {
+    if (!hasOpenAi) {
+      return res.status(503).json({ error: "AI image analysis is not configured on the server" });
+    }
+
+    const imageBase64 = String(req.body?.imageBase64 || "").trim();
+    const mimeType = String(req.body?.mimeType || "image/jpeg").trim();
+
+    if (!imageBase64) {
+      return res.status(400).json({ error: "imageBase64 is required" });
+    }
+
+    // Protect the backend from very large uploads in JSON mode.
+    if (imageBase64.length > 6_500_000) {
+      return res.status(413).json({ error: "Image is too large; please try a smaller photo" });
+    }
+
+    const result = await parseMealPhotoWithAi(imageBase64, mimeType);
+    return res.json(result);
+  } catch (error) {
+    console.error("Failed to analyze meal photo:", error);
+    return res.status(500).json({ error: "failed to analyze meal photo" });
+  }
+});
+
 mealsRouter.post("/food-insights", async (req, res) => {
   try {
-    const { foodName, nutrients, quantity, unit, grams, mealType, userGoal, otherFoodsToday, sameMealFoods } = req.body;
+    const { foodName, nutrients, quantity, unit, grams, mealType, userGoal, userContext, otherFoodsToday, sameMealFoods } = req.body;
 
     if (!foodName || !nutrients) {
       return res.status(400).json({ error: "foodName and nutrients are required" });
     }
+
+    // Build userContext from request; prefer userContext over legacy userGoal
+    const uc = userContext && typeof userContext === "object" ? {
+      goal: userContext.goal ?? userGoal ?? null,
+      age: userContext.age != null ? Number(userContext.age) : null,
+      weightKg: userContext.weightKg != null ? Number(userContext.weightKg) : null,
+      heightCm: userContext.heightCm != null ? Number(userContext.heightCm) : null,
+      genderAtBirth: userContext.genderAtBirth === "male" || userContext.genderAtBirth === "female" ? userContext.genderAtBirth : null,
+      activityLevel: userContext.activityLevel ? String(userContext.activityLevel) : null,
+      bmi: userContext.bmi != null ? Number(userContext.bmi) : null
+    } : undefined;
 
     const insights = await getFoodInsights({
       foodName: String(foodName),
@@ -432,7 +469,8 @@ mealsRouter.post("/food-insights", async (req, res) => {
       unit: String(unit) || "serving",
       grams: Number(grams) || 100,
       mealType: mealType ? String(mealType) : undefined,
-      userGoal: userGoal ? String(userGoal) : "reduce_cholesterol_maintain_weight",
+      userGoal: userGoal ? String(userGoal) : undefined,
+      userContext: uc,
       otherFoodsToday: Array.isArray(otherFoodsToday) ? otherFoodsToday : undefined,
       sameMealFoods: Array.isArray(sameMealFoods) ? sameMealFoods : undefined
     });

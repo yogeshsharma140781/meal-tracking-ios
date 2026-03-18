@@ -4,9 +4,14 @@
   "main": "node_modules/expo/AppEntry.js",
   "scripts": {
     "start": "expo start",
+    "start:production": "NODE_ENV=production expo start --no-dev --minify",
     "ios": "expo run:ios",
     "ios:production": "open ios/Joul.xcworkspace",
-    "ios:production:simulator": "xcodebuild -workspace ios/Joul.xcworkspace -scheme Joul -configuration Release -destination 'platform=iOS Simulator,name=iPhone 16e' -derivedDataPath ios/build build && xcrun simctl install booted ios/build/Build/Products/Release-iphonesimulator/Joul.app && xcrun simctl launch booted com.anonymous.meal-tracking",
+    "ios:production:simulator": "NODE_ENV=production xcodebuild -workspace ios/Joul.xcworkspace -scheme Joul -configuration Release -destination 'platform=iOS Simulator,name=iPhone 16e' -derivedDataPath ios/build build && xcrun simctl install booted ios/build/Build/Products/Release-iphonesimulator/Joul.app && xcrun simctl launch booted com.anonymous.meal-tracking",
+    "build": "xcodebuild -workspace ios/Joul.xcworkspace -scheme Joul -configuration Release -destination 'platform=iOS Simulator,name=iPhone 16e' -derivedDataPath ios/build build",
+    "build:production": "NODE_ENV=production xcodebuild -workspace ios/Joul.xcworkspace -scheme Joul -configuration Release -destination 'platform=iOS Simulator,name=iPhone 16e' -derivedDataPath ios/build build",
+    "build:device": "xcodebuild -workspace ios/Joul.xcworkspace -scheme Joul -configuration Release -destination generic/platform=iOS -derivedDataPath ios/build build",
+    "build:device:production": "NODE_ENV=production xcodebuild -workspace ios/Joul.xcworkspace -scheme Joul -configuration Release -destination generic/platform=iOS -derivedDataPath ios/build build",
     "android": "expo run:android",
     "postinstall": "sh ./scripts/fix-expo-nested-modules.sh"
   },
@@ -16,19 +21,33 @@
   "description": "",
   "dependencies": {
     "@react-native-async-storage/async-storage": "^2.2.0",
+    "@react-native-community/datetimepicker": "8.4.4",
+    "@shopify/react-native-skia": "2.2.12",
     "babel-preset-expo": "^54.0.9",
     "expo": "^54.0.31",
     "expo-asset": "^12.0.12",
+    "expo-camera": "^55.0.9",
     "expo-file-system": "^19.0.21",
+    "expo-image-picker": "latest",
+    "expo-notifications": "^0.31.5",
     "expo-print": "~14.0.1",
+    "expo-secure-store": "^15.0.8",
     "expo-sharing": "~13.0.1",
     "react": "19.1.0",
     "react-native": "^0.81.5",
-    "react-native-svg": "^15.15.1"
+    "react-native-purchases": "^9.7.6",
+    "react-native-purchases-ui": "^9.7.6",
+    "react-native-reanimated": "~4.1.1",
+    "react-native-svg": "^15.15.1",
+    "react-native-webview": "^13.16.0",
+    "react-native-worklets": "^0.7.2",
+    "react-refresh": "^0.18.0"
   },
   "devDependencies": {
     "@types/react": "^19.2.9",
     "@types/react-native": "^0.73.0",
+    "metro-minify-terser": "^0.83.3",
+    "react-native-svg-transformer": "^1.5.3",
     "typescript": "^5.9.3"
   }
 }
