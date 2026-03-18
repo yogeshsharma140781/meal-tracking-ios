@@ -4,6 +4,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   Pressable,
   View,
   StyleSheet,
@@ -4589,8 +4590,19 @@ function AppContent() {
 
     return (
       <SafeAreaView style={styles.container}>
-        <View style={styles.onboardingContainer}>
-          {onboardingStep === 0 && (
+        <KeyboardAvoidingView
+          style={{ flex: 1 }}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          keyboardVerticalOffset={0}
+        >
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+            <ScrollView
+              contentContainerStyle={styles.onboardingContainer}
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode="on-drag"
+              showsVerticalScrollIndicator={false}
+            >
+              {onboardingStep === 0 && (
             <>
               <Text style={styles.onboardingTitle}>Let’s personalize your plan</Text>
               <Text style={styles.onboardingSubtitle}>
@@ -4605,7 +4617,7 @@ function AppContent() {
             </>
           )}
 
-          {onboardingStep === 1 && (
+              {onboardingStep === 1 && (
             <>
               <Text style={styles.onboardingTitle}>What’s your main goal?</Text>
               <View style={styles.onboardingList}>
@@ -4636,7 +4648,7 @@ function AppContent() {
             </>
           )}
 
-          {onboardingStep === 2 && (
+              {onboardingStep === 2 && (
             <>
               <Text style={styles.onboardingTitle}>Basic Profile</Text>
               <Text style={styles.onboardingSubtitleSmall}>Tell us about you</Text>
@@ -4734,7 +4746,7 @@ function AppContent() {
             </>
           )}
 
-          {onboardingStep === 3 && (
+              {onboardingStep === 3 && (
             <>
               <Text style={styles.onboardingTitle}>Our recommendation</Text>
               <Text style={styles.onboardingSubtitleSmall}>Daily values based on your input</Text>
@@ -4785,8 +4797,10 @@ function AppContent() {
                 <Text style={styles.onboardingBackLinkText}>Previous</Text>
               </TouchableOpacity>
             </>
-          )}
-        </View>
+              )}
+            </ScrollView>
+          </TouchableWithoutFeedback>
+        </KeyboardAvoidingView>
         <Modal visible={showOnboardingDobPicker} transparent animationType="fade">
           <TouchableOpacity
             style={styles.modalOverlay}
