@@ -21,6 +21,7 @@ import {
   AppState,
   Switch,
   ActivityIndicator,
+  Linking,
   Alert
 } from "react-native";
 import { WebView } from "react-native-webview";
@@ -1663,6 +1664,28 @@ const NUTRIENT_EXPLANATIONS: Record<string, string> = {
     "Potassium supports heart and muscle function; aim for 2600mg daily from bananas, potatoes, and beans."
 };
 
+const HEALTH_CITATION_SOURCES: { label: string; url: string }[] = [
+  {
+    label: "NIH Office of Dietary Supplements: Dietary Reference Intakes (DRIs)",
+    url: "https://ods.od.nih.gov/HealthInformation/Dietary_Reference_Intakes.aspx"
+  },
+  {
+    label: "USDA/HHS: Dietary Guidelines for Americans",
+    url: "https://www.dietaryguidelines.gov/"
+  },
+  {
+    label: "Mifflin-St Jeor equation reference (PubMed)",
+    url: "https://pubmed.ncbi.nlm.nih.gov/2305711/"
+  },
+  {
+    label: "WHO: Salt reduction (sodium guidance)",
+    url: "https://www.who.int/news-room/fact-sheets/detail/salt-reduction"
+  }
+];
+
+const HEALTH_CONTENT_DISCLAIMER =
+  "Nutrition targets and insights are informational only and not medical advice. Please consult a qualified healthcare professional for diagnosis or treatment decisions.";
+
 const MICRO_KEYS: MicroKey[] = [
   "fiber_g",
   "sodium_mg",
@@ -2649,7 +2672,7 @@ function getContributors(
 
 function AppContent() {
   const { isPro, isLoading: subscriptionLoading, presentPaywall, presentCustomerCenter } = useSubscription();
-  const [view, setView] = useState<"home" | "add" | "meal" | "export" | "personal" | "savedFoods" | "terms" | "privacy" | "onboarding">("home");
+  const [view, setView] = useState<"home" | "add" | "meal" | "export" | "personal" | "savedFoods" | "terms" | "privacy" | "onboarding" | "sources">("home");
   const [showTermsPrivacySubmenu, setShowTermsPrivacySubmenu] = useState(false);
   const [webViewLoading, setWebViewLoading] = useState(true);
   const [webViewError, setWebViewError] = useState<string | null>(null);
@@ -2744,6 +2767,9 @@ function AppContent() {
   const reminderDeviceIdRef = useRef<string | null>(null);
   const reminderPushTokenRef = useRef<string | null>(null);
   const [showReminderTimePicker, setShowReminderTimePicker] = useState(false);
+  const sourcesReturnViewRef = useRef<
+    "home" | "add" | "meal" | "export" | "personal" | "savedFoods" | "terms" | "privacy" | "onboarding"
+  >("home");
 
   const addScrollRef = useRef<ScrollView>(null);
   const addInputRef = useRef<TextInput>(null);
@@ -2818,7 +2844,9 @@ function AppContent() {
   useEffect(() => {
     if (!hydrated || subscriptionLoading) return;
     if (isPro) return;
-    if (view === "onboarding") return;
+    // Launch paywall should only auto-show from home, not when navigating
+    // onboarding/compliance screens like Sources & methodology.
+    if (view !== "home") return;
     if (hasShownLaunchPaywallRef.current) return;
     hasShownLaunchPaywallRef.current = true;
     const timer = setTimeout(() => {
@@ -3702,6 +3730,29 @@ function AppContent() {
       console.warn("Error saving dismissed insight:", err);
     }
   }, [todayKey]);
+
+  const openHealthCitation = useCallback(async (url: string) => {
+    try {
+      const supported = await Linking.canOpenURL(url);
+      if (!supported) {
+        Alert.alert("Unable to open link", "Please copy and open this URL in your browser.", [
+          { text: "OK" }
+        ]);
+        return;
+      }
+      await Linking.openURL(url);
+    } catch (err) {
+      console.warn("Failed to open citation link:", err);
+      Alert.alert("Unable to open link", "Please try again.");
+    }
+  }, []);
+
+  const openSourcesScreen = useCallback(() => {
+    if (view !== "sources") {
+      sourcesReturnViewRef.current = view;
+    }
+    setView("sources");
+  }, [view]);
 
   // Analysis tab uses the same date as MEALS page
   const analysisDayData = getDayData(selectedDate);
@@ -4789,6 +4840,10 @@ function AppContent() {
                 </View>
               </View>
               <Text style={styles.onboardingFootnote}>You can change this anytime</Text>
+              <TouchableOpacity style={styles.sourcesNavRow} onPress={openSourcesScreen} activeOpacity={0.8}>
+                <Text style={styles.sourcesNavText}>Sources & methodology</Text>
+                <Text style={styles.sourcesNavChevron}>›</Text>
+              </TouchableOpacity>
               {customTargetError ? <Text style={styles.addError}>{customTargetError}</Text> : null}
               <TouchableOpacity style={styles.primaryButton} onPress={handleFinishOnboarding}>
                 <Text style={styles.primaryButtonText}>Start tracking</Text>
@@ -5398,6 +5453,10 @@ function AppContent() {
             />
           </View>
           {customTargetError ? <Text style={styles.addError}>{customTargetError}</Text> : null}
+          <TouchableOpacity style={styles.sourcesNavRow} onPress={openSourcesScreen} activeOpacity={0.8}>
+            <Text style={styles.sourcesNavText}>Sources & methodology</Text>
+            <Text style={styles.sourcesNavChevron}>›</Text>
+          </TouchableOpacity>
         </ScrollView>
       </SafeAreaView>
     );
@@ -7126,6 +7185,53 @@ function AppContent() {
     );
   }
 
+  if (view === "sources") {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.addHeader}>
+          <TouchableOpacity
+            style={styles.iconButton}
+            onPress={() => setView(sourcesReturnViewRef.current)}
+          >
+            <Text style={styles.iconText}>‹</Text>
+          </TouchableOpacity>
+          <View style={styles.headerCenter}>
+            <Text style={styles.headerTitle}>Sources & methodology</Text>
+          </View>
+          <View style={styles.iconButton} />
+        </View>
+        <ScrollView
+          style={{ flex: 1, backgroundColor: "#F5F5F7" }}
+          contentContainerStyle={styles.sourcesScreenContent}
+          keyboardShouldPersistTaps="handled"
+        >
+          <View style={styles.analysisSourcesCard}>
+            <Text style={styles.analysisSourcesTitle}>How recommendations are calculated</Text>
+            <Text style={styles.analysisSourcesDisclaimer}>
+              We estimate calorie needs from BMR/TDEE and activity level, then derive macro
+              targets from your goals and profile inputs.
+            </Text>
+            <Text style={styles.analysisSourcesDisclaimer}>{HEALTH_CONTENT_DISCLAIMER}</Text>
+          </View>
+
+          <View style={styles.analysisSourcesCard}>
+            <Text style={styles.analysisSourcesTitle}>Reference sources</Text>
+            {HEALTH_CITATION_SOURCES.map((source) => (
+              <TouchableOpacity
+                key={`sources-screen-${source.url}`}
+                onPress={() => openHealthCitation(source.url)}
+                activeOpacity={0.7}
+                style={styles.analysisSourceLinkRow}
+              >
+                <Text style={styles.analysisSourceLinkText}>{source.label}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
   if (view === "export") {
     return (
       <SafeAreaView style={styles.container}>
@@ -7263,7 +7369,18 @@ function AppContent() {
         </View>
         <View style={styles.headerCenter}>
           {activeTab === "insights" ? (
-            <Text style={styles.headerTitle}>Insights</Text>
+            <View style={styles.headerInsightsCenter}>
+              <Text style={styles.headerTitle}>Insights</Text>
+              <TouchableOpacity
+                style={styles.headerInsightsInfoButton}
+                onPress={openSourcesScreen}
+                activeOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityLabel="Open sources and methodology"
+              >
+                <Text style={styles.headerInsightsInfoButtonText}>ⓘ</Text>
+              </TouchableOpacity>
+            </View>
           ) : (
             <>
               <TouchableOpacity style={styles.iconButton} onPress={goToPrevDay}>
@@ -7882,6 +7999,11 @@ function AppContent() {
                 </TouchableOpacity>
               )}
               </View>
+
+              <TouchableOpacity style={styles.sourcesNavRow} onPress={openSourcesScreen} activeOpacity={0.8}>
+                <Text style={styles.sourcesNavText}>Sources & methodology</Text>
+                <Text style={styles.sourcesNavChevron}>›</Text>
+              </TouchableOpacity>
             </ScrollView>
             ) : (
           <>
@@ -7911,6 +8033,11 @@ function AppContent() {
               {NUTRIENT_EXPLANATIONS[selectedNutrient.label] ??
                 `${selectedNutrient.label} supports overall health; target is based on general guidelines.`}
             </Text>
+
+            <TouchableOpacity style={styles.sourcesNavRow} onPress={openSourcesScreen} activeOpacity={0.8}>
+              <Text style={styles.sourcesNavText}>Sources & methodology</Text>
+              <Text style={styles.sourcesNavChevron}>›</Text>
+            </TouchableOpacity>
 
             {(() => {
               const raw =
@@ -8377,6 +8504,24 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     gap: 8
+  },
+  headerInsightsCenter: {
+    width: "100%",
+    alignItems: "center",
+    justifyContent: "center",
+    position: "relative"
+  },
+  headerInsightsInfoButton: {
+    position: "absolute",
+    left: "50%",
+    marginLeft: 46,
+    paddingHorizontal: 2,
+    paddingVertical: 2
+  },
+  headerInsightsInfoButtonText: {
+    fontSize: 15,
+    color: "#111827",
+    fontWeight: "500"
   },
   headerTitle: {
     fontSize: 16,
@@ -9293,6 +9438,61 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     paddingBottom: 120,
     paddingHorizontal: 12
+  },
+  sourcesScreenContent: {
+    paddingTop: 8,
+    paddingBottom: 120,
+    paddingHorizontal: 12,
+    gap: 10
+  },
+  sourcesNavRow: {
+    marginTop: 14,
+    paddingHorizontal: 2,
+    minHeight: 28,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-start",
+    gap: 3
+  },
+  sourcesNavText: {
+    fontSize: 12,
+    fontWeight: "400",
+    fontStyle: "italic",
+    color: "#6B7280"
+  },
+  sourcesNavChevron: {
+    fontSize: 14,
+    color: "#6B7280",
+    fontWeight: "400"
+  },
+  analysisSourcesCard: {
+    marginTop: 14,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    borderWidth: 1,
+    borderColor: "#E5E7EB"
+  },
+  analysisSourcesTitle: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#111827"
+  },
+  analysisSourcesDisclaimer: {
+    marginTop: 8,
+    fontSize: 12,
+    lineHeight: 18,
+    color: "#4B5563"
+  },
+  analysisSourceLinkRow: {
+    marginTop: 8
+  },
+  analysisSourceLinkText: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: "#1D4ED8",
+    textDecorationLine: "underline"
   },
   analysisMacroList: {
     flexDirection: "column",
