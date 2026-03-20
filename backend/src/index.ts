@@ -19,6 +19,11 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
+// Same health check under /v1 for docs and quick pings (e.g. Safari on device).
+app.get("/v1/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
 app.use("/v1/meals", mealsRouter);
 app.use("/v1/foods", foodsRouter);
 app.use("/v1/feedback", feedbackRouter);
