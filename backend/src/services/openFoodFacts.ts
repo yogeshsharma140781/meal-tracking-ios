@@ -45,6 +45,13 @@ function parseServingSizeString(raw: string): number | null {
     if (Number.isFinite(n) && n > 0) return n;
   }
 
+  // Bare number in serving_size (OFF sometimes stores "40" without unit)
+  const bare = s.match(/^(\d+(?:[.,]\d+)?)\s*$/);
+  if (bare) {
+    const n = parseFloat(bare[1].replace(",", "."));
+    if (Number.isFinite(n) && n > 0 && n <= 500) return n;
+  }
+
   return null;
 }
 
@@ -80,43 +87,74 @@ function deriveServingGramsFromNutriments(n: Record<string, unknown>): number | 
   return null;
 }
 
+/** Net pack size in g (e.g. "600 g") — not one serving. */
+function parsePackQuantityGrams(product: Record<string, unknown>): number | null {
+  const q = parseServingSizeString(String(product.quantity || ""));
+  if (q != null && q > 0) return q;
+  const nw = parseServingSizeString(String(product.net_weight || ""));
+  if (nw != null && nw > 0) return nw;
+  return null;
+}
+
+/** Candidate serving ~same as total pack → whole-pack data, not one portion. */
+function isProbablyWholePackNotServing(
+  candidateGrams: number,
+  product: Record<string, unknown>
+): boolean {
+  const pack = parsePackQuantityGrams(product);
+  if (pack == null || pack < 30) return false;
+  const ratio = candidateGrams / pack;
+  return ratio >= 0.88 && ratio <= 1.02;
+}
+
 /**
  * OFF fields + nutriments → grams for one logged portion (defaults 100 if unknown).
- * Prefer: serving_quantity + unit → serving_size text → nutriments ratio → product quantity (often whole pack).
+ * Never use `product.quantity` as serving — it is almost always the **whole pack** (e.g. 600 g vs 40 g).
  */
 export function parseProductGrams(
   product: Record<string, unknown>,
   nutriments?: Record<string, unknown>
 ): number {
-  // 1) Normalized numeric fields (often set when serving_size text is empty or inconsistent)
+  const packG = parsePackQuantityGrams(product);
+
   const sq = num(product.serving_quantity);
   const unit = String(product.serving_quantity_unit || "")
     .toLowerCase()
     .trim();
   if (sq != null && sq > 0) {
-    if (unit === "g" || unit === "gram" || unit === "grams") return sq;
-    if (unit === "mg") return sq / 1000;
-    if (unit === "ml" || unit === "cl") return unit === "cl" ? sq * 10 : sq;
-    if (unit === "l") return sq * 1000;
-    // OFF sometimes omits unit when it's grams (e.g. 40)
-    if (unit === "" && sq >= 0.5 && sq <= 5000) return sq;
+    if (isProbablyWholePackNotServing(sq, product)) {
+      // OFF sometimes duplicates pack weight into serving_quantity
+    } else if (unit === "g" || unit === "gram" || unit === "grams") {
+      return sq;
+    } else if (unit === "mg") {
+      return sq / 1000;
+    } else if (unit === "ml" || unit === "cl") {
+      return unit === "cl" ? sq * 10 : sq;
+    } else if (unit === "l") {
+      return sq * 1000;
+    } else if (unit === "" && sq >= 0.5 && sq <= 5000) {
+      if (!isProbablyWholePackNotServing(sq, product)) {
+        if (packG != null && sq >= packG * 0.88) {
+          // likely pack weight with missing unit
+        } else if (sq <= 250 || (packG != null && sq < packG * 0.5)) {
+          return sq;
+        }
+      }
+    }
   }
 
-  // 2) Free-text serving_size
   const servingStr = String(product.serving_size || "");
   const fromServing = parseServingSizeString(servingStr);
-  if (fromServing != null) return fromServing;
-
-  // 3) Infer from per-serving vs per-100g nutrients (common for EU labels / French products)
-  if (nutriments && Object.keys(nutriments).length > 0) {
-    const derived = deriveServingGramsFromNutriments(nutriments);
-    if (derived != null) return derived;
+  if (fromServing != null && !isProbablyWholePackNotServing(fromServing, product)) {
+    return fromServing;
   }
 
-  // 4) Whole-pack quantity (last resort — can be 500 g while serving is 40 g)
-  const qtyStr = String(product.quantity || "");
-  const fromQty = parseServingSizeString(qtyStr);
-  if (fromQty != null) return fromQty;
+  if (nutriments && Object.keys(nutriments).length > 0) {
+    const derived = deriveServingGramsFromNutriments(nutriments);
+    if (derived != null && !isProbablyWholePackNotServing(derived, product)) {
+      return derived;
+    }
+  }
 
   return 100;
 }
