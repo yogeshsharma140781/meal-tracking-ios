@@ -1,4 +1,5 @@
 import { NutrientTotals, emptyTotals } from "../utils/types";
+import { suggestServingGramsOpenAI } from "./servingSizeOpenAI";
 
 const OFF_BASE = "https://world.openfoodfacts.org/api/v2/product";
 const USER_AGENT =
@@ -88,7 +89,7 @@ function deriveServingGramsFromNutriments(n: Record<string, unknown>): number | 
 }
 
 /** Net pack size in g (e.g. "600 g") — not one serving. */
-function parsePackQuantityGrams(product: Record<string, unknown>): number | null {
+export function parsePackQuantityGrams(product: Record<string, unknown>): number | null {
   const q = parseServingSizeString(String(product.quantity || ""));
   if (q != null && q > 0) return q;
   const nw = parseServingSizeString(String(product.net_weight || ""));
@@ -107,6 +108,12 @@ function isProbablyWholePackNotServing(
   return ratio >= 0.88 && ratio <= 1.02;
 }
 
+export type ParseProductGramsResult = {
+  grams: number;
+  /** True when OFF had no usable serving — we use 100g placeholder; caller may ask OpenAI for a better default */
+  needsAIGuess: boolean;
+};
+
 /**
  * OFF fields + nutriments → grams for one logged portion (defaults 100 if unknown).
  * Never use `product.quantity` as serving — it is almost always the **whole pack** (e.g. 600 g vs 40 g).
@@ -114,7 +121,7 @@ function isProbablyWholePackNotServing(
 export function parseProductGrams(
   product: Record<string, unknown>,
   nutriments?: Record<string, unknown>
-): number {
+): ParseProductGramsResult {
   const packG = parsePackQuantityGrams(product);
 
   const sq = num(product.serving_quantity);
@@ -125,19 +132,19 @@ export function parseProductGrams(
     if (isProbablyWholePackNotServing(sq, product)) {
       // OFF sometimes duplicates pack weight into serving_quantity
     } else if (unit === "g" || unit === "gram" || unit === "grams") {
-      return sq;
+      return { grams: sq, needsAIGuess: false };
     } else if (unit === "mg") {
-      return sq / 1000;
+      return { grams: sq / 1000, needsAIGuess: false };
     } else if (unit === "ml" || unit === "cl") {
-      return unit === "cl" ? sq * 10 : sq;
+      return { grams: unit === "cl" ? sq * 10 : sq, needsAIGuess: false };
     } else if (unit === "l") {
-      return sq * 1000;
+      return { grams: sq * 1000, needsAIGuess: false };
     } else if (unit === "" && sq >= 0.5 && sq <= 5000) {
       if (!isProbablyWholePackNotServing(sq, product)) {
         if (packG != null && sq >= packG * 0.88) {
           // likely pack weight with missing unit
         } else if (sq <= 250 || (packG != null && sq < packG * 0.5)) {
-          return sq;
+          return { grams: sq, needsAIGuess: false };
         }
       }
     }
@@ -146,17 +153,17 @@ export function parseProductGrams(
   const servingStr = String(product.serving_size || "");
   const fromServing = parseServingSizeString(servingStr);
   if (fromServing != null && !isProbablyWholePackNotServing(fromServing, product)) {
-    return fromServing;
+    return { grams: fromServing, needsAIGuess: false };
   }
 
   if (nutriments && Object.keys(nutriments).length > 0) {
     const derived = deriveServingGramsFromNutriments(nutriments);
     if (derived != null && !isProbablyWholePackNotServing(derived, product)) {
-      return derived;
+      return { grams: derived, needsAIGuess: false };
     }
   }
 
-  return 100;
+  return { grams: 100, needsAIGuess: true };
 }
 
 function nutrimentsToPer100g(n: Record<string, unknown>): { per100: NutrientTotals; missing: string[] } {
@@ -288,29 +295,59 @@ export async function fetchOpenFoodFactsProduct(barcode: string): Promise<OpenFo
   const p = body.product;
   const nut = (p.nutriments || {}) as Record<string, unknown>;
   const { per100, missing } = nutrimentsToPer100g(nut);
-  const servingGrams = parseProductGrams(p, nut);
-  const factor = servingGrams / 100;
-  const nutrients = scaleTotals(per100, factor);
 
   const productName =
     String(p.product_name || p.product_name_en || p.generic_name || "Unknown product").trim() || "Unknown product";
   const brand = String(p.brands || "")
     .split(",")[0]
     ?.trim();
+  const brandOrUndef = brand || undefined;
+
+  const parsedServing = parseProductGrams(p, nut);
+  let servingGrams = parsedServing.grams;
+  let servingFromAI = false;
+
+  if (parsedServing.needsAIGuess) {
+    const aiGrams = await suggestServingGramsOpenAI({
+      productName,
+      brand: brandOrUndef,
+      categoriesTags: Array.isArray(p.categories_tags)
+        ? (p.categories_tags as string[]).filter((t) => typeof t === "string")
+        : undefined,
+      kcalPer100g: per100.calories_kcal,
+      packGrams: parsePackQuantityGrams(p)
+    });
+    if (aiGrams != null) {
+      servingGrams = aiGrams;
+      servingFromAI = true;
+    }
+  }
+
+  const factor = servingGrams / 100;
+  const nutrients = scaleTotals(per100, factor);
 
   const confidence = missing.length === 0 ? 0.85 : missing.length < 3 ? 0.65 : 0.45;
+
+  let portionNote: string;
+  if (servingFromAI) {
+    portionNote = `Logged portion: ${Math.round(servingGrams * 10) / 10} g (AI-estimated typical serving; Open Food Facts had no serving info).`;
+  } else if (parsedServing.needsAIGuess) {
+    portionNote = `Logged portion: ${Math.round(servingGrams)} g (default; Open Food Facts had no serving size).`;
+  } else {
+    portionNote = `Logged portion: ${Math.round(servingGrams)} g (from pack / serving where available).`;
+  }
 
   return {
     found: true,
     barcode: clean,
     productName,
-    brand: brand || undefined,
+    brand: brandOrUndef,
     servingGrams,
     nutrients,
     nutrientsPer100g: per100,
     confidence,
     missingFields: missing,
     source: "openfoodfacts",
-    notes: [`Logged portion: ${Math.round(servingGrams)} g (from pack / serving where available).`]
+    notes: [portionNote]
   };
 }
