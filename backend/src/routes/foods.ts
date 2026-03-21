@@ -18,6 +18,17 @@ foodsRouter.get("/barcode/:barcode", async (req, res) => {
   if (!barcode) {
     return res.status(400).json({ error: "barcode is required" });
   }
-  const result = await foodResolver.resolveBarcode(barcode);
-  return res.json(result);
+  try {
+    const result = await foodResolver.resolveBarcode(barcode);
+    if (!result.found) {
+      return res.status(404).json({
+        error: "Product not found for this barcode",
+        ...result
+      });
+    }
+    return res.json(result);
+  } catch (err) {
+    console.error("barcode lookup failed:", err);
+    return res.status(502).json({ error: "Barcode lookup failed" });
+  }
 });

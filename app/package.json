@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "main": "node_modules/expo/AppEntry.js",
   "scripts": {
-    "start": "expo start",
+    "start": "bash scripts/with-bundled-node.sh npx expo start",
+    "start:lan": "bash scripts/with-bundled-node.sh npx expo start --lan --clear",
+    "start:tunnel": "bash scripts/with-bundled-node.sh npx expo start --tunnel --clear",
     "start:production": "NODE_ENV=production expo start --no-dev --minify",
     "ios": "expo run:ios",
     "ios:production": "open ios/Joul.xcworkspace",
@@ -27,6 +29,7 @@
     "expo": "^54.0.31",
     "expo-asset": "^12.0.12",
     "expo-camera": "^55.0.9",
+    "expo-constants": "~18.0.13",
     "expo-file-system": "^19.0.21",
     "expo-image-picker": "latest",
     "expo-notifications": "^0.31.5",

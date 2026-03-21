@@ -16,6 +16,13 @@ const attributionEngine = new AttributionEngine();
 
 const DEFAULT_USER_ID = "00000000-0000-0000-0000-000000000001";
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isUuidParam(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
 const sumTotals = (a: NutrientTotals, b: NutrientTotals): NutrientTotals => ({
   calories_kcal: a.calories_kcal + b.calories_kcal,
   protein_g: a.protein_g + b.protein_g,
@@ -330,28 +337,7 @@ mealsRouter.post("/nl-log", async (req, res) => {
   }
 });
 
-mealsRouter.get("/:mealId", async (req, res) => {
-  if (!hasDatabase || !pool) {
-    return res.status(503).json({ error: "database not configured" });
-  }
-  const mealId = req.params.mealId;
-  const mealRes = await pool.query(
-    `select id, meal_label, started_at from meals where id = $1`,
-    [mealId]
-  );
-  if (mealRes.rows.length === 0) {
-    return res.status(404).json({ error: "meal not found" });
-  }
-  const itemsRes = await pool.query(
-    `select mi.id, i.name, mi.quantity, mi.unit, mi.grams, mi.assumption_text, mi.confidence
-     from meal_items mi
-     join ingredients i on i.id = mi.ingredient_id
-     where mi.meal_id = $1`,
-    [mealId]
-  );
-  return res.json({ meal: mealRes.rows[0], items: itemsRes.rows });
-});
-
+// Static GET paths must be registered before `/:mealId` or "nl-log" is parsed as a UUID meal id.
 mealsRouter.get("/", async (req, res) => {
   if (!hasDatabase || !pool) {
     return res.status(503).json({ error: "database not configured" });
@@ -368,29 +354,6 @@ mealsRouter.get("/", async (req, res) => {
     [DEFAULT_USER_ID, day]
   );
   return res.json({ meals: mealsRes.rows });
-});
-
-mealsRouter.get("/:mealId/nutrients", async (req, res) => {
-  if (!hasDatabase || !pool) {
-    return res.status(503).json({ error: "database not configured" });
-  }
-  const mealId = req.params.mealId;
-  const nutrientsRes = await pool.query(
-    `select calories_kcal, protein_g, carbs_g, fat_g, fiber_g, sodium_mg, cholesterol_mg
-     from meal_nutrients
-     where meal_id = $1`,
-    [mealId]
-  );
-  const attributionRes = await pool.query(
-    `select nutrient_key, meal_item_id, amount
-     from nutrient_attribution
-     where meal_id = $1`,
-    [mealId]
-  );
-  return res.json({
-    nutrients: nutrientsRes.rows[0] || emptyTotals(),
-    attribution: attributionRes.rows
-  });
 });
 
 mealsRouter.get("/days/:day/nutrients", async (req, res) => {
@@ -415,6 +378,63 @@ mealsRouter.get("/days/:day/nutrients", async (req, res) => {
     nutrients: dayRes.rows[0] || emptyTotals(),
     attribution: attributionRes.rows
   });
+});
+
+mealsRouter.get("/:mealId/nutrients", async (req, res) => {
+  if (!hasDatabase || !pool) {
+    return res.status(503).json({ error: "database not configured" });
+  }
+  const mealId = req.params.mealId;
+  if (!isUuidParam(mealId)) {
+    return res.status(400).json({
+      error:
+        "mealId must be a UUID. Natural-language logging is POST /v1/meals/nl-log (not GET this path)."
+    });
+  }
+  const nutrientsRes = await pool.query(
+    `select calories_kcal, protein_g, carbs_g, fat_g, fiber_g, sodium_mg, cholesterol_mg
+     from meal_nutrients
+     where meal_id = $1`,
+    [mealId]
+  );
+  const attributionRes = await pool.query(
+    `select nutrient_key, meal_item_id, amount
+     from nutrient_attribution
+     where meal_id = $1`,
+    [mealId]
+  );
+  return res.json({
+    nutrients: nutrientsRes.rows[0] || emptyTotals(),
+    attribution: attributionRes.rows
+  });
+});
+
+mealsRouter.get("/:mealId", async (req, res) => {
+  if (!hasDatabase || !pool) {
+    return res.status(503).json({ error: "database not configured" });
+  }
+  const mealId = req.params.mealId;
+  if (!isUuidParam(mealId)) {
+    return res.status(400).json({
+      error:
+        "mealId must be a UUID. Natural-language logging is POST /v1/meals/nl-log (not GET this path)."
+    });
+  }
+  const mealRes = await pool.query(
+    `select id, meal_label, started_at from meals where id = $1`,
+    [mealId]
+  );
+  if (mealRes.rows.length === 0) {
+    return res.status(404).json({ error: "meal not found" });
+  }
+  const itemsRes = await pool.query(
+    `select mi.id, i.name, mi.quantity, mi.unit, mi.grams, mi.assumption_text, mi.confidence
+     from meal_items mi
+     join ingredients i on i.id = mi.ingredient_id
+     where mi.meal_id = $1`,
+    [mealId]
+  );
+  return res.json({ meal: mealRes.rows[0], items: itemsRes.rows });
 });
 
 mealsRouter.post("/photo-describe", async (req, res) => {

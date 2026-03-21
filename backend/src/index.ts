@@ -9,6 +9,7 @@ import { revenuecatRouter } from "./routes/revenuecat";
 import { notificationsRouter } from "./routes/notifications";
 import { hasDatabase, pool } from "./db/pool";
 import { startReminderScheduler } from "./services/notifications";
+import { hasOpenAi } from "./services/aiNutrition";
 
 const app = express();
 
@@ -50,6 +51,9 @@ ensureSchema()
     app.listen(port, () => {
       // eslint-disable-next-line no-console
       console.log(`Meal Tracking API listening on ${port}`);
+      console.log(
+        `OpenAI (nl-log / photo-describe): ${hasOpenAi ? "enabled" : "DISABLED — OPENAI_API_KEY missing at process start"}`
+      );
       if (!hasDatabase) {
         console.warn("⚠️  Database not configured - some features will be unavailable");
       }
@@ -63,5 +67,8 @@ ensureSchema()
     app.listen(port, () => {
       // eslint-disable-next-line no-console
       console.log(`Meal Tracking API listening on ${port} (without database)`);
+      console.log(
+        `OpenAI (nl-log / photo-describe): ${hasOpenAi ? "enabled" : "DISABLED — OPENAI_API_KEY missing at process start"}`
+      );
     });
   });

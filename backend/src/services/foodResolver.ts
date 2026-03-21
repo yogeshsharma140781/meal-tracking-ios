@@ -1,4 +1,5 @@
 import { NutrientTotals } from "../utils/types";
+import { fetchOpenFoodFactsProduct, type OpenFoodFactsBarcodePayload } from "./openFoodFacts";
 
 export type ResolvedIngredient = {
   name: string;
@@ -15,12 +16,7 @@ export type ResolveTextResult = {
   notes: string[];
 };
 
-export type BarcodeResult = {
-  productName: string;
-  nutrients?: NutrientTotals;
-  confidence: number;
-  missingFields: string[];
-};
+export type BarcodeResult = OpenFoodFactsBarcodePayload;
 
 type IngredientDefaults = {
   defaultUnit: string;
@@ -181,12 +177,7 @@ export class FoodResolverService {
     return { ingredients, notes };
   }
 
-  async resolveBarcode(_barcode: string): Promise<BarcodeResult> {
-    // TODO: integrate Open Food Facts lookup + normalization.
-    return {
-      productName: "Unknown product",
-      confidence: 0.2,
-      missingFields: ["calories_kcal", "protein_g", "carbs_g", "fat_g"]
-    };
+  async resolveBarcode(barcode: string): Promise<BarcodeResult> {
+    return fetchOpenFoodFactsProduct(barcode.trim());
   }
 }

@@ -29,7 +29,8 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import Svg, { Circle, Path } from "react-native-svg";
 import * as Notifications from "expo-notifications";
-import { CameraView, useCameraPermissions } from "expo-camera";
+import Constants from "expo-constants";
+import { CameraView, useCameraPermissions, type BarcodeScanningResult } from "expo-camera";
 import * as ImagePicker from "expo-image-picker";
 import { SubscriptionProvider, useSubscription } from "./SubscriptionContext";
 import { setSecureJSON, getSecureJSON, SECURE_KEYS } from "./secureStorage";
@@ -41,6 +42,26 @@ import {
   MEAL_REMINDER_ID,
   type MealReminderSettings
 } from "./mealReminderNotifications";
+
+/** EAS project UUID — required for getExpoPushTokenAsync in bare / Xcode builds (see docs/notification-strategy.md). */
+let warnedMissingEASProjectId = false;
+function resolveEASProjectId(): string | undefined {
+  const fromEnv =
+    typeof process !== "undefined" && process.env.EXPO_PUBLIC_EAS_PROJECT_ID
+      ? String(process.env.EXPO_PUBLIC_EAS_PROJECT_ID).trim()
+      : "";
+  if (fromEnv) return fromEnv;
+
+  const extra = Constants.expoConfig?.extra as { eas?: { projectId?: string } } | undefined;
+  const fromManifest = extra?.eas?.projectId?.trim();
+  if (fromManifest) return fromManifest;
+
+  const eas = (Constants as { easConfig?: { projectId?: string } }).easConfig;
+  const fromEasConfig = eas?.projectId?.trim();
+  if (fromEasConfig) return fromEasConfig;
+
+  return undefined;
+}
 
 // Tab icon rendered from local image asset with tint support.
 function TabIcon({
@@ -55,7 +76,7 @@ function TabIcon({
   return (
     <Image
       source={source}
-      style={{ width: size, height: size, tintColor }}
+      style={{ width: size, height: size, ...(tintColor ? { tintColor } : {}) }}
       resizeMode="contain"
     />
   );
@@ -433,11 +454,49 @@ const PressableCard: React.FC<{
   );
 };
 
-// For local testing, use: http://YOUR_MAC_IP:4000/v1
-// For production, use: https://meal-tracking-api.onrender.com/v1
-const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_BASE_URL ||
-  "https://meal-tracking-api.onrender.com/v1";
+// For local testing, use: http://YOUR_MAC_IP:4000/v1 (set EXPO_PUBLIC_API_BASE_URL in .env)
+// For production / App Store builds, omit EXPO_PUBLIC_API_BASE_URL or use HTTPS Render URL.
+const PRODUCTION_API_BASE_URL = "https://meal-tracking-api.onrender.com/v1";
+
+function isLikelyPrivateOrLocalHttpUrl(url: string): boolean {
+  const lower = url.toLowerCase();
+  if (!lower.startsWith("http://")) return false;
+  return (
+    lower.includes("localhost") ||
+    lower.includes("127.0.0.1") ||
+    /\b192\.168\.\d{1,3}\.\d{1,3}\b/.test(lower) ||
+    /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/.test(lower) ||
+    /\b172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/.test(lower)
+  );
+}
+
+function resolveApiBaseUrl(): string {
+  const fromEnv = process.env.EXPO_PUBLIC_API_BASE_URL?.trim();
+  if (!fromEnv) return PRODUCTION_API_BASE_URL;
+  // Release archives often bake EXPO_PUBLIC_* from the machine that built the bundle.
+  // If that was a LAN HTTP URL, all devices off that Wi‑Fi will fail silently.
+  if (!__DEV__ && isLikelyPrivateOrLocalHttpUrl(fromEnv)) {
+    return PRODUCTION_API_BASE_URL;
+  }
+  return fromEnv;
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
+
+if (__DEV__) {
+  // Helps confirm what URL Metro / Dev Client is using (not logged in App Store builds).
+  console.log("[api] EXPO_PUBLIC_API_BASE_URL raw:", process.env.EXPO_PUBLIC_API_BASE_URL);
+  console.log("[api] resolved API_BASE_URL:", API_BASE_URL);
+  const raw = process.env.EXPO_PUBLIC_API_BASE_URL?.trim();
+  if (raw && isLikelyPrivateOrLocalHttpUrl(raw)) {
+    console.warn(
+      "[api] Your bundle uses a local/LAN API base URL — meal/photo requests hit your Mac (or fail), not Render. " +
+        "You will not see POST /v1/meals/* in Render logs. Unset EXPO_PUBLIC_API_BASE_URL or set it to " +
+        PRODUCTION_API_BASE_URL +
+        " to test the hosted API."
+    );
+  }
+}
 
 type NutrientTotals = {
   calories_kcal: number;
@@ -1564,6 +1623,20 @@ type MealItem = {
   unit: string;
   grams: number;
   nutrients: NutrientTotals;
+};
+
+/** Response shape from GET /v1/foods/barcode/:code (Open Food Facts). */
+type BarcodePreview = {
+  found: boolean;
+  barcode: string;
+  productName: string;
+  brand?: string;
+  servingGrams: number;
+  nutrients?: NutrientTotals;
+  confidence: number;
+  missingFields: string[];
+  source?: string;
+  notes?: string[];
 };
 
 type DayData = {
@@ -2706,9 +2779,13 @@ function AppContent() {
   const [mealPhotoAnalyzing, setMealPhotoAnalyzing] = useState(false);
   const [mealPhotoProgress, setMealPhotoProgress] = useState(0);
   const [mealPhotoStatusText, setMealPhotoStatusText] = useState("Analyzing photo...");
-  const [addComposerTab, setAddComposerTab] = useState<"photo" | "text">("text");
+  const [addComposerTab, setAddComposerTab] = useState<"text" | "photo" | "barcode">("text");
   const [addKeyboardOffset, setAddKeyboardOffset] = useState(0);
   const [hasAutoOpenedCamera, setHasAutoOpenedCamera] = useState(false);
+  const [barcodePreview, setBarcodePreview] = useState<BarcodePreview | null>(null);
+  const [barcodeLookupLoading, setBarcodeLookupLoading] = useState(false);
+  const barcodeScanLastTsRef = useRef(0);
+  const barcodeScanLastCodeRef = useRef<string>("");
   const [dataByDate, setDataByDate] = useState<Record<string, DayData>>({});
   const [selectedDate, setSelectedDate] = useState<string>(() => toDateKey(new Date()));
   const [hydrated, setHydrated] = useState(false);
@@ -2877,7 +2954,10 @@ function AppContent() {
   }, [view, isTemplateMode, addComposerTab]);
 
   useEffect(() => {
-    if (view !== "add" || isTemplateMode) return;
+    if (view !== "add" || isTemplateMode || addComposerTab !== "text") {
+      setAddKeyboardOffset(0);
+      return;
+    }
     const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
     const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
     const showSub = Keyboard.addListener(showEvent, (event) => {
@@ -2889,7 +2969,23 @@ function AppContent() {
       showSub.remove();
       hideSub.remove();
     };
-  }, [view, isTemplateMode]);
+  }, [view, isTemplateMode, addComposerTab]);
+
+  useEffect(() => {
+    if (addComposerTab !== "barcode") {
+      setBarcodePreview(null);
+      setBarcodeLookupLoading(false);
+    }
+  }, [addComposerTab]);
+
+  useEffect(() => {
+    if (view !== "add" || addComposerTab !== "barcode") return;
+    if (!cameraPermission?.granted) {
+      requestCameraPermission().catch(() => {
+        setError("Camera permission is required to scan barcodes.");
+      });
+    }
+  }, [view, addComposerTab, cameraPermission?.granted, requestCameraPermission]);
 
   useEffect(() => {
     if (view !== "personal") return;
@@ -3516,8 +3612,19 @@ function AppContent() {
       const granted = await requestMealReminderPermission();
       if (!granted) return null;
 
+      const projectId = resolveEASProjectId();
+      if (!projectId) {
+        if (!warnedMissingEASProjectId) {
+          warnedMissingEASProjectId = true;
+          console.warn(
+            "Expo push token skipped: no EAS projectId. Set EXPO_PUBLIC_EAS_PROJECT_ID or expo.extra.eas.projectId in app.json (UUID from https://expo.dev → your project). See docs/notification-strategy.md."
+          );
+        }
+        return null;
+      }
+
       try {
-        const tokenResponse = await Notifications.getExpoPushTokenAsync();
+        const tokenResponse = await Notifications.getExpoPushTokenAsync({ projectId });
         const token = tokenResponse?.data?.trim();
         if (!token) return null;
         reminderPushTokenRef.current = token;
@@ -3982,7 +4089,11 @@ function AppContent() {
           });
         }, 320);
 
-        const res = await fetch(`${API_BASE_URL}/meals/photo-describe`, {
+        const photoUrl = `${API_BASE_URL}/meals/photo-describe`;
+        if (__DEV__) {
+          console.log("[meal-photo] POST", photoUrl);
+        }
+        const res = await fetch(photoUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -3990,6 +4101,10 @@ function AppContent() {
             mimeType: mimeType || "image/jpeg"
           })
         });
+
+        if (__DEV__) {
+          console.log("[meal-photo] response status:", res.status, res.statusText);
+        }
 
         if (!res.ok) {
           const payload = await res.json().catch(() => ({}));
@@ -4154,6 +4269,8 @@ function AppContent() {
     setAddComposerTab("text");
     setAddKeyboardOffset(0);
     setHasAutoOpenedCamera(false);
+    setBarcodePreview(null);
+    barcodeScanLastCodeRef.current = "";
     setView("add");
   };
 
@@ -4167,10 +4284,19 @@ function AppContent() {
       let resolvedItems: MealItem[];
       const cached = resolveFromKnownFoods(entryText, knownFoods, foodNutrients);
       if (cached && cached.length > 0) {
+        if (__DEV__) {
+          console.log(
+            "[meal-log] skipped POST /meals/nl-log — text matched known foods cache (no API call)"
+          );
+        }
         resolvedItems = cached;
       } else {
         try {
-          const res = await fetch(`${API_BASE_URL}/meals/nl-log`, {
+          const nlLogUrl = `${API_BASE_URL}/meals/nl-log`;
+          if (__DEV__) {
+            console.log("[meal-log] POST", nlLogUrl);
+          }
+          const res = await fetch(nlLogUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -4179,12 +4305,21 @@ function AppContent() {
               tzOffsetMinutes: new Date().getTimezoneOffset()
             })
           });
+          if (__DEV__) {
+            console.log("[meal-log] response status:", res.status, res.statusText);
+          }
           if (!res.ok) {
             const payload = await res.json().catch(() => ({}));
+            if (__DEV__) {
+              console.warn("[meal-log] error body:", payload);
+            }
             throw new Error(payload?.error || "Failed to log meal.");
           }
-          const data = (await res.json()) as MealResponse & { items?: MealItem[] };
+          const data = (await res.json()) as MealResponse & { items?: MealItem[]; notes?: string[] };
           const apiItems = data.items || [];
+          if (__DEV__ && Array.isArray(data.notes) && data.notes.length > 0) {
+            console.log("[meal-log] API notes:", data.notes);
+          }
           if (apiItems.length > 0) {
             resolvedItems = apiItems;
             const nextNutrients = { ...foodNutrients };
@@ -4200,14 +4335,32 @@ function AppContent() {
             setFoodNutrients(nextNutrients);
             await persistFoodNutrients(nextNutrients);
           } else {
+            if (__DEV__) {
+              console.warn(
+                "[meal-log] API returned OK but 0 items — using on-device estimate. " +
+                  "On Render, if OPENAI_API_KEY is unset, the server only recognizes a tiny demo list (e.g. oats, blueberry, milk); " +
+                  "arbitrary phrases like \"zebra muffin\" yield empty items while the DB meal row may still be created."
+              );
+            }
             resolvedItems = parseFoodTextLocally(entryText);
             if (resolvedItems.length === 0) {
               throw new Error("Could not parse any foods. Try formats like \"100g chicken\" or \"2 eggs\".");
             }
           }
         } catch (apiErr) {
+          if (__DEV__) {
+            console.warn(
+              "[meal-log] request failed (showing error if local parse also fails):",
+              apiErr instanceof Error ? apiErr.message : apiErr
+            );
+          }
           const localItems = parseFoodTextLocally(entryText);
           if (localItems.length > 0) {
+            if (__DEV__) {
+              console.warn(
+                "[meal-log] using offline local parse fallback; API was not used for this meal."
+              );
+            }
             resolvedItems = localItems;
           } else {
             throw apiErr;
@@ -4325,6 +4478,174 @@ function AppContent() {
       setLoading(false);
     }
   };
+
+  const lookupBarcodeProduct = useCallback(async (code: string) => {
+    const clean = code.replace(/\D/g, "");
+    if (clean.length < 8) return;
+    setBarcodeLookupLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE_URL}/foods/barcode/${encodeURIComponent(clean)}`);
+      const json = (await res.json()) as BarcodePreview & { error?: string };
+      if (!res.ok) {
+        throw new Error(json.error || "Product not found");
+      }
+      if (!json.found || !json.nutrients) {
+        throw new Error(json.error || "Product not found");
+      }
+      setBarcodePreview(json);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Barcode lookup failed";
+      setError(message);
+      setBarcodePreview(null);
+    } finally {
+      setBarcodeLookupLoading(false);
+    }
+  }, []);
+
+  const handleBarcodeScanned = useCallback(
+    (result: BarcodeScanningResult) => {
+      if (addComposerTab !== "barcode") return;
+      if (barcodeLookupLoading || barcodePreview) return;
+      const raw = result?.data?.trim() ?? "";
+      const digits = raw.replace(/\D/g, "");
+      if (digits.length < 8 || digits.length > 14) return;
+      const now = Date.now();
+      if (digits === barcodeScanLastCodeRef.current && now - barcodeScanLastTsRef.current < 2500) {
+        return;
+      }
+      barcodeScanLastTsRef.current = now;
+      barcodeScanLastCodeRef.current = digits;
+      void lookupBarcodeProduct(digits);
+    },
+    [addComposerTab, barcodeLookupLoading, barcodePreview, lookupBarcodeProduct]
+  );
+
+  const handleBarcodeCommit = useCallback(async () => {
+    if (!selectedMealId || !barcodePreview?.nutrients) return;
+    try {
+      setLoading(true);
+      setError(null);
+      const displayName = barcodePreview.brand
+        ? `${barcodePreview.productName} (${barcodePreview.brand})`
+        : barcodePreview.productName;
+      const item: MealItem = {
+        id: `barcode-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+        name: displayName,
+        quantity: barcodePreview.servingGrams,
+        unit: "g",
+        grams: barcodePreview.servingGrams,
+        nutrients: barcodePreview.nutrients
+      };
+      const finalItems: MealItem[] = [item].map((it) => {
+        const key = normalizeFoodNameForKey(it.name);
+        const override = foodOverrides[key];
+        return override ? { ...it, nutrients: override } : it;
+      });
+      const resolvedTotals = finalItems.reduce(
+        (acc, row) => sumTotals(acc, row.nutrients),
+        emptyTotals()
+      );
+      const day = getDayData(selectedDate);
+      const nextMeals = day.meals.map((meal) =>
+        meal.id === selectedMealId
+          ? { ...meal, nutrients: sumTotals(meal.nutrients, resolvedTotals) }
+          : meal
+      );
+      const nextItems = {
+        ...day.mealItems,
+        [selectedMealId]: [...(day.mealItems[selectedMealId] || []), ...finalItems]
+      };
+      const next = { ...dataByDate, [selectedDate]: { meals: nextMeals, mealItems: nextItems } };
+      setDataByDate(next);
+
+      if (finalItems.length > 0) {
+        const nameMap = new Map<string, string>();
+        knownFoods.forEach((name) => {
+          const key = normalizeFoodNameForDedup(name);
+          if (key) nameMap.set(key, name);
+        });
+        finalItems.forEach((row) => {
+          if (row && row.name) {
+            const normalizedKey = normalizeFoodNameForDedup(row.name);
+            const canonical = getCanonicalFoodName(row.name);
+            if (normalizedKey && canonical) {
+              if (!nameMap.has(normalizedKey)) {
+                nameMap.set(normalizedKey, canonical);
+              } else {
+                const existing = nameMap.get(normalizedKey);
+                if (existing && canonical.length < existing.length) {
+                  nameMap.set(normalizedKey, canonical);
+                }
+              }
+            }
+          }
+        });
+        const mergedList = Array.from(nameMap.values()).sort((a, b) => a.localeCompare(b));
+        setKnownFoods(mergedList);
+        await persistKnownFoods(mergedList);
+
+        const nextServing = { ...foodServingGrams };
+        finalItems.forEach((row) => {
+          if (row && row.name) {
+            const canonical = getCanonicalFoodName(row.name);
+            const key = normalizeFoodNameForKey(canonical);
+            if (key && !(key in nextServing)) {
+              nextServing[key] = inferDefaultServingGrams(canonical);
+            }
+          }
+        });
+        if (Object.keys(nextServing).length !== Object.keys(foodServingGrams).length) {
+          setFoodServingGrams(nextServing);
+          await persistFoodServingGrams(nextServing);
+        }
+      }
+
+      await persistData(next);
+
+      try {
+        const hasLoggedMeal = await AsyncStorage.getItem(HAS_LOGGED_MEAL_KEY);
+        if (!hasLoggedMeal) {
+          await AsyncStorage.setItem(HAS_LOGGED_MEAL_KEY, "true");
+        }
+      } catch (err) {
+        console.warn("Error marking meal as logged:", err);
+      }
+
+      if (selectedDate === todayKey) {
+        updateMealReminderSchedule(mealReminderSettings, true).catch((err) => {
+          console.warn("Failed to cancel meal reminder after logging meal:", err);
+        });
+        syncMealReminderStateToBackend(mealReminderSettings, true).catch((err) => {
+          console.warn("Failed to sync reminder state after logging meal:", err);
+        });
+      }
+
+      setBarcodePreview(null);
+      barcodeScanLastCodeRef.current = "";
+      setAddComposerTab("text");
+      setView("home");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not add item";
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
+  }, [
+    selectedMealId,
+    barcodePreview,
+    foodOverrides,
+    getDayData,
+    selectedDate,
+    dataByDate,
+    knownFoods,
+    foodServingGrams,
+    todayKey,
+    mealReminderSettings,
+    updateMealReminderSchedule,
+    syncMealReminderStateToBackend,
+    persistData
+  ]);
 
   const handleSaveTemplate = () => {
     if (!templateName.trim() || !entryText.trim()) {
@@ -5775,7 +6096,17 @@ function AppContent() {
             </View>
 
             <View style={styles.addCameraStage}>
-              {addComposerTab === "photo" && isPro && cameraPermission?.granted && !(mealPhotoAnalyzing && mealPhotoUri) ? (
+              {addComposerTab === "barcode" && cameraPermission?.granted ? (
+                <CameraView
+                  style={styles.addCameraImage}
+                  facing="back"
+                  barcodeScannerSettings={{
+                    barcodeTypes: ["ean13", "ean8", "upc_a", "upc_e"]
+                  }}
+                  onBarcodeScanned={handleBarcodeScanned}
+                  active={!barcodeLookupLoading && !barcodePreview}
+                />
+              ) : addComposerTab === "photo" && isPro && cameraPermission?.granted && !(mealPhotoAnalyzing && mealPhotoUri) ? (
                 <CameraView ref={cameraRef} style={styles.addCameraImage} facing="back" />
               ) : mealPhotoUri ? (
                 <Image source={{ uri: mealPhotoUri }} style={styles.addCameraImage} resizeMode="cover" />
@@ -5786,6 +6117,8 @@ function AppContent() {
                       ? "Take photo is available on Pro."
                       : addComposerTab === "photo"
                       ? "Camera permission is required to capture meal photos."
+                      : addComposerTab === "barcode"
+                      ? "Allow camera access to scan product barcodes (EAN / UPC)."
                       : "Take a meal photo to start"}
                   </Text>
                   {addComposerTab === "photo" && !isPro ? (
@@ -5793,6 +6126,13 @@ function AppContent() {
                       <Text style={styles.addCameraPermissionButtonText}>Upgrade to Pro</Text>
                     </TouchableOpacity>
                   ) : addComposerTab === "photo" ? (
+                    <TouchableOpacity
+                      style={styles.addCameraPermissionButton}
+                      onPress={requestCameraPermission}
+                    >
+                      <Text style={styles.addCameraPermissionButtonText}>Enable camera</Text>
+                    </TouchableOpacity>
+                  ) : addComposerTab === "barcode" && !cameraPermission?.granted ? (
                     <TouchableOpacity
                       style={styles.addCameraPermissionButton}
                       onPress={requestCameraPermission}
@@ -5809,6 +6149,13 @@ function AppContent() {
                   <Text style={styles.addCameraAnalyzingText}>
                     {mealPhotoStatusText} {mealPhotoProgress}%
                   </Text>
+                </View>
+              )}
+
+              {addComposerTab === "barcode" && barcodeLookupLoading && !mealPhotoAnalyzing && (
+                <View style={styles.addCameraAnalyzingOverlay}>
+                  <ActivityIndicator size="large" color="#FFFFFF" />
+                  <Text style={styles.addCameraAnalyzingText}>Looking up product…</Text>
                 </View>
               )}
 
@@ -5852,20 +6199,24 @@ function AppContent() {
               style={[
                 styles.addFloatingComposer,
                 addKeyboardOffset > 0 && { bottom: Math.max(-22, addKeyboardOffset - 22) },
-                addComposerTab === "text" && styles.addFloatingComposerExpanded
+                (addComposerTab === "text" || addComposerTab === "barcode") &&
+                  styles.addFloatingComposerExpanded
               ]}
             >
               <View style={styles.addComposerTabsRow}>
                 <TouchableOpacity
                   style={styles.addComposerTab}
-                  onPress={() => setAddComposerTab("text")}
+                  onPress={() => {
+                    Keyboard.dismiss();
+                    setAddComposerTab("text");
+                  }}
                   disabled={mealPhotoAnalyzing}
-                  activeOpacity={1}
+                  activeOpacity={0.85}
                 >
                   <View
                     style={[
-                      styles.addComposerTabContent,
-                      addComposerTab === "text" && styles.addComposerTabContentActive
+                      styles.addComposerTabPill,
+                      addComposerTab === "text" && styles.addComposerTabPillActive
                     ]}
                   >
                     <TabIcon
@@ -5887,14 +6238,19 @@ function AppContent() {
                   style={styles.addComposerTab}
                   onPress={handleSelectPhotoTab}
                   disabled={mealPhotoAnalyzing}
-                  activeOpacity={1}
+                  activeOpacity={0.85}
                 >
                   <View
                     style={[
-                      styles.addComposerTabContent,
-                      addComposerTab === "photo" && styles.addComposerTabContentActive
+                      styles.addComposerTabPill,
+                      addComposerTab === "photo" && styles.addComposerTabPillActive
                     ]}
                   >
+                    {!isPro ? (
+                      <View style={styles.addComposerProBadge}>
+                        <Text style={styles.addComposerProBadgeText}>PRO</Text>
+                      </View>
+                    ) : null}
                     <TabIcon
                       source={require("./assets/add-tab-camera-grey.png")}
                       size={26}
@@ -5908,11 +6264,39 @@ function AppContent() {
                     >
                       TAKE PHOTO
                     </Text>
-                    {!isPro ? (
-                      <View style={styles.addComposerProBadge}>
-                        <Text style={styles.addComposerProBadgeText}>PRO</Text>
-                      </View>
-                    ) : null}
+                  </View>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.addComposerTab}
+                  onPress={() => {
+                    Keyboard.dismiss();
+                    setAddComposerTab("barcode");
+                  }}
+                  disabled={mealPhotoAnalyzing}
+                  activeOpacity={0.85}
+                >
+                  <View
+                    style={[
+                      styles.addComposerTabPill,
+                      addComposerTab === "barcode" && styles.addComposerTabPillActive
+                    ]}
+                  >
+                    <TabIcon
+                      source={
+                        addComposerTab === "barcode"
+                          ? require("./assets/add-tab-barcode-active.png")
+                          : require("./assets/add-tab-barcode-inactive.png")
+                      }
+                      size={26}
+                    />
+                    <Text
+                      style={[
+                        styles.addComposerTabText,
+                        addComposerTab === "barcode" && styles.addComposerTabTextActive
+                      ]}
+                    >
+                      SCAN BARCODE
+                    </Text>
                   </View>
                 </TouchableOpacity>
               </View>
@@ -6009,6 +6393,66 @@ function AppContent() {
                     </TouchableOpacity>
                   </View>
                   {error ? <Text style={styles.addError}>{error}</Text> : null}
+                </View>
+              )}
+
+              {addComposerTab === "barcode" && (
+                <View style={styles.addBarcodeMvpContent}>
+                  <View style={styles.addBarcodeMvpCard}>
+                    <TabIcon
+                      source={require("./assets/add-tab-barcode-active.png")}
+                      size={40}
+                    />
+                    {barcodePreview ? (
+                      <>
+                        <Text style={styles.addBarcodeMvpTitle} numberOfLines={2}>
+                          {barcodePreview.productName}
+                        </Text>
+                        {barcodePreview.brand ? (
+                          <Text style={styles.addBarcodeMvpBrand}>{barcodePreview.brand}</Text>
+                        ) : null}
+                        <Text style={styles.addBarcodeMvpMeta}>
+                          {Math.round(barcodePreview.servingGrams)} g ·{" "}
+                          {Math.round(barcodePreview.nutrients?.calories_kcal ?? 0)} kcal
+                        </Text>
+                        {barcodePreview.notes?.[0] ? (
+                          <Text style={styles.addBarcodeMvpNote}>{barcodePreview.notes[0]}</Text>
+                        ) : null}
+                        <Text style={styles.addBarcodeMvpSource}>Nutrition via Open Food Facts</Text>
+                        <View style={styles.addBarcodeMvpActions}>
+                          <TouchableOpacity
+                            style={styles.addBarcodeMvpSecondary}
+                            onPress={() => {
+                              setBarcodePreview(null);
+                              barcodeScanLastCodeRef.current = "";
+                            }}
+                          >
+                            <Text style={styles.addBarcodeMvpSecondaryText}>Scan again</Text>
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            style={[
+                              styles.addBarcodeMvpPrimary,
+                              loading && styles.addFloatingConfirmDisabled
+                            ]}
+                            onPress={() => void handleBarcodeCommit()}
+                            disabled={loading}
+                          >
+                            <Text style={styles.addBarcodeMvpPrimaryText}>
+                              {loading ? "Adding…" : "Add to meal"}
+                            </Text>
+                          </TouchableOpacity>
+                        </View>
+                      </>
+                    ) : (
+                      <>
+                        <Text style={styles.addBarcodeMvpTitle}>Scan a barcode</Text>
+                        <Text style={styles.addBarcodeMvpBody}>
+                          Aim at the product barcode. We look up nutrition on the server (Open Food Facts) and add one
+                          portion to this meal.
+                        </Text>
+                      </>
+                    )}
+                  </View>
                 </View>
               )}
             </View>
@@ -9959,35 +10403,134 @@ const styles = StyleSheet.create({
   },
   addComposerTabsRow: {
     flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between"
+    alignItems: "stretch",
+    justifyContent: "space-between",
+    gap: 6,
+    paddingHorizontal: 2
   },
   addComposerTab: {
     flex: 1,
-    alignItems: "center",
-    paddingVertical: 8
+    alignItems: "stretch",
+    paddingVertical: 4
   },
-  addComposerTabContent: {
-    flexDirection: "row",
+  addComposerTabPill: {
+    position: "relative",
+    flex: 1,
     alignItems: "center",
-    gap: 6,
-    paddingBottom: 2
+    justifyContent: "center",
+    paddingVertical: 10,
+    paddingHorizontal: 4,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "transparent",
+    gap: 5,
+    minHeight: 76
+  },
+  addComposerTabPillActive: {
+    backgroundColor: "#EFF6FF",
+    borderColor: "#BFDBFE"
   },
   addComposerTabText: {
     color: "#4B5563",
-    fontSize: 12,
+    fontSize: 10,
     fontWeight: "600",
-    letterSpacing: 0.2
+    letterSpacing: 0.15,
+    textAlign: "center"
   },
   addComposerTabTextActive: {
     color: "#1D4ED8",
     opacity: 1
   },
   addComposerProBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
+    position: "absolute",
+    top: 4,
+    right: 4,
+    zIndex: 2,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
     borderRadius: 999,
     backgroundColor: "#111827"
+  },
+  addBarcodeMvpContent: {
+    flex: 1,
+    minHeight: 0,
+    marginTop: 10
+  },
+  addBarcodeMvpCard: {
+    flex: 1,
+    minHeight: 200,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    borderRadius: 16,
+    padding: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10
+  },
+  addBarcodeMvpTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#111827"
+  },
+  addBarcodeMvpBody: {
+    fontSize: 14,
+    lineHeight: 20,
+    color: "#4B5563",
+    textAlign: "center"
+  },
+  addBarcodeMvpBrand: {
+    fontSize: 14,
+    color: "#6B7280",
+    textAlign: "center"
+  },
+  addBarcodeMvpMeta: {
+    fontSize: 15,
+    fontWeight: "600",
+    color: "#111827"
+  },
+  addBarcodeMvpNote: {
+    fontSize: 12,
+    color: "#6B7280",
+    textAlign: "center"
+  },
+  addBarcodeMvpSource: {
+    fontSize: 11,
+    color: "#9CA3AF",
+    fontStyle: "italic"
+  },
+  addBarcodeMvpActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginTop: 8,
+    width: "100%",
+    justifyContent: "center"
+  },
+  addBarcodeMvpSecondary: {
+    paddingVertical: 12,
+    paddingHorizontal: 18,
+    borderRadius: 999,
+    backgroundColor: "#E5E7EB"
+  },
+  addBarcodeMvpSecondaryText: {
+    fontSize: 15,
+    fontWeight: "600",
+    color: "#4B5563"
+  },
+  addBarcodeMvpPrimary: {
+    flex: 1,
+    maxWidth: 220,
+    paddingVertical: 12,
+    paddingHorizontal: 18,
+    borderRadius: 999,
+    backgroundColor: "#2563EB",
+    alignItems: "center"
+  },
+  addBarcodeMvpPrimaryText: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#FFFFFF"
   },
   addComposerProBadgeText: {
     color: "#FFFFFF",
