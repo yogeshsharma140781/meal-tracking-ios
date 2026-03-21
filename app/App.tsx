@@ -483,10 +483,29 @@ function resolveApiBaseUrl(): string {
 
 const API_BASE_URL = resolveApiBaseUrl();
 
+/**
+ * Barcode lookup hits GET /foods/barcode/:code on the backend (Open Food Facts proxy).
+ * On a physical phone, dev bundles often set EXPO_PUBLIC_API_BASE_URL to a LAN IP; that
+ * backend may be off or outdated. In __DEV__, route barcode to production HTTPS so scans work
+ * without running the API on your Mac. Override with EXPO_PUBLIC_BARCODE_API_BASE_URL.
+ */
+function resolveBarcodeApiBaseUrl(): string {
+  const override = process.env.EXPO_PUBLIC_BARCODE_API_BASE_URL?.trim();
+  if (override) return override;
+  const raw = process.env.EXPO_PUBLIC_API_BASE_URL?.trim();
+  if (__DEV__ && raw && isLikelyPrivateOrLocalHttpUrl(raw)) {
+    return PRODUCTION_API_BASE_URL;
+  }
+  return API_BASE_URL;
+}
+
+const BARCODE_API_BASE_URL = resolveBarcodeApiBaseUrl();
+
 if (__DEV__) {
   // Helps confirm what URL Metro / Dev Client is using (not logged in App Store builds).
   console.log("[api] EXPO_PUBLIC_API_BASE_URL raw:", process.env.EXPO_PUBLIC_API_BASE_URL);
   console.log("[api] resolved API_BASE_URL:", API_BASE_URL);
+  console.log("[api] BARCODE_API_BASE_URL (used for /foods/barcode only):", BARCODE_API_BASE_URL);
   const raw = process.env.EXPO_PUBLIC_API_BASE_URL?.trim();
   if (raw && isLikelyPrivateOrLocalHttpUrl(raw)) {
     console.warn(
@@ -600,6 +619,22 @@ const scaleTotals = (t: NutrientTotals, factor: number): NutrientTotals => ({
   vitamin_c_mg: (t.vitamin_c_mg ?? 0) * factor,
   vitamin_a_mcg: (t.vitamin_a_mcg ?? 0) * factor
 });
+
+/** Default grams shown in barcode quantity step (from API serving estimate). */
+function formatBarcodeGramsDefault(g: number): string {
+  if (!Number.isFinite(g) || g <= 0) return "100";
+  const rounded = Math.round(g * 10) / 10;
+  if (Number.isInteger(rounded)) return String(rounded);
+  return rounded.toFixed(1);
+}
+
+function parseBarcodeGramsInput(raw: string): number | null {
+  const t = raw.replace(",", ".").trim();
+  if (!t) return null;
+  const n = parseFloat(t);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
 
 const subtractTotals = (
   a: NutrientTotals,
@@ -2784,6 +2819,8 @@ function AppContent() {
   const [hasAutoOpenedCamera, setHasAutoOpenedCamera] = useState(false);
   const [barcodePreview, setBarcodePreview] = useState<BarcodePreview | null>(null);
   const [barcodeLookupLoading, setBarcodeLookupLoading] = useState(false);
+  /** Grams user ate; default filled from API serving estimate after scan. */
+  const [barcodeGramsInput, setBarcodeGramsInput] = useState("");
   const barcodeScanLastTsRef = useRef(0);
   const barcodeScanLastCodeRef = useRef<string>("");
   const [dataByDate, setDataByDate] = useState<Record<string, DayData>>({});
@@ -2975,6 +3012,7 @@ function AppContent() {
     if (addComposerTab !== "barcode") {
       setBarcodePreview(null);
       setBarcodeLookupLoading(false);
+      setBarcodeGramsInput("");
     }
   }, [addComposerTab]);
 
@@ -4270,6 +4308,7 @@ function AppContent() {
     setAddKeyboardOffset(0);
     setHasAutoOpenedCamera(false);
     setBarcodePreview(null);
+    setBarcodeGramsInput("");
     barcodeScanLastCodeRef.current = "";
     setView("add");
   };
@@ -4485,7 +4524,11 @@ function AppContent() {
     setBarcodeLookupLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE_URL}/foods/barcode/${encodeURIComponent(clean)}`);
+      const url = `${BARCODE_API_BASE_URL}/foods/barcode/${encodeURIComponent(clean)}`;
+      if (__DEV__) {
+        console.log("[barcode] GET", url);
+      }
+      const res = await fetch(url);
       const json = (await res.json()) as BarcodePreview & { error?: string };
       if (!res.ok) {
         throw new Error(json.error || "Product not found");
@@ -4494,10 +4537,21 @@ function AppContent() {
         throw new Error(json.error || "Product not found");
       }
       setBarcodePreview(json);
+      setBarcodeGramsInput(formatBarcodeGramsDefault(json.servingGrams));
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Barcode lookup failed";
+      let message = err instanceof Error ? err.message : "Barcode lookup failed";
+      if (
+        typeof message === "string" &&
+        (message.includes("Network request failed") ||
+          message.includes("Could not connect") ||
+          message.includes("Failed to connect"))
+      ) {
+        message =
+          "Could not reach the server for barcode lookup. Check Wi‑Fi and try again. (Tip: barcode uses the hosted API when your dev URL is a LAN address.)";
+      }
       setError(message);
       setBarcodePreview(null);
+      setBarcodeGramsInput("");
     } finally {
       setBarcodeLookupLoading(false);
     }
@@ -4523,19 +4577,29 @@ function AppContent() {
 
   const handleBarcodeCommit = useCallback(async () => {
     if (!selectedMealId || !barcodePreview?.nutrients) return;
+    const gramsLogged = parseBarcodeGramsInput(barcodeGramsInput);
+    if (gramsLogged == null) {
+      setError("Enter a valid amount in grams (greater than 0).");
+      return;
+    }
     try {
       setLoading(true);
       setError(null);
       const displayName = barcodePreview.brand
         ? `${barcodePreview.productName} (${barcodePreview.brand})`
         : barcodePreview.productName;
+      const baseServing =
+        Number.isFinite(barcodePreview.servingGrams) && barcodePreview.servingGrams > 0
+          ? barcodePreview.servingGrams
+          : 100;
+      const nutrientsForLogged = scaleTotals(barcodePreview.nutrients, gramsLogged / baseServing);
       const item: MealItem = {
         id: `barcode-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
         name: displayName,
-        quantity: barcodePreview.servingGrams,
+        quantity: gramsLogged,
         unit: "g",
-        grams: barcodePreview.servingGrams,
-        nutrients: barcodePreview.nutrients
+        grams: gramsLogged,
+        nutrients: nutrientsForLogged
       };
       const finalItems: MealItem[] = [item].map((it) => {
         const key = normalizeFoodNameForKey(it.name);
@@ -4622,6 +4686,7 @@ function AppContent() {
       }
 
       setBarcodePreview(null);
+      setBarcodeGramsInput("");
       barcodeScanLastCodeRef.current = "";
       setAddComposerTab("text");
       setView("home");
@@ -4634,6 +4699,7 @@ function AppContent() {
   }, [
     selectedMealId,
     barcodePreview,
+    barcodeGramsInput,
     foodOverrides,
     getDayData,
     selectedDate,
@@ -6097,15 +6163,28 @@ function AppContent() {
 
             <View style={styles.addCameraStage}>
               {addComposerTab === "barcode" && cameraPermission?.granted ? (
-                <CameraView
-                  style={styles.addCameraImage}
-                  facing="back"
-                  barcodeScannerSettings={{
-                    barcodeTypes: ["ean13", "ean8", "upc_a", "upc_e"]
-                  }}
-                  onBarcodeScanned={handleBarcodeScanned}
-                  active={!barcodeLookupLoading && !barcodePreview}
-                />
+                barcodeLookupLoading || barcodePreview ? (
+                  <View style={[styles.addCameraImage, styles.addBarcodeCameraPaused]}>
+                    {barcodeLookupLoading ? (
+                      <>
+                        <ActivityIndicator size="large" color="#FFFFFF" />
+                        <Text style={styles.addBarcodeCameraPausedText}>Looking up product…</Text>
+                      </>
+                    ) : (
+                      <Text style={styles.addBarcodeCameraPausedText}>Product found — enter grams below</Text>
+                    )}
+                  </View>
+                ) : (
+                  <CameraView
+                    style={styles.addCameraImage}
+                    facing="back"
+                    barcodeScannerSettings={{
+                      barcodeTypes: ["ean13", "ean8", "upc_a", "upc_e"]
+                    }}
+                    onBarcodeScanned={handleBarcodeScanned}
+                    active
+                  />
+                )
               ) : addComposerTab === "photo" && isPro && cameraPermission?.granted && !(mealPhotoAnalyzing && mealPhotoUri) ? (
                 <CameraView ref={cameraRef} style={styles.addCameraImage} facing="back" />
               ) : mealPhotoUri ? (
@@ -6152,13 +6231,6 @@ function AppContent() {
                 </View>
               )}
 
-              {addComposerTab === "barcode" && barcodeLookupLoading && !mealPhotoAnalyzing && (
-                <View style={styles.addCameraAnalyzingOverlay}>
-                  <ActivityIndicator size="large" color="#FFFFFF" />
-                  <Text style={styles.addCameraAnalyzingText}>Looking up product…</Text>
-                </View>
-              )}
-
               {addComposerTab === "photo" && isPro && (
                 <TouchableOpacity
                   style={styles.addShutterWrap}
@@ -6200,7 +6272,8 @@ function AppContent() {
                 styles.addFloatingComposer,
                 addKeyboardOffset > 0 && { bottom: Math.max(-22, addKeyboardOffset - 22) },
                 (addComposerTab === "text" || addComposerTab === "barcode") &&
-                  styles.addFloatingComposerExpanded
+                  styles.addFloatingComposerExpanded,
+                addComposerTab === "barcode" && styles.addFloatingComposerBarcode
               ]}
             >
               <View style={styles.addComposerTabsRow}>
@@ -6397,33 +6470,76 @@ function AppContent() {
               )}
 
               {addComposerTab === "barcode" && (
-                <View style={styles.addBarcodeMvpContent}>
-                  <View style={styles.addBarcodeMvpCard}>
-                    <TabIcon
-                      source={require("./assets/add-tab-barcode-active.png")}
-                      size={40}
-                    />
+                <ScrollView
+                  style={styles.addBarcodeMvpContent}
+                  contentContainerStyle={styles.addBarcodeMvpScrollContent}
+                  keyboardShouldPersistTaps="handled"
+                  keyboardDismissMode="on-drag"
+                >
+                  <View
+                    style={[
+                      styles.addBarcodeMvpCard,
+                      barcodePreview && styles.addBarcodeMvpCardQuantity
+                    ]}
+                  >
+                    <View style={{ alignSelf: "center" }}>
+                      <TabIcon
+                        source={require("./assets/add-tab-barcode-active.png")}
+                        size={40}
+                      />
+                    </View>
                     {barcodePreview ? (
                       <>
-                        <Text style={styles.addBarcodeMvpTitle} numberOfLines={2}>
+                        <Text style={styles.addBarcodeMvpStepTitle}>How much did you eat?</Text>
+                        <Text
+                          style={[styles.addBarcodeMvpTitle, styles.addBarcodeMvpProductCenter]}
+                          numberOfLines={2}
+                        >
                           {barcodePreview.productName}
                         </Text>
                         {barcodePreview.brand ? (
-                          <Text style={styles.addBarcodeMvpBrand}>{barcodePreview.brand}</Text>
+                          <Text style={[styles.addBarcodeMvpBrand, styles.addBarcodeMvpProductCenter]}>
+                            {barcodePreview.brand}
+                          </Text>
                         ) : null}
-                        <Text style={styles.addBarcodeMvpMeta}>
-                          {Math.round(barcodePreview.servingGrams)} g ·{" "}
-                          {Math.round(barcodePreview.nutrients?.calories_kcal ?? 0)} kcal
+                        <Text style={styles.addBarcodeMvpHint}>
+                          Amount (below) defaults from pack data when available — change it to match what you ate.
                         </Text>
-                        {barcodePreview.notes?.[0] ? (
-                          <Text style={styles.addBarcodeMvpNote}>{barcodePreview.notes[0]}</Text>
-                        ) : null}
+                        <Text style={styles.addBarcodeMvpFieldLabel}>Amount (grams)</Text>
+                        <TextInput
+                          style={styles.addBarcodeMvpGramsInput}
+                          value={barcodeGramsInput}
+                          onChangeText={(t) => {
+                            setBarcodeGramsInput(t);
+                            setError(null);
+                          }}
+                          keyboardType="decimal-pad"
+                          placeholder={formatBarcodeGramsDefault(barcodePreview.servingGrams)}
+                          placeholderTextColor="#9CA3AF"
+                          selectTextOnFocus
+                        />
+                        <Text style={styles.addBarcodeMvpEstimate}>
+                          {(() => {
+                            const g = parseBarcodeGramsInput(barcodeGramsInput);
+                            const base =
+                              Number.isFinite(barcodePreview.servingGrams) && barcodePreview.servingGrams > 0
+                                ? barcodePreview.servingGrams
+                                : 100;
+                            if (g == null || !barcodePreview.nutrients) {
+                              return "—";
+                            }
+                            const kcal = scaleTotals(barcodePreview.nutrients, g / base).calories_kcal;
+                            return `~${Math.round(kcal)} kcal`;
+                          })()}
+                        </Text>
                         <Text style={styles.addBarcodeMvpSource}>Nutrition via Open Food Facts</Text>
                         <View style={styles.addBarcodeMvpActions}>
                           <TouchableOpacity
                             style={styles.addBarcodeMvpSecondary}
                             onPress={() => {
+                              Keyboard.dismiss();
                               setBarcodePreview(null);
+                              setBarcodeGramsInput("");
                               barcodeScanLastCodeRef.current = "";
                             }}
                           >
@@ -6434,7 +6550,10 @@ function AppContent() {
                               styles.addBarcodeMvpPrimary,
                               loading && styles.addFloatingConfirmDisabled
                             ]}
-                            onPress={() => void handleBarcodeCommit()}
+                            onPress={() => {
+                              Keyboard.dismiss();
+                              void handleBarcodeCommit();
+                            }}
                             disabled={loading}
                           >
                             <Text style={styles.addBarcodeMvpPrimaryText}>
@@ -6447,13 +6566,13 @@ function AppContent() {
                       <>
                         <Text style={styles.addBarcodeMvpTitle}>Scan a barcode</Text>
                         <Text style={styles.addBarcodeMvpBody}>
-                          Aim at the product barcode. We look up nutrition on the server (Open Food Facts) and add one
-                          portion to this meal.
+                          Aim at the product barcode. We look up nutrition on the server (Open Food Facts), then enter
+                          grams and tap Add to meal.
                         </Text>
                       </>
                     )}
                   </View>
-                </View>
+                </ScrollView>
               )}
             </View>
           </KeyboardAvoidingView>
@@ -10294,6 +10413,20 @@ const styles = StyleSheet.create({
     width: "100%",
     height: "100%"
   },
+  /** Shown while OFF lookup runs or after scan — camera is unmounted to avoid iOS FigCapture / XPC errors. */
+  addBarcodeCameraPaused: {
+    backgroundColor: "#000000",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 14
+  },
+  addBarcodeCameraPausedText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "600",
+    textAlign: "center",
+    paddingHorizontal: 24
+  },
   addCameraPlaceholder: {
     flex: 1,
     backgroundColor: "#111827",
@@ -10396,6 +10529,11 @@ const styles = StyleSheet.create({
   addFloatingComposerExpanded: {
     minHeight: 420
   },
+  /** Barcode card has grams field + estimate — needs more vertical space than text tab. */
+  addFloatingComposerBarcode: {
+    minHeight: 520,
+    paddingBottom: 18
+  },
   addFloatingTextContent: {
     flex: 1,
     minHeight: 0,
@@ -10456,6 +10594,10 @@ const styles = StyleSheet.create({
     minHeight: 0,
     marginTop: 10
   },
+  addBarcodeMvpScrollContent: {
+    flexGrow: 1,
+    paddingBottom: 24
+  },
   addBarcodeMvpCard: {
     flex: 1,
     minHeight: 200,
@@ -10467,6 +10609,56 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     gap: 10
+  },
+  addBarcodeMvpCardQuantity: {
+    justifyContent: "flex-start",
+    alignItems: "stretch",
+    minHeight: 320
+  },
+  addBarcodeMvpStepTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#111827",
+    textAlign: "center",
+    marginBottom: 4
+  },
+  addBarcodeMvpProductCenter: {
+    width: "100%",
+    textAlign: "center"
+  },
+  addBarcodeMvpHint: {
+    fontSize: 12,
+    lineHeight: 17,
+    color: "#6B7280",
+    textAlign: "center",
+    marginTop: 2
+  },
+  addBarcodeMvpFieldLabel: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#374151",
+    alignSelf: "flex-start",
+    marginTop: 8,
+    marginBottom: 6
+  },
+  addBarcodeMvpGramsInput: {
+    width: "100%",
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    fontSize: 18,
+    fontWeight: "600",
+    color: "#111827",
+    backgroundColor: "#F9FAFB"
+  },
+  addBarcodeMvpEstimate: {
+    fontSize: 15,
+    fontWeight: "600",
+    color: "#1D4ED8",
+    textAlign: "center",
+    marginTop: 8
   },
   addBarcodeMvpTitle: {
     fontSize: 18,
@@ -10481,16 +10673,6 @@ const styles = StyleSheet.create({
   },
   addBarcodeMvpBrand: {
     fontSize: 14,
-    color: "#6B7280",
-    textAlign: "center"
-  },
-  addBarcodeMvpMeta: {
-    fontSize: 15,
-    fontWeight: "600",
-    color: "#111827"
-  },
-  addBarcodeMvpNote: {
-    fontSize: 12,
     color: "#6B7280",
     textAlign: "center"
   },

@@ -1,0 +1,15 @@
+---
+description: Restart Expo Metro after JS bundle changes (meal-tracking-ios app).
+globs:
+  - "**/meal-tracking-ios/app/**/*.{ts,tsx}"
+  - "**/meal-tracking-ios/app/**/*.js"
+alwaysApply: false
+---
+
+# Metro restart (Expo)
+
+When you change files under `meal-tracking-ios/app/` that affect the JavaScript bundle (especially `App.tsx`, hooks, or any screen), **restart Metro yourself** so a physical device or simulator picks up the change:
+
+1. From `meal-tracking-ios/app`, run **`bash start-metro-lan.sh`** **in the background** (it runs `kill-metro-if-running.sh`, **`env -u CI`** so Fast Refresh is not disabled, **`--clear`**, **`--port 8081`**), unless Metro was already restarted in this turn.
+
+Do **not** rely on `CI=true` in the environment — project scripts strip it with **`env -u CI`**.

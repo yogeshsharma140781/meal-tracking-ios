@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "main": "node_modules/expo/AppEntry.js",
   "scripts": {
-    "start": "bash scripts/with-bundled-node.sh npx expo start",
-    "start:lan": "bash scripts/with-bundled-node.sh npx expo start --lan --clear",
-    "start:tunnel": "bash scripts/with-bundled-node.sh npx expo start --tunnel --clear",
+    "start": "bash scripts/kill-metro-if-running.sh && env -u CI bash scripts/with-bundled-node.sh npx expo start --clear --port 8081",
+    "start:lan": "bash scripts/kill-metro-if-running.sh && env -u CI bash scripts/with-bundled-node.sh npx expo start --lan --clear --port 8081",
+    "start:tunnel": "bash scripts/kill-metro-if-running.sh && env -u CI bash scripts/with-bundled-node.sh npx expo start --tunnel --clear --port 8081",
     "start:production": "NODE_ENV=production expo start --no-dev --minify",
     "ios": "expo run:ios",
     "ios:production": "open ios/Joul.xcworkspace",

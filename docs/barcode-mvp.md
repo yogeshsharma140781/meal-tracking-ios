@@ -3,13 +3,14 @@
 ## Flow
 
 1. **App** — Add item(s) → **SCAN BARCODE** → camera scans EAN-13 / EAN-8 / UPC-A / UPC-E.
-2. **Client** — `GET {API_BASE_URL}/foods/barcode/{digits}` (same host as `/v1/meals`).
-3. **Server** — Proxies **[Open Food Facts](https://world.openfoodfacts.org)** API v2 (`/api/v2/product/{code}`), maps nutriments to your `NutrientTotals`, estimates **portion grams** from `serving_size` / `quantity` (defaults to **100 g** if unknown).
-4. **User** — Confirms **Add to meal**; one `MealItem` is appended to the selected meal.
+2. **Client** — `GET {BARCODE_API_BASE_URL}/foods/barcode/{digits}`. In **`__DEV__`**, if `EXPO_PUBLIC_API_BASE_URL` is a **LAN/localhost HTTP** URL, `BARCODE_API_BASE_URL` defaults to the **production** API so barcode works on a phone without a local backend. Override with **`EXPO_PUBLIC_BARCODE_API_BASE_URL`**.
+3. **Server** — Proxies **[Open Food Facts](https://world.openfoodfacts.org)** API v2 (`/api/v2/product/{code}`), maps nutriments to your `NutrientTotals`, estimates **portion grams** using (in order): `serving_quantity` + `serving_quantity_unit`, parsed `serving_size` (incl. French *grammes* / *gr*), ratio of per-serving vs per-100g nutrients, then `quantity` (often whole pack — last resort). Defaults to **100 g** only if nothing matches.
+4. **User** — Sees product + **grams** field (default = server’s serving estimate), can edit, then **Add to meal**. Nutrients are scaled by `userGrams / servingGrams` from the preview payload.
 
 ## Env (Render / local)
 
 - Optional: `OPENFOODFACTS_USER_AGENT` — descriptive User-Agent (recommended by OFF). Default in code is a generic dev string.
+- Optional (app): `EXPO_PUBLIC_BARCODE_API_BASE_URL` — force barcode requests to a specific base URL (e.g. local backend for testing the proxy).
 
 ## Deploy
 
