@@ -314,6 +314,30 @@ function clampGramsPerUnit(g: number): number {
   return Math.min(GRAMS_PER_UNIT_MAX, Math.max(GRAMS_PER_UNIT_MIN, g));
 }
 
+const PIECE_LIKE = /^(piece|pieces|pc|pcs|slice|slices)$/i;
+
+/**
+ * Vision models often output ~50g per "piece" (our old default). That is wrong for grapes,
+ * berries, and small cut fruit — yields 10×50=500g. Cap gramsPerUnit by food + unit.
+ */
+function sanitizeGramsPerUnitForFood(name: string, unitRaw: string, gramsPerUnit: number): number {
+  const u = unitRaw.trim().toLowerCase();
+  if (!PIECE_LIKE.test(u)) return gramsPerUnit;
+
+  const lower = name.toLowerCase();
+  let cap = 3500;
+
+  if (/\b(grape|grapes)\b/.test(lower)) cap = Math.min(cap, 8);
+  else if (/\b(blueberry|blueberries|raspberry|raspberries|blackberry|blackberries|berry|berries)\b/.test(lower)) {
+    cap = Math.min(cap, 12);
+  } else if (/\b(strawberry|strawberries)\b/.test(lower)) cap = Math.min(cap, 28);
+  else if (/\b(pineapple)\b/.test(lower)) cap = Math.min(cap, 45);
+  else if (/\b(watermelon|cantaloupe|honeydew|melon)\b/.test(lower)) cap = Math.min(cap, 65);
+  else if (/\b(fruit salad|mixed fruit|fruit bowl)\b/.test(lower)) cap = Math.min(cap, 40);
+
+  return Math.min(gramsPerUnit, cap);
+}
+
 /** Compare units after normalization (plural/synonyms). */
 function canonicalPortionUnit(u: string): string {
   const x = u.trim().toLowerCase().replace(/\s+/g, "");
@@ -354,7 +378,9 @@ export const parseMealPhotoWithAi = async (
   const system = [
     "You are a nutrition assistant analyzing meal photos.",
     "Identify visible foods in the photo. For portions, prioritize an accurate COUNT of discrete items and a sensible STRUCTURED unit (piece, slice, bowl, cup, g, ml, tbsp).",
-    "For EVERY item you MUST fill gramsPerUnit: typical grams for ONE of that unit in a normal adult meal (combine what you see with common reference portions—USDA-style / home / restaurant / cultural norms).",
+    "For EVERY item you MUST fill gramsPerUnit: typical grams for ONE of that unit (combine what you see with common reference portions).",
+    "CRITICAL gramsPerUnit realism: A single grape is ~4–8g; a small berry ~5–12g; one strawberry slice/wedge ~8–22g; a pineapple chunk ~20–40g; a watermelon cube ~25–55g. Do NOT use ~50g per piece for grapes or berries—that would massively overstate totals.",
+    "Mixed fruit in one bowl: prefer ONE line such as '1 bowl fruit salad' with gramsPerUnit ~180–350g for the bowl, OR list components with realistic per-piece weights—not the same 50g for every fruit type.",
     "Do not pretend to weigh pixels; use typical sizes. piece = one discrete item; slice = one slice; bowl/cup/serving = one filled portion; tbsp/tsp = level spoon.",
     "For unit g or ml, set gramsPerUnit to 1 (total mass is quantity × 1). For L use quantity in liters and gramsPerUnit 1000, or prefer ml.",
     "Set estimatedGrams to quantity × gramsPerUnit (they must be consistent).",
@@ -435,7 +461,7 @@ export const parseMealPhotoWithAi = async (
     const lower = name.toLowerCase();
     if (/\b(tea|chai|coffee|juice|milk|lassi|smoothie|shake|broth|drink|beverage)\b/.test(lower)) return "liquid";
     if (/\b(sauce|chutney|dip|dressing|salsa|pesto|jam|ketchup|mayonnaise|mayo|hummus|spread)\b/.test(lower)) return "condiment";
-    if (/\b(dumpling|momo|sushi|nigiri|roll|taco|burrito|sandwich|burger|pizza|slice|samosa|empanada|falafel|croissant|cookie|biscuit|muffin|egg|idli|dosa|roti|chapati|naan|paratha|wrap|spring\s+roll|meatball|wing|nugget|cutlet|apple|banana|orange|pear)\b/i.test(lower)) {
+    if (/\b(dumpling|momo|sushi|nigiri|roll|taco|burrito|sandwich|burger|pizza|slice|samosa|empanada|falafel|croissant|cookie|biscuit|muffin|egg|idli|dosa|roti|chapati|naan|paratha|wrap|spring\s+roll|meatball|wing|nugget|cutlet|apple|banana|orange|pear|strawberry|grape|berries|berry|blackberry|raspberry|blueberry|pineapple|watermelon|melon)\b/i.test(lower)) {
       return "countable";
     }
     if (/\b(rice|biryani|pulao|risotto|paella|poha|upma|khichdi|oatmeal|oats|porridge|dal|curry|gravy|stew|soup|noodle|noodles|ramen|udon|pho|pasta|mac\s+and\s+cheese|congee|kichari|salad)\b/i.test(lower)) {
@@ -512,14 +538,18 @@ export const parseMealPhotoWithAi = async (
       const rawName = normalizeIndianPhotoItemName(item.name);
       const rawQuantity = Number.isFinite(item.quantity) && item.quantity > 0 ? item.quantity : 1;
       const rawUnit = item.unit?.trim() || "serving";
-      const rawGramsPerUnit = clampGramsPerUnit(
-        item.gramsPerUnit != null &&
-          Number.isFinite(item.gramsPerUnit) &&
-          item.gramsPerUnit > 0
-          ? item.gramsPerUnit
-          : rawQuantity > 0 && item.estimatedGrams > 0
-            ? item.estimatedGrams / rawQuantity
-            : 50
+      const rawGramsPerUnit = sanitizeGramsPerUnitForFood(
+        rawName,
+        rawUnit,
+        clampGramsPerUnit(
+          item.gramsPerUnit != null &&
+            Number.isFinite(item.gramsPerUnit) &&
+            item.gramsPerUnit > 0
+            ? item.gramsPerUnit
+            : rawQuantity > 0 && item.estimatedGrams > 0
+              ? item.estimatedGrams / rawQuantity
+              : 50
+        )
       );
       const directMassTotal = totalGramsFromDirectMassVolume(rawQuantity, rawUnit);
       const rawEstimatedGrams =

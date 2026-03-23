@@ -92,6 +92,30 @@ describe("parseMealPhotoWithAi (mocked OpenAI)", () => {
     expect(result.items[0].gramsPerUnit).toBeUndefined();
   });
 
+  it("caps unrealistic gramsPerUnit for grapes (avoids 10×50g=500g)", async () => {
+    mockCreate.mockResolvedValue({
+      output_text: JSON.stringify({
+        descriptionText: "10 piece grapes",
+        notes: [],
+        items: [
+          {
+            name: "grapes",
+            quantity: 10,
+            unit: "piece",
+            gramsPerUnit: 50,
+            estimatedGrams: 500,
+            confidence: 0.7,
+            assumptionText: "Model overestimated per piece."
+          }
+        ]
+      })
+    });
+
+    const result = await parseMealPhotoWithAi("dGVzdA==");
+    expect(result.items[0].estimatedGrams).toBe(80);
+    expect(result.items[0].gramsPerUnit).toBe(8);
+  });
+
   it("when portion rules change unit (curry + piece → bowl), uses normalized total not piece gramsPerUnit", async () => {
     mockCreate.mockResolvedValue({
       output_text: JSON.stringify({
