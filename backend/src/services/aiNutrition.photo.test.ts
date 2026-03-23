@@ -92,6 +92,54 @@ describe("parseMealPhotoWithAi (mocked OpenAI)", () => {
     expect(result.items[0].gramsPerUnit).toBeUndefined();
   });
 
+  it("caps watermelon pieces when model outputs ~200g each (serving or piece)", async () => {
+    mockCreate.mockResolvedValue({
+      output_text: JSON.stringify({
+        descriptionText: "8 piece watermelon",
+        notes: [],
+        items: [
+          {
+            name: "watermelon",
+            quantity: 8,
+            unit: "serving",
+            gramsPerUnit: 200,
+            estimatedGrams: 1600,
+            confidence: 0.75,
+            assumptionText: "Cubes in salad."
+          }
+        ]
+      })
+    });
+
+    const result = await parseMealPhotoWithAi("dGVzdA==");
+    expect(result.items[0].estimatedGrams).toBe(440);
+    expect(result.items[0].gramsPerUnit).toBe(55);
+  });
+
+  it("caps pineapple when model uses high gramsPerUnit per piece", async () => {
+    mockCreate.mockResolvedValue({
+      output_text: JSON.stringify({
+        descriptionText: "6 piece pineapple",
+        notes: [],
+        items: [
+          {
+            name: "pineapple",
+            quantity: 6,
+            unit: "piece",
+            gramsPerUnit: 200,
+            estimatedGrams: 1200,
+            confidence: 0.75,
+            assumptionText: "Chunks."
+          }
+        ]
+      })
+    });
+
+    const result = await parseMealPhotoWithAi("dGVzdA==");
+    expect(result.items[0].estimatedGrams).toBe(240);
+    expect(result.items[0].gramsPerUnit).toBe(40);
+  });
+
   it("caps unrealistic gramsPerUnit for grapes (avoids 10×50g=500g)", async () => {
     mockCreate.mockResolvedValue({
       output_text: JSON.stringify({

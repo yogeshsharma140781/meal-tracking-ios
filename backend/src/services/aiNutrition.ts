@@ -316,26 +316,73 @@ function clampGramsPerUnit(g: number): number {
 
 const PIECE_LIKE = /^(piece|pieces|pc|pcs|slice|slices)$/i;
 
+/** piece/slice/pc OR serving — models often use "serving" per chunk with absurd gramsPerUnit. */
+function isDiscreteCountUnit(unitRaw: string): boolean {
+  const u = unitRaw.trim().toLowerCase().replace(/\s+/g, "");
+  return PIECE_LIKE.test(u) || /^(serving|servings)$/.test(u);
+}
+
+/** Max grams per counted item for cut fruit / berries (salad-sized chunks). */
+function maxGramsPerDiscreteFruitItem(nameLower: string): number | null {
+  if (/\b(grape|grapes)\b/.test(nameLower)) return 8;
+  if (/\b(blueberry|blueberries|raspberry|raspberries|blackberry|blackberries|berry|berries)\b/.test(nameLower)) {
+    return 12;
+  }
+  if (/\b(strawberry|strawberries)\b/.test(nameLower)) return 28;
+  if (/\b(pineapple)\b/.test(nameLower)) return 40;
+  if (/\b(watermelon|cantaloupe|honeydew|melon)\b/.test(nameLower)) return 55;
+  if (/\b(fruit salad|mixed fruit|fruit bowl)\b/.test(nameLower)) return 40;
+  return null;
+}
+
 /**
- * Vision models often output ~50g per "piece" (our old default). That is wrong for grapes,
- * berries, and small cut fruit — yields 10×50=500g. Cap gramsPerUnit by food + unit.
+ * Do not cap when the line clearly means one whole bowl/cup of food (quantity 1).
  */
-function sanitizeGramsPerUnitForFood(name: string, unitRaw: string, gramsPerUnit: number): number {
+function shouldApplyFruitDiscreteCap(name: string, unitRaw: string, quantity: number): boolean {
   const u = unitRaw.trim().toLowerCase();
-  if (!PIECE_LIKE.test(u)) return gramsPerUnit;
-
+  const bowlLike = /^(bowl|bowls|cup|cups)$/.test(u);
   const lower = name.toLowerCase();
-  let cap = 3500;
 
-  if (/\b(grape|grapes)\b/.test(lower)) cap = Math.min(cap, 8);
-  else if (/\b(blueberry|blueberries|raspberry|raspberries|blackberry|blackberries|berry|berries)\b/.test(lower)) {
-    cap = Math.min(cap, 12);
-  } else if (/\b(strawberry|strawberries)\b/.test(lower)) cap = Math.min(cap, 28);
-  else if (/\b(pineapple)\b/.test(lower)) cap = Math.min(cap, 45);
-  else if (/\b(watermelon|cantaloupe|honeydew|melon)\b/.test(lower)) cap = Math.min(cap, 65);
-  else if (/\b(fruit salad|mixed fruit|fruit bowl)\b/.test(lower)) cap = Math.min(cap, 40);
+  if (/\b(fruit salad|mixed fruit|fruit bowl)\b/.test(lower) && bowlLike && quantity <= 1) {
+    return false;
+  }
+  if (bowlLike && quantity <= 1) return false;
 
+  return isDiscreteCountUnit(unitRaw);
+}
+
+/**
+ * Vision models often output ~50g per "piece" or ~200g per "serving" for fruit chunks.
+ * Cap gramsPerUnit for discrete units (piece, slice, serving, pc).
+ */
+function sanitizeGramsPerUnitForFood(
+  name: string,
+  unitRaw: string,
+  gramsPerUnit: number,
+  quantity: number
+): number {
+  const lower = name.toLowerCase();
+  const cap = maxGramsPerDiscreteFruitItem(lower);
+  if (cap == null || !shouldApplyFruitDiscreteCap(name, unitRaw, quantity)) {
+    return gramsPerUnit;
+  }
   return Math.min(gramsPerUnit, cap);
+}
+
+/** Last-resort ceiling so totals cannot exceed qty × max-per-item after any path. */
+function capTotalGramsForFruitLine(
+  name: string,
+  unitRaw: string,
+  quantity: number,
+  totalGrams: number
+): number {
+  const lower = name.toLowerCase();
+  const cap = maxGramsPerDiscreteFruitItem(lower);
+  if (cap == null || !shouldApplyFruitDiscreteCap(name, unitRaw, quantity)) {
+    return totalGrams;
+  }
+  const maxTotal = quantity * cap;
+  return Math.min(totalGrams, maxTotal);
 }
 
 /** Compare units after normalization (plural/synonyms). */
@@ -379,7 +426,7 @@ export const parseMealPhotoWithAi = async (
     "You are a nutrition assistant analyzing meal photos.",
     "Identify visible foods in the photo. For portions, prioritize an accurate COUNT of discrete items and a sensible STRUCTURED unit (piece, slice, bowl, cup, g, ml, tbsp).",
     "For EVERY item you MUST fill gramsPerUnit: typical grams for ONE of that unit (combine what you see with common reference portions).",
-    "CRITICAL gramsPerUnit realism: A single grape is ~4–8g; a small berry ~5–12g; one strawberry slice/wedge ~8–22g; a pineapple chunk ~20–40g; a watermelon cube ~25–55g. Do NOT use ~50g per piece for grapes or berries—that would massively overstate totals.",
+    "CRITICAL gramsPerUnit realism: A single grape is ~4–8g; a small berry ~5–12g; one strawberry slice/wedge ~8–22g; a pineapple chunk ~15–40g; a watermelon cube ~20–55g. Never use ~50g per grape, ~150–200g per watermelon chunk, or ~200g per pineapple chunk in a fruit salad—those are huge overestimates.",
     "Mixed fruit in one bowl: prefer ONE line such as '1 bowl fruit salad' with gramsPerUnit ~180–350g for the bowl, OR list components with realistic per-piece weights—not the same 50g for every fruit type.",
     "Do not pretend to weigh pixels; use typical sizes. piece = one discrete item; slice = one slice; bowl/cup/serving = one filled portion; tbsp/tsp = level spoon.",
     "For unit g or ml, set gramsPerUnit to 1 (total mass is quantity × 1). For L use quantity in liters and gramsPerUnit 1000, or prefer ml.",
@@ -549,7 +596,8 @@ export const parseMealPhotoWithAi = async (
             : rawQuantity > 0 && item.estimatedGrams > 0
               ? item.estimatedGrams / rawQuantity
               : 50
-        )
+        ),
+        rawQuantity
       );
       const directMassTotal = totalGramsFromDirectMassVolume(rawQuantity, rawUnit);
       const rawEstimatedGrams =
@@ -610,6 +658,11 @@ export const parseMealPhotoWithAi = async (
       const per = clampGramsPerUnit(rawGramsPerUnit);
       estimatedGramsFinal = Math.max(1, Math.round(qty * per * 10) / 10);
       gramsPerUnitOut = per;
+    }
+
+    estimatedGramsFinal = capTotalGramsForFruitLine(rawName, unit, qty, estimatedGramsFinal);
+    if (gramsPerUnitOut != null && qty > 0) {
+      gramsPerUnitOut = Math.round((estimatedGramsFinal / qty) * 10) / 10;
     }
 
     const fromVisionPortion = direct == null && normalizeUnchanged;
