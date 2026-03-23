@@ -748,8 +748,12 @@ const getCanonicalFoodName = (name: string): string => {
 const inferDefaultServingGrams = (name: string): number => {
   const lower = name.toLowerCase();
   const rules: { keywords: string[]; grams: number }[] = [
-    /** Before "apple" — "pineapple".includes("apple") would otherwise match apple (150g fruit rule). */
-    { keywords: ["pineapple"], grams: 150 },
+    /** Before "apple" — "pineapple".includes("apple") would otherwise match apple (150g). Use chunk-sized g for piece logs. */
+    { keywords: ["pineapple"], grams: 28 },
+    /** Cut-fruit / piece counts when text has no explicit grams (fallback). */
+    { keywords: ["watermelon"], grams: 45 },
+    { keywords: ["grape", "grapes"], grams: 5 },
+    { keywords: ["strawberry", "strawberries"], grams: 15 },
     { keywords: ["vitamin", "omega", "tablet", "capsule", "supplement", "pill", "softgel", "gummy", "multivitamin", "probiotic"], grams: 1 },
     { keywords: ["chapati", "chapatti", "roti", "phulka"], grams: 50 },
     { keywords: ["naan"], grams: 90 },
@@ -766,7 +770,7 @@ const inferDefaultServingGrams = (name: string): number => {
     { keywords: ["banana"], grams: 120 },
     { keywords: ["apple", "orange", "pear"], grams: 150 },
     { keywords: ["mango"], grams: 200 },
-    { keywords: ["strawberry", "blueberry", "raspberry", "berry"], grams: 100 },
+    { keywords: ["blueberry", "blueberries", "raspberry", "raspberries", "blackberry", "blackberries", "berry"], grams: 100 },
     { keywords: ["milk"], grams: 240 },
     { keywords: ["yogurt", "curd", "dahi"], grams: 170 },
     { keywords: ["oatmeal", "oats"], grams: 40 },
@@ -958,6 +962,26 @@ function parseToParsedFoods(text: string): ParsedFood[] {
 
   for (const chunk of chunks) {
     const lower = chunk.toLowerCase();
+
+    // "<num> g <food>" or "<num>g <food>" — explicit grams (e.g. photo API: "440 g watermelon")
+    const gramsLead = chunk.match(/^(\d+(?:\.\d+)?)\s*g\s+(.+)$/i);
+    if (gramsLead) {
+      const gramsNum = parseFloat(gramsLead[1]);
+      const foodPart = gramsLead[2].trim();
+      if (foodPart && Number.isFinite(gramsNum) && gramsNum > 0) {
+        const name = capitalizeFirst(foodPart);
+        results.push({
+          name,
+          originalText: chunk,
+          quantity: gramsNum,
+          unit: "g",
+          approx: false,
+          role: detectFoodRole(name),
+          confidence: 0.95,
+        });
+        continue;
+      }
+    }
 
     // Special case: "<grams> g <main> in <fat>"
     const gramInMatch = lower.match(
@@ -4219,15 +4243,31 @@ function AppContent() {
 
         const payload = (await res.json()) as {
           descriptionText?: string;
-          items?: Array<{ quantity?: number; unit?: string; name?: string }>;
+          items?: Array<{
+            quantity?: number;
+            unit?: string;
+            name?: string;
+            estimatedGrams?: number;
+          }>;
         };
 
         const fromDescription = (payload.descriptionText || "").trim();
-        const fromItems = (payload.items || [])
-          .filter((item) => item && item.name && String(item.name).trim().length > 0)
-          .map((item) => `${item.quantity || 1} ${item.unit || "serving"} ${String(item.name).trim()}`)
+        const rawItems = (payload.items || []).filter(
+          (item) => item && item.name && String(item.name).trim().length > 0
+        );
+        /** Prefer explicit grams so local enrichParsedFoods matches server photo math (piece×heuristics was wildly off for fruit). */
+        const fromItems = rawItems
+          .map((item) => {
+            const name = String(item.name).trim();
+            const g = item.estimatedGrams;
+            if (typeof g === "number" && Number.isFinite(g) && g > 0) {
+              return `${Math.round(g)} g ${name}`;
+            }
+            return `${item.quantity ?? 1} ${item.unit ?? "serving"} ${name}`;
+          })
           .join("\n");
-        const nextDescription = fromDescription || fromItems;
+        const nextDescription =
+          rawItems.length > 0 ? fromItems : fromDescription || fromItems;
 
         if (!nextDescription) {
           throw new Error("Could not identify foods in that image. Try retaking with better lighting.");
