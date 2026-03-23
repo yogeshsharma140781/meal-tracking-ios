@@ -23,6 +23,8 @@ export type AiPhotoMealItem = {
   estimatedGrams: number;
   confidence: number;
   assumptionText: string;
+  /** Typical grams for one unit (from vision model when structured units are used). */
+  gramsPerUnit?: number;
 };
 
 export type AiPhotoMealResult = {
@@ -270,7 +272,10 @@ const photoSchema = {
           name: { type: "string" },
           quantity: { type: "number" },
           unit: { type: "string" },
+          /** Total grams ≈ quantity × gramsPerUnit (should be consistent). */
           estimatedGrams: { type: "number" },
+          /** Typical grams for ONE unit (piece, slice, bowl, cup, tbsp, serving, …). Use food knowledge + what you see; not pixel-scale weighing. For unit "g" or "ml", use 1. */
+          gramsPerUnit: { type: "number" },
           confidence: { type: "number" },
           assumptionText: { type: "string" }
         },
@@ -279,6 +284,7 @@ const photoSchema = {
           "quantity",
           "unit",
           "estimatedGrams",
+          "gramsPerUnit",
           "confidence",
           "assumptionText"
         ]
@@ -289,6 +295,50 @@ const photoSchema = {
   },
   required: ["items", "descriptionText", "notes"]
 };
+
+/** Direct mass/volume units: total grams = quantity (with L → ml×1000). */
+function totalGramsFromDirectMassVolume(quantity: number, unitRaw: string): number | null {
+  const q = Number.isFinite(quantity) && quantity > 0 ? quantity : 1;
+  const u = unitRaw.trim().toLowerCase().replace(/\s+/g, "");
+  if (u === "g" || u === "gram" || u === "grams") return q;
+  if (u === "ml" || u === "mls" || u === "milliliter" || u === "milliliters") return q;
+  if (u === "l" || u === "liter" || u === "liters") return q * 1000;
+  return null;
+}
+
+const GRAMS_PER_UNIT_MIN = 0.5;
+const GRAMS_PER_UNIT_MAX = 3500;
+
+function clampGramsPerUnit(g: number): number {
+  if (!Number.isFinite(g) || g <= 0) return 50;
+  return Math.min(GRAMS_PER_UNIT_MAX, Math.max(GRAMS_PER_UNIT_MIN, g));
+}
+
+/** Compare units after normalization (plural/synonyms). */
+function canonicalPortionUnit(u: string): string {
+  const x = u.trim().toLowerCase().replace(/\s+/g, "");
+  const map: Record<string, string> = {
+    pieces: "piece",
+    pcs: "piece",
+    pc: "piece",
+    bowls: "bowl",
+    cups: "cup",
+    slices: "slice",
+    servings: "serving",
+    grams: "g",
+    gram: "g",
+    milliliter: "ml",
+    milliliters: "ml",
+    mls: "ml",
+    liter: "l",
+    liters: "l",
+    tablespoons: "tbsp",
+    tablespoon: "tbsp",
+    teaspoons: "tsp",
+    teaspoon: "tsp"
+  };
+  return map[x] ?? x;
+}
 
 export const parseMealPhotoWithAi = async (
   imageBase64: string,
@@ -303,8 +353,11 @@ export const parseMealPhotoWithAi = async (
 
   const system = [
     "You are a nutrition assistant analyzing meal photos.",
-    "Identify visible foods in the photo and estimate portions.",
-    "Output each item with quantity and unit, and an estimated grams value.",
+    "Identify visible foods in the photo. For portions, prioritize an accurate COUNT of discrete items and a sensible STRUCTURED unit (piece, slice, bowl, cup, g, ml, tbsp).",
+    "For EVERY item you MUST fill gramsPerUnit: typical grams for ONE of that unit in a normal adult meal (combine what you see with common reference portions—USDA-style / home / restaurant / cultural norms).",
+    "Do not pretend to weigh pixels; use typical sizes. piece = one discrete item; slice = one slice; bowl/cup/serving = one filled portion; tbsp/tsp = level spoon.",
+    "For unit g or ml, set gramsPerUnit to 1 (total mass is quantity × 1). For L use quantity in liters and gramsPerUnit 1000, or prefer ml.",
+    "Set estimatedGrams to quantity × gramsPerUnit (they must be consistent).",
     "Keep item names concise and practical for logging (e.g., 'grilled chicken', 'white rice').",
     "Support global cuisines and choose culturally accurate names when identifiable (Indian, East/Southeast Asian, Middle Eastern, African, European, Latin American, etc.).",
     "Be careful with lookalike foods and do not default to generic labels when a specific regional dish is plausible.",
@@ -453,16 +506,24 @@ export const parseMealPhotoWithAi = async (
     return { unit, quantity, estimatedGrams };
   };
 
-  const normalizedItems = (parsed.items || [])
+  const staged = (parsed.items || [])
     .filter((item) => item && typeof item.name === "string" && item.name.trim().length > 0)
     .map((item) => {
       const rawName = normalizeIndianPhotoItemName(item.name);
       const rawQuantity = Number.isFinite(item.quantity) && item.quantity > 0 ? item.quantity : 1;
       const rawUnit = item.unit?.trim() || "serving";
+      const rawGramsPerUnit = clampGramsPerUnit(
+        item.gramsPerUnit != null &&
+          Number.isFinite(item.gramsPerUnit) &&
+          item.gramsPerUnit > 0
+          ? item.gramsPerUnit
+          : rawQuantity > 0 && item.estimatedGrams > 0
+            ? item.estimatedGrams / rawQuantity
+            : 50
+      );
+      const directMassTotal = totalGramsFromDirectMassVolume(rawQuantity, rawUnit);
       const rawEstimatedGrams =
-        Number.isFinite(item.estimatedGrams) && item.estimatedGrams > 0
-          ? item.estimatedGrams
-          : 100;
+        directMassTotal ?? rawQuantity * rawGramsPerUnit;
       const normalizedPortion = normalizeUnitForFoodType(
         rawName,
         rawUnit,
@@ -470,17 +531,74 @@ export const parseMealPhotoWithAi = async (
         rawEstimatedGrams
       );
       return {
-        name: rawName,
-        quantity: normalizedPortion.quantity,
-        unit: normalizedPortion.unit,
-        estimatedGrams: normalizedPortion.estimatedGrams,
+        rawName,
+        rawUnit,
+        rawQuantity,
+        rawGramsPerUnit,
+        normalizedPortion,
+        visionGrams: Math.max(1, normalizedPortion.estimatedGrams),
+        assumptionBase: item.assumptionText?.trim() || "Estimated from visible portion size.",
         confidence:
           Number.isFinite(item.confidence) && item.confidence >= 0 && item.confidence <= 1
             ? item.confidence
-            : 0.5,
-        assumptionText: item.assumptionText?.trim() || "Estimated from visible portion size."
+            : 0.5
       };
     });
+
+  const normalizedItems = staged.map((s) => {
+    const {
+      normalizedPortion,
+      rawName,
+      rawUnit,
+      rawQuantity,
+      rawGramsPerUnit,
+      visionGrams,
+      assumptionBase,
+      confidence
+    } = s;
+    const qty = Number.isFinite(normalizedPortion.quantity) && normalizedPortion.quantity > 0
+      ? normalizedPortion.quantity
+      : 1;
+    const unit = normalizedPortion.unit;
+
+    const normalizeUnchanged =
+      canonicalPortionUnit(rawUnit) === canonicalPortionUnit(unit) &&
+      Math.abs(rawQuantity - qty) < 1e-6;
+
+    let estimatedGramsFinal: number;
+    let gramsPerUnitOut: number | undefined;
+
+    const direct = totalGramsFromDirectMassVolume(qty, unit);
+    if (direct != null) {
+      estimatedGramsFinal = Math.max(1, Math.round(direct * 10) / 10);
+      gramsPerUnitOut = undefined;
+    } else if (!normalizeUnchanged) {
+      estimatedGramsFinal = Math.max(1, Math.round(visionGrams * 10) / 10);
+      gramsPerUnitOut =
+        qty > 0 ? Math.round((estimatedGramsFinal / qty) * 10) / 10 : undefined;
+    } else {
+      const per = clampGramsPerUnit(rawGramsPerUnit);
+      estimatedGramsFinal = Math.max(1, Math.round(qty * per * 10) / 10);
+      gramsPerUnitOut = per;
+    }
+
+    const fromVisionPortion = direct == null && normalizeUnchanged;
+    const assumptionText = fromVisionPortion
+      ? `${assumptionBase} Total weight ≈ ${estimatedGramsFinal} g (quantity × typical ${unit} weight from photo analysis).`
+      : direct == null && !normalizeUnchanged
+        ? `${assumptionBase} Total weight ≈ ${estimatedGramsFinal} g (portion rules adjusted unit or quantity).`
+        : assumptionBase;
+
+    return {
+      name: rawName,
+      quantity: normalizedPortion.quantity,
+      unit: normalizedPortion.unit,
+      estimatedGrams: estimatedGramsFinal,
+      confidence,
+      assumptionText,
+      ...(gramsPerUnitOut != null ? { gramsPerUnit: gramsPerUnitOut } : {})
+    };
+  });
 
   const fallbackDescriptionText = normalizedItems
     .map((item) => `${item.quantity} ${item.unit} ${item.name}`)

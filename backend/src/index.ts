@@ -45,12 +45,14 @@ const ensureSchema = async () => {
 };
 
 const port = Number(process.env.PORT) || 4000;
+/** Bind address (default all interfaces so phones on the same Wi‑Fi can reach your Mac). */
+const host = process.env.HOST || "0.0.0.0";
 ensureSchema()
   .then(() => {
     startReminderScheduler();
-    app.listen(port, () => {
+    app.listen(port, host, () => {
       // eslint-disable-next-line no-console
-      console.log(`Meal Tracking API listening on ${port}`);
+      console.log(`Meal Tracking API listening on http://${host}:${port}`);
       console.log(
         `OpenAI (nl-log / photo-describe): ${hasOpenAi ? "enabled" : "DISABLED — OPENAI_API_KEY missing at process start"}`
       );
@@ -64,9 +66,9 @@ ensureSchema()
     console.warn("⚠️  App will continue without database features");
     // Still start the app even if database fails
     startReminderScheduler();
-    app.listen(port, () => {
+    app.listen(port, host, () => {
       // eslint-disable-next-line no-console
-      console.log(`Meal Tracking API listening on ${port} (without database)`);
+      console.log(`Meal Tracking API listening on http://${host}:${port} (without database)`);
       console.log(
         `OpenAI (nl-log / photo-describe): ${hasOpenAi ? "enabled" : "DISABLED — OPENAI_API_KEY missing at process start"}`
       );

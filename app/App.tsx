@@ -748,6 +748,8 @@ const getCanonicalFoodName = (name: string): string => {
 const inferDefaultServingGrams = (name: string): number => {
   const lower = name.toLowerCase();
   const rules: { keywords: string[]; grams: number }[] = [
+    /** Before "apple" — "pineapple".includes("apple") would otherwise match apple (150g fruit rule). */
+    { keywords: ["pineapple"], grams: 150 },
     { keywords: ["vitamin", "omega", "tablet", "capsule", "supplement", "pill", "softgel", "gummy", "multivitamin", "probiotic"], grams: 1 },
     { keywords: ["chapati", "chapatti", "roti", "phulka"], grams: 50 },
     { keywords: ["naan"], grams: 90 },
@@ -1441,6 +1443,10 @@ const FOOD_SUGGESTIONS_KEY = "@mealtracking_foodSuggestions";
 const FOOD_NUTRIENTS_KEY = "@mealtracking_foodNutrients";
 const FOOD_OVERRIDES_KEY = "@mealtracking_foodOverrides";
 const FOOD_SERVING_GRAMS_KEY = "@mealtracking_foodServingGrams";
+/** Cached GET /foods/barcode/:code responses (offline / faster rescan). Key = digits-only barcode. */
+const BARCODE_PRODUCT_CACHE_KEY = "@mealtracking_barcodeProductCache";
+/** Last amount (grams) the user logged or edited per barcode. */
+const BARCODE_PREFERRED_GRAMS_KEY = "@mealtracking_barcodePreferredGrams";
 const MEAL_TEMPLATES_KEY = "@mealtracking_mealTemplates";
 const MEAL_REMINDER_STORAGE_KEY = "@mealtracking_mealReminder";
 const REMINDER_DEVICE_ID_KEY = "@mealtracking_reminderDeviceId";
@@ -2799,6 +2805,10 @@ function AppContent() {
   const [foodNutrients, setFoodNutrients] = useState<Record<string, NutrientTotals>>({});
   const [foodOverrides, setFoodOverrides] = useState<Record<string, NutrientTotals>>({});
   const [foodServingGrams, setFoodServingGrams] = useState<Record<string, number>>({});
+  /** Cached barcode lookups (same shape as API). Keys: digits-only EAN/UPC. */
+  const [barcodeProductCache, setBarcodeProductCache] = useState<Record<string, BarcodePreview>>({});
+  /** Last logged or chosen grams per barcode (digits key). */
+  const [barcodePreferredGrams, setBarcodePreferredGrams] = useState<Record<string, number>>({});
   const [mealTemplates, setMealTemplates] = useState<MealTemplate[]>([]);
   const [templateName, setTemplateName] = useState("");
   const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
@@ -2821,6 +2831,8 @@ function AppContent() {
   const [barcodeLookupLoading, setBarcodeLookupLoading] = useState(false);
   /** Grams user ate; default filled from API serving estimate after scan. */
   const [barcodeGramsInput, setBarcodeGramsInput] = useState("");
+  /** Torch helps low light (reduces motion/noise blur); focus is continuous when autofocus="off" (expo-camera). */
+  const [barcodeTorchOn, setBarcodeTorchOn] = useState(false);
   const barcodeScanLastTsRef = useRef(0);
   const barcodeScanLastCodeRef = useRef<string>("");
   const [dataByDate, setDataByDate] = useState<Record<string, DayData>>({});
@@ -2991,7 +3003,8 @@ function AppContent() {
   }, [view, isTemplateMode, addComposerTab]);
 
   useEffect(() => {
-    if (view !== "add" || isTemplateMode || addComposerTab !== "text") {
+    // Text + barcode tabs: move the floating composer up when the keyboard opens (grams field, multiline input).
+    if (view !== "add" || isTemplateMode || (addComposerTab !== "text" && addComposerTab !== "barcode")) {
       setAddKeyboardOffset(0);
       return;
     }
@@ -3013,17 +3026,18 @@ function AppContent() {
       setBarcodePreview(null);
       setBarcodeLookupLoading(false);
       setBarcodeGramsInput("");
+      setBarcodeTorchOn(false);
     }
   }, [addComposerTab]);
 
   useEffect(() => {
-    if (view !== "add" || addComposerTab !== "barcode") return;
+    if (view !== "add" || addComposerTab !== "barcode" || !isPro) return;
     if (!cameraPermission?.granted) {
       requestCameraPermission().catch(() => {
         setError("Camera permission is required to scan barcodes.");
       });
     }
-  }, [view, addComposerTab, cameraPermission?.granted, requestCameraPermission]);
+  }, [view, addComposerTab, isPro, cameraPermission?.granted, requestCameraPermission]);
 
   useEffect(() => {
     if (view !== "personal") return;
@@ -3157,6 +3171,18 @@ function AppContent() {
     },
     []
   );
+
+  const persistBarcodeProductCache = useCallback(async (cache: Record<string, BarcodePreview>) => {
+    try {
+      await AsyncStorage.setItem(BARCODE_PRODUCT_CACHE_KEY, JSON.stringify(cache));
+    } catch (_) {}
+  }, []);
+
+  const persistBarcodePreferredGrams = useCallback(async (prefs: Record<string, number>) => {
+    try {
+      await AsyncStorage.setItem(BARCODE_PREFERRED_GRAMS_KEY, JSON.stringify(prefs));
+    } catch (_) {}
+  }, []);
 
   const persistMealTemplates = useCallback(
     async (templates: MealTemplate[]) => {
@@ -3508,6 +3534,48 @@ function AppContent() {
         }
       } catch (err) {
         console.warn("Error loading food serving grams:", err);
+      }
+
+      // Barcode product cache + preferred grams (per scanned code)
+      try {
+        const barcodeCacheRaw = await AsyncStorage.getItem(BARCODE_PRODUCT_CACHE_KEY);
+        if (!cancelled && barcodeCacheRaw) {
+          const parsed = JSON.parse(barcodeCacheRaw) as Record<string, unknown>;
+          if (parsed && typeof parsed === "object") {
+            const out: Record<string, BarcodePreview> = {};
+            for (const [k, v] of Object.entries(parsed)) {
+              if (!/^\d{8,14}$/.test(k) || !v || typeof v !== "object") continue;
+              const p = v as BarcodePreview;
+              if (p.found && p.nutrients && typeof p.servingGrams === "number") {
+                out[k] = p;
+              }
+            }
+            if (Object.keys(out).length > 0) {
+              setBarcodeProductCache(out);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("Error loading barcode product cache:", err);
+      }
+
+      try {
+        const barcodePrefRaw = await AsyncStorage.getItem(BARCODE_PREFERRED_GRAMS_KEY);
+        if (!cancelled && barcodePrefRaw) {
+          const parsed = JSON.parse(barcodePrefRaw) as Record<string, unknown>;
+          if (parsed && typeof parsed === "object") {
+            const out: Record<string, number> = {};
+            for (const [k, v] of Object.entries(parsed)) {
+              if (!/^\d{8,14}$/.test(k)) continue;
+              if (typeof v === "number" && v > 0) out[k] = v;
+            }
+            if (Object.keys(out).length > 0) {
+              setBarcodePreferredGrams(out);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("Error loading barcode preferred grams:", err);
       }
 
       // Load cached food nutrients (for known-foods reuse)
@@ -4278,6 +4346,19 @@ function AppContent() {
     }
   }, [isPro, mealPhotoAnalyzing, presentPaywall]);
 
+  const handleSelectBarcodeTab = useCallback(async () => {
+    if (mealPhotoAnalyzing) return;
+    Keyboard.dismiss();
+    if (isPro) {
+      setAddComposerTab("barcode");
+      return;
+    }
+    const purchased = await presentPaywall();
+    if (purchased) {
+      setAddComposerTab("barcode");
+    }
+  }, [isPro, mealPhotoAnalyzing, presentPaywall]);
+
   useEffect(() => {
     if (view !== "add" || isTemplateMode || addComposerTab !== "photo") return;
     if (hasAutoOpenedCamera) return;
@@ -4518,44 +4599,78 @@ function AppContent() {
     }
   };
 
-  const lookupBarcodeProduct = useCallback(async (code: string) => {
-    const clean = code.replace(/\D/g, "");
-    if (clean.length < 8) return;
-    setBarcodeLookupLoading(true);
-    setError(null);
-    try {
-      const url = `${BARCODE_API_BASE_URL}/foods/barcode/${encodeURIComponent(clean)}`;
-      if (__DEV__) {
-        console.log("[barcode] GET", url);
+  const applyBarcodePreview = useCallback(
+    (preview: BarcodePreview, cleanCode: string) => {
+      setBarcodePreview(preview);
+      const pref = barcodePreferredGrams[cleanCode];
+      setBarcodeGramsInput(
+        pref != null && pref > 0
+          ? formatBarcodeGramsDefault(pref)
+          : formatBarcodeGramsDefault(preview.servingGrams)
+      );
+    },
+    [barcodePreferredGrams]
+  );
+
+  const lookupBarcodeProduct = useCallback(
+    async (code: string) => {
+      const clean = code.replace(/\D/g, "");
+      if (clean.length < 8) return;
+      setError(null);
+      const cached = barcodeProductCache[clean];
+      const hasValidCache = Boolean(cached?.found && cached?.nutrients);
+
+      if (hasValidCache) {
+        applyBarcodePreview(cached, clean);
+        setBarcodeLookupLoading(false);
+      } else {
+        setBarcodeLookupLoading(true);
       }
-      const res = await fetch(url);
-      const json = (await res.json()) as BarcodePreview & { error?: string };
-      if (!res.ok) {
-        throw new Error(json.error || "Product not found");
+
+      try {
+        const url = `${BARCODE_API_BASE_URL}/foods/barcode/${encodeURIComponent(clean)}`;
+        if (__DEV__) {
+          console.log("[barcode] GET", url);
+        }
+        const res = await fetch(url);
+        const json = (await res.json()) as BarcodePreview & { error?: string };
+        if (!res.ok) {
+          throw new Error(json.error || "Product not found");
+        }
+        if (!json.found || !json.nutrients) {
+          throw new Error(json.error || "Product not found");
+        }
+        setBarcodeProductCache((prev) => {
+          const next = { ...prev, [clean]: json };
+          void persistBarcodeProductCache(next);
+          return next;
+        });
+        applyBarcodePreview(json, clean);
+      } catch (err) {
+        if (hasValidCache && cached) {
+          setError("Using saved product — could not refresh.");
+          applyBarcodePreview(cached, clean);
+        } else {
+          let message = err instanceof Error ? err.message : "Barcode lookup failed";
+          if (
+            typeof message === "string" &&
+            (message.includes("Network request failed") ||
+              message.includes("Could not connect") ||
+              message.includes("Failed to connect"))
+          ) {
+            message =
+              "Could not reach the server for barcode lookup. Check Wi‑Fi and try again. (Tip: barcode uses the hosted API when your dev URL is a LAN address.)";
+          }
+          setError(message);
+          setBarcodePreview(null);
+          setBarcodeGramsInput("");
+        }
+      } finally {
+        setBarcodeLookupLoading(false);
       }
-      if (!json.found || !json.nutrients) {
-        throw new Error(json.error || "Product not found");
-      }
-      setBarcodePreview(json);
-      setBarcodeGramsInput(formatBarcodeGramsDefault(json.servingGrams));
-    } catch (err) {
-      let message = err instanceof Error ? err.message : "Barcode lookup failed";
-      if (
-        typeof message === "string" &&
-        (message.includes("Network request failed") ||
-          message.includes("Could not connect") ||
-          message.includes("Failed to connect"))
-      ) {
-        message =
-          "Could not reach the server for barcode lookup. Check Wi‑Fi and try again. (Tip: barcode uses the hosted API when your dev URL is a LAN address.)";
-      }
-      setError(message);
-      setBarcodePreview(null);
-      setBarcodeGramsInput("");
-    } finally {
-      setBarcodeLookupLoading(false);
-    }
-  }, []);
+    },
+    [barcodeProductCache, applyBarcodePreview, persistBarcodeProductCache]
+  );
 
   const handleBarcodeScanned = useCallback(
     (result: BarcodeScanningResult) => {
@@ -4665,6 +4780,20 @@ function AppContent() {
         }
       }
 
+      const barcodeKey = barcodePreview.barcode.replace(/\D/g, "");
+      if (barcodeKey.length >= 8) {
+        setBarcodePreferredGrams((prev) => {
+          const nextPrefs = { ...prev, [barcodeKey]: gramsLogged };
+          void persistBarcodePreferredGrams(nextPrefs);
+          return nextPrefs;
+        });
+        setBarcodeProductCache((prev) => {
+          const nextCache = { ...prev, [barcodeKey]: barcodePreview };
+          void persistBarcodeProductCache(nextCache);
+          return nextCache;
+        });
+      }
+
       await persistData(next);
 
       try {
@@ -4710,7 +4839,9 @@ function AppContent() {
     mealReminderSettings,
     updateMealReminderSchedule,
     syncMealReminderStateToBackend,
-    persistData
+    persistData,
+    persistBarcodePreferredGrams,
+    persistBarcodeProductCache
   ]);
 
   const handleSaveTemplate = () => {
@@ -6162,7 +6293,7 @@ function AppContent() {
             </View>
 
             <View style={styles.addCameraStage}>
-              {addComposerTab === "barcode" && cameraPermission?.granted ? (
+              {addComposerTab === "barcode" && isPro && cameraPermission?.granted ? (
                 barcodeLookupLoading || barcodePreview ? (
                   <View style={[styles.addCameraImage, styles.addBarcodeCameraPaused]}>
                     {barcodeLookupLoading ? (
@@ -6175,15 +6306,29 @@ function AppContent() {
                     )}
                   </View>
                 ) : (
-                  <CameraView
-                    style={styles.addCameraImage}
-                    facing="back"
-                    barcodeScannerSettings={{
-                      barcodeTypes: ["ean13", "ean8", "upc_a", "upc_e"]
-                    }}
-                    onBarcodeScanned={handleBarcodeScanned}
-                    active
-                  />
+                  <View style={styles.addCameraImage}>
+                    <CameraView
+                      style={StyleSheet.absoluteFill}
+                      facing="back"
+                      autofocus="off"
+                      enableTorch={barcodeTorchOn}
+                      barcodeScannerSettings={{
+                        barcodeTypes: ["ean13", "ean8", "upc_a", "upc_e"]
+                      }}
+                      onBarcodeScanned={handleBarcodeScanned}
+                      active
+                    />
+                    <TouchableOpacity
+                      style={styles.addBarcodeTorchButton}
+                      onPress={() => setBarcodeTorchOn((v) => !v)}
+                      activeOpacity={0.85}
+                      accessibilityLabel={barcodeTorchOn ? "Turn off flashlight" : "Turn on flashlight for low light"}
+                    >
+                      <Text style={styles.addBarcodeTorchButtonText}>
+                        {barcodeTorchOn ? "Light on" : "Light"}
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
                 )
               ) : addComposerTab === "photo" && isPro && cameraPermission?.granted && !(mealPhotoAnalyzing && mealPhotoUri) ? (
                 <CameraView ref={cameraRef} style={styles.addCameraImage} facing="back" />
@@ -6194,6 +6339,8 @@ function AppContent() {
                   <Text style={styles.addCameraPlaceholderText}>
                     {addComposerTab === "photo" && !isPro
                       ? "Take photo is available on Pro."
+                      : addComposerTab === "barcode" && !isPro
+                      ? "Scan barcode is available on Pro."
                       : addComposerTab === "photo"
                       ? "Camera permission is required to capture meal photos."
                       : addComposerTab === "barcode"
@@ -6201,6 +6348,10 @@ function AppContent() {
                       : "Take a meal photo to start"}
                   </Text>
                   {addComposerTab === "photo" && !isPro ? (
+                    <TouchableOpacity style={styles.addCameraPermissionButton} onPress={() => presentPaywall()}>
+                      <Text style={styles.addCameraPermissionButtonText}>Upgrade to Pro</Text>
+                    </TouchableOpacity>
+                  ) : addComposerTab === "barcode" && !isPro ? (
                     <TouchableOpacity style={styles.addCameraPermissionButton} onPress={() => presentPaywall()}>
                       <Text style={styles.addCameraPermissionButtonText}>Upgrade to Pro</Text>
                     </TouchableOpacity>
@@ -6260,7 +6411,7 @@ function AppContent() {
               )}
             </View>
 
-            {addComposerTab === "text" && addKeyboardOffset > 0 && (
+            {(addComposerTab === "text" || addComposerTab === "barcode") && addKeyboardOffset > 0 && (
               <View
                 pointerEvents="none"
                 style={[styles.addKeyboardUnderlay, { height: addKeyboardOffset + 36 }]}
@@ -6271,9 +6422,13 @@ function AppContent() {
               style={[
                 styles.addFloatingComposer,
                 addKeyboardOffset > 0 && { bottom: Math.max(-22, addKeyboardOffset - 22) },
-                (addComposerTab === "text" || addComposerTab === "barcode") &&
-                  styles.addFloatingComposerExpanded,
-                addComposerTab === "barcode" && styles.addFloatingComposerBarcode
+                addComposerTab === "text" && styles.addFloatingComposerExpanded,
+                addComposerTab === "barcode" &&
+                  !barcodePreview &&
+                  styles.addFloatingComposerBarcodeScan,
+                addComposerTab === "barcode" &&
+                  barcodePreview &&
+                  styles.addFloatingComposerBarcodeWithProduct
               ]}
             >
               <View style={styles.addComposerTabsRow}>
@@ -6341,10 +6496,7 @@ function AppContent() {
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={styles.addComposerTab}
-                  onPress={() => {
-                    Keyboard.dismiss();
-                    setAddComposerTab("barcode");
-                  }}
+                  onPress={handleSelectBarcodeTab}
                   disabled={mealPhotoAnalyzing}
                   activeOpacity={0.85}
                 >
@@ -6354,6 +6506,11 @@ function AppContent() {
                       addComposerTab === "barcode" && styles.addComposerTabPillActive
                     ]}
                   >
+                    {!isPro ? (
+                      <View style={styles.addComposerProBadge}>
+                        <Text style={styles.addComposerProBadgeText}>PRO</Text>
+                      </View>
+                    ) : null}
                     <TabIcon
                       source={
                         addComposerTab === "barcode"
@@ -6469,27 +6626,18 @@ function AppContent() {
                 </View>
               )}
 
-              {addComposerTab === "barcode" && (
+              {addComposerTab === "barcode" && !barcodePreview && error ? (
+                <Text style={styles.addBarcodeMvpScanError}>{error}</Text>
+              ) : null}
+
+              {addComposerTab === "barcode" && barcodePreview && (
                 <ScrollView
                   style={styles.addBarcodeMvpContent}
                   contentContainerStyle={styles.addBarcodeMvpScrollContent}
                   keyboardShouldPersistTaps="handled"
                   keyboardDismissMode="on-drag"
                 >
-                  <View
-                    style={[
-                      styles.addBarcodeMvpCard,
-                      barcodePreview && styles.addBarcodeMvpCardQuantity
-                    ]}
-                  >
-                    <View style={{ alignSelf: "center" }}>
-                      <TabIcon
-                        source={require("./assets/add-tab-barcode-active.png")}
-                        size={40}
-                      />
-                    </View>
-                    {barcodePreview ? (
-                      <>
+                  <View style={[styles.addBarcodeMvpCard, styles.addBarcodeMvpCardQuantity]}>
                         <Text style={styles.addBarcodeMvpStepTitle}>How much did you eat?</Text>
                         <Text
                           style={[styles.addBarcodeMvpTitle, styles.addBarcodeMvpProductCenter]}
@@ -6512,6 +6660,17 @@ function AppContent() {
                           onChangeText={(t) => {
                             setBarcodeGramsInput(t);
                             setError(null);
+                          }}
+                          onBlur={() => {
+                            const clean = barcodePreview.barcode.replace(/\D/g, "");
+                            if (clean.length < 8) return;
+                            const g = parseBarcodeGramsInput(barcodeGramsInput);
+                            if (g == null) return;
+                            setBarcodePreferredGrams((prev) => {
+                              const next = { ...prev, [clean]: g };
+                              void persistBarcodePreferredGrams(next);
+                              return next;
+                            });
                           }}
                           keyboardType="decimal-pad"
                           placeholder={formatBarcodeGramsDefault(barcodePreview.servingGrams)}
@@ -6561,16 +6720,6 @@ function AppContent() {
                             </Text>
                           </TouchableOpacity>
                         </View>
-                      </>
-                    ) : (
-                      <>
-                        <Text style={styles.addBarcodeMvpTitle}>Scan a barcode</Text>
-                        <Text style={styles.addBarcodeMvpBody}>
-                          Aim at the product barcode. We look up nutrition on the server (Open Food Facts), then enter
-                          grams and tap Add to meal.
-                        </Text>
-                      </>
-                    )}
                   </View>
                 </ScrollView>
               )}
@@ -6941,11 +7090,17 @@ function AppContent() {
             <View style={styles.iconButton} />
           </View>
         </SafeAreaView>
+        <KeyboardAvoidingView
+          style={{ flex: 1 }}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          keyboardVerticalOffset={Platform.OS === "ios" ? 8 : 0}
+        >
         <ScrollView
           style={{ flex: 1 }}
           contentContainerStyle={styles.foodDetailContent}
           showsVerticalScrollIndicator
           keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
         >
           <View style={styles.foodDetailSection}>
             <Text style={styles.foodDetailSectionTitle}>Quantity</Text>
@@ -7262,6 +7417,7 @@ function AppContent() {
             </>
           ) : null}
         </ScrollView>
+        </KeyboardAvoidingView>
       </View>
     );
   }
@@ -10427,6 +10583,23 @@ const styles = StyleSheet.create({
     textAlign: "center",
     paddingHorizontal: 24
   },
+  addBarcodeTorchButton: {
+    position: "absolute",
+    top: 12,
+    right: 12,
+    zIndex: 2,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.35)"
+  },
+  addBarcodeTorchButtonText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "600"
+  },
   addCameraPlaceholder: {
     flex: 1,
     backgroundColor: "#111827",
@@ -10529,9 +10702,13 @@ const styles = StyleSheet.create({
   addFloatingComposerExpanded: {
     minHeight: 420
   },
-  /** Barcode card has grams field + estimate — needs more vertical space than text tab. */
-  addFloatingComposerBarcode: {
-    minHeight: 520,
+  /** Barcode tab while scanning / loading — keep panel short so the camera preview stays large. */
+  addFloatingComposerBarcodeScan: {
+    paddingBottom: 12
+  },
+  /** Barcode tab after product loads — room for grams, kcal, actions (scrolls if needed). */
+  addFloatingComposerBarcodeWithProduct: {
+    minHeight: 380,
     paddingBottom: 18
   },
   addFloatingTextContent: {
@@ -10615,6 +10792,15 @@ const styles = StyleSheet.create({
     alignItems: "stretch",
     minHeight: 320
   },
+  addBarcodeMvpScanError: {
+    color: "#DC2626",
+    fontSize: 13,
+    lineHeight: 18,
+    paddingHorizontal: 4,
+    paddingTop: 4,
+    paddingBottom: 6,
+    textAlign: "center"
+  },
   addBarcodeMvpStepTitle: {
     fontSize: 16,
     fontWeight: "700",
@@ -10664,12 +10850,6 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: "700",
     color: "#111827"
-  },
-  addBarcodeMvpBody: {
-    fontSize: 14,
-    lineHeight: 20,
-    color: "#4B5563",
-    textAlign: "center"
   },
   addBarcodeMvpBrand: {
     fontSize: 14,
