@@ -754,6 +754,9 @@ const inferDefaultServingGrams = (name: string): number => {
     { keywords: ["watermelon"], grams: 45 },
     { keywords: ["grape", "grapes"], grams: 5 },
     { keywords: ["strawberry", "strawberries"], grams: 15 },
+    /** Before generic "berry" 100g — counting berries by the piece must be a few g each, not 100g. */
+    { keywords: ["blueberry", "blueberries", "raspberry", "raspberries"], grams: 5 },
+    { keywords: ["blackberry", "blackberries"], grams: 8 },
     { keywords: ["vitamin", "omega", "tablet", "capsule", "supplement", "pill", "softgel", "gummy", "multivitamin", "probiotic"], grams: 1 },
     { keywords: ["chapati", "chapatti", "roti", "phulka"], grams: 50 },
     { keywords: ["naan"], grams: 90 },
@@ -770,7 +773,7 @@ const inferDefaultServingGrams = (name: string): number => {
     { keywords: ["banana"], grams: 120 },
     { keywords: ["apple", "orange", "pear"], grams: 150 },
     { keywords: ["mango"], grams: 200 },
-    { keywords: ["blueberry", "blueberries", "raspberry", "raspberries", "blackberry", "blackberries", "berry"], grams: 100 },
+    { keywords: ["berry"], grams: 100 },
     { keywords: ["milk"], grams: 240 },
     { keywords: ["yogurt", "curd", "dahi"], grams: 170 },
     { keywords: ["oatmeal", "oats"], grams: 40 },
@@ -950,6 +953,13 @@ function normalizeParsedUnit(raw: string): string {
     slices: "slice"
   };
   return map[u] || u;
+}
+
+/** Must match piece-like units anywhere we branch on "per piece" (parser may leave "pieces" or odd casing). */
+function isPieceLikeUnit(unit: string | undefined): boolean {
+  if (!unit) return false;
+  const u = unit.trim().toLowerCase().replace(/\s+/g, "");
+  return u === "piece" || u === "pieces" || u === "pc" || u === "pcs";
 }
 
 function parseToParsedFoods(text: string): ParsedFood[] {
@@ -1139,7 +1149,7 @@ function enrichParsedFoods(parsedFoods: ParsedFood[]): MealItem[] {
     const lowerName = f.name.toLowerCase();
     const qty = f.quantity && f.quantity > 0 ? f.quantity : undefined;
 
-    if (isBreadLike(lowerName) || (f.unit === "piece" && qty)) {
+    if (isBreadLike(lowerName) || (isPieceLikeUnit(f.unit) && qty)) {
       const pieces = qty ?? 1;
       const key = Object.keys(DEFAULT_GRAMS_PER_PIECE).find(
         (k) => k !== "*" && lowerName.includes(k)
@@ -1163,7 +1173,7 @@ function enrichParsedFoods(parsedFoods: ParsedFood[]): MealItem[] {
     let approx = !!f.approx;
 
     if (f.role === "main") {
-      if (isBreadLike(lowerName) || (quantity && quantity > 0 && unit === "piece")) {
+      if (isBreadLike(lowerName) || (quantity && quantity > 0 && isPieceLikeUnit(unit))) {
         const pieces = quantity && quantity > 0 ? quantity : 1;
         const key = Object.keys(DEFAULT_GRAMS_PER_PIECE).find(
           (k) => k !== "*" && lowerName.includes(k)
