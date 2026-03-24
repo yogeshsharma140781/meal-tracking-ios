@@ -7,6 +7,11 @@
 3. **Server** — Proxies **[Open Food Facts](https://world.openfoodfacts.org)** API v2 (`/api/v2/product/{code}`), maps nutriments to your `NutrientTotals`, estimates **portion grams** using (in order): `serving_quantity` + unit (rejecting values that match **whole-pack** `quantity`), parsed `serving_size` (incl. French *grammes* / *gr*, bare `"40"`), ratio of per-serving vs per-100g nutrients (reject if ≈ pack weight). **`product.quantity` is never used as a serving** (it is usually total pack, e.g. 600 g vs 40 g portion). If nothing matches, the API uses **100 g** as a placeholder and, when **`OPENAI_API_KEY`** is set, asks OpenAI for a **typical single-serving grams** (from name, OFF `categories_tags`, kcal/100g, pack weight); nutrients are scaled to that portion. If the key is missing or the model fails, the response stays at **100 g** and the note explains that OFF had no serving.
 4. **User** — Sees product + **grams** field (default = server’s serving estimate), can edit, then **Add to meal**. Nutrients are scaled by `userGrams / servingGrams` from the preview payload.
 
+### Client cache (iOS app)
+
+- **`@mealtracking_barcodeProductCache`** — last successful API response per barcode (digits key). If a scan hits the network and fails, the app can still show the **saved product** and a short “could not refresh” message.
+- **`@mealtracking_barcodePreferredGrams`** — last amount (grams) the user chose for that barcode (saved when the grams field **blurs** or when they **Add to meal**). Next scan pre-fills that amount instead of only the server default.
+
 ## Env (Render / local)
 
 - Optional: `OPENFOODFACTS_USER_AGENT` — descriptive User-Agent (recommended by OFF). Default in code is a generic dev string.

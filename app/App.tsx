@@ -311,8 +311,10 @@ const CollapsibleField: React.FC<CollapsibleFieldProps> = ({
   );
 };
 
-const SWIPE_SENSITIVITY = 1.3; // Slower, smoother tracking
+const SWIPE_SENSITIVITY = 1; // Keep card movement aligned with finger
 const DELETE_THRESHOLD = 120; // Swipe threshold in pixels to trigger delete
+const BACK_SWIPE_EDGE_WIDTH = 28;
+const BACK_SWIPE_TRIGGER = 84;
 
 /** Swipeable item card: tap opens detail, swipe left to delete. */
 const SwipeableItemCard: React.FC<{
@@ -323,53 +325,64 @@ const SwipeableItemCard: React.FC<{
   cardContent: React.ReactNode;
 }> = ({ item, onOpenDetail, onDelete, cardStyle, cardContent }) => {
   const translateX = useRef(new Animated.Value(0)).current;
-  const lastOffset = useRef(0);
   const cardWidthRef = useRef(0);
   const screenWidth = Dimensions.get("window").width;
+  const resetSwipe = useCallback((velocity = 0) => {
+    Animated.spring(translateX, {
+      toValue: 0,
+      useNativeDriver: true,
+      tension: 170,
+      friction: 18,
+      velocity,
+    }).start();
+  }, [translateX]);
+
+  const finishSwipe = useCallback((dx: number, vx: number) => {
+    const cardWidth = cardWidthRef.current || screenWidth;
+    const deleteDistance = Math.max(DELETE_THRESHOLD, Math.min(cardWidth * 0.35, 180));
+    const current = Math.max(-cardWidth, Math.min(0, dx * SWIPE_SENSITIVITY));
+    const shouldDelete = current <= -deleteDistance || (dx < -60 && vx < -0.9);
+
+    if (shouldDelete) {
+      Animated.timing(translateX, {
+        toValue: -Math.max(cardWidth, screenWidth),
+        duration: 220,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start(() => {
+        onDelete();
+      });
+      return;
+    }
+
+    resetSwipe(vx);
+  }, [onDelete, resetSwipe, screenWidth, translateX]);
   
   const panResponder = useMemo(
     () =>
       PanResponder.create({
         onStartShouldSetPanResponder: () => false,
         onMoveShouldSetPanResponder: (_, g) =>
-          Math.abs(g.dx) > 6 && Math.abs(g.dx) > Math.abs(g.dy),
+          Math.abs(g.dx) > 8 && Math.abs(g.dx) > Math.abs(g.dy) * 1.2,
+        onPanResponderGrant: () => {
+          translateX.stopAnimation();
+        },
+        onPanResponderTerminationRequest: () => false,
         onPanResponderMove: (_, g) => {
+          const cardWidth = cardWidthRef.current || screenWidth;
           const { dx } = g;
-          const amplified = lastOffset.current + dx * SWIPE_SENSITIVITY;
-          // Allow swiping up to full screen width
-          const newVal = Math.max(-screenWidth, Math.min(0, amplified));
+          const amplified = dx * SWIPE_SENSITIVITY;
+          const newVal = Math.max(-cardWidth, Math.min(0, amplified));
           translateX.setValue(newVal);
         },
         onPanResponderRelease: (_, g) => {
-          const { dx, vx } = g;
-          const current = lastOffset.current + dx * SWIPE_SENSITIVITY;
-          
-          // Check if user swiped far enough to auto-delete (single longer swipe)
-          const shouldDelete = current < -DELETE_THRESHOLD || (dx < -DELETE_THRESHOLD && vx < -0.3);
-          
-          if (shouldDelete) {
-            // Animate off screen and then delete
-            Animated.timing(translateX, {
-              toValue: -screenWidth,
-              duration: 250,
-              easing: Easing.out(Easing.cubic),
-              useNativeDriver: true,
-            }).start(() => {
-              onDelete();
-            });
-          } else {
-            // Snap back if not swiped far enough
-            lastOffset.current = 0;
-            Animated.timing(translateX, {
-              toValue: 0,
-              duration: 320,
-              easing: Easing.out(Easing.cubic),
-              useNativeDriver: true,
-            }).start();
-          }
+          finishSwipe(g.dx, g.vx || 0);
+        },
+        onPanResponderTerminate: (_, g) => {
+          finishSwipe(g.dx, g.vx || 0);
         },
       }),
-    [translateX, onDelete, screenWidth]
+    [finishSwipe, screenWidth, translateX]
   );
   
   return (
@@ -417,6 +430,76 @@ const SwipeableItemCard: React.FC<{
         </View>
       </Animated.View>
     </View>
+  );
+};
+
+const BackSwipeContainer: React.FC<{
+  onBack: () => void;
+  children: React.ReactNode;
+  style?: any;
+}> = ({ onBack, children, style }) => {
+  const translateX = useRef(new Animated.Value(0)).current;
+  const screenWidth = Dimensions.get("window").width;
+
+  const resetPosition = useCallback((velocity = 0) => {
+    Animated.spring(translateX, {
+      toValue: 0,
+      useNativeDriver: true,
+      tension: 170,
+      friction: 20,
+      velocity,
+    }).start();
+  }, [translateX]);
+
+  const finishGesture = useCallback((dx: number, vx: number) => {
+    const shouldGoBack = dx >= BACK_SWIPE_TRIGGER || (dx >= 40 && vx >= 0.8);
+    if (shouldGoBack) {
+      Animated.timing(translateX, {
+        toValue: screenWidth,
+        duration: 180,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start(() => {
+        translateX.setValue(0);
+        onBack();
+      });
+      return;
+    }
+    resetPosition(vx);
+  }, [onBack, resetPosition, screenWidth, translateX]);
+
+  const panResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => false,
+        onMoveShouldSetPanResponder: (_, g) =>
+          g.x0 <= BACK_SWIPE_EDGE_WIDTH &&
+          g.dx > 8 &&
+          g.dx > Math.abs(g.dy) * 1.5,
+        onPanResponderGrant: () => {
+          translateX.stopAnimation();
+        },
+        onPanResponderTerminationRequest: () => false,
+        onPanResponderMove: (_, g) => {
+          translateX.setValue(Math.max(0, Math.min(screenWidth * 0.35, g.dx)));
+        },
+        onPanResponderRelease: (_, g) => {
+          finishGesture(g.dx, g.vx || 0);
+        },
+        onPanResponderTerminate: (_, g) => {
+          finishGesture(g.dx, g.vx || 0);
+        },
+      }),
+    [finishGesture, screenWidth, translateX]
+  );
+
+  return (
+    <Animated.View
+      style={[{ flex: 1, transform: [{ translateX }] }, style]}
+      {...panResponder.panHandlers}
+    >
+      {children}
+    </Animated.View>
   );
 };
 
@@ -875,19 +958,122 @@ const LOCAL_FOOD_ESTIMATES: Record<string, NutrientTotals> = {
   salad: { calories_kcal: 15, protein_g: 1.2, carbs_g: 2.9, fat_g: 0.2, fiber_g: 1.2, sodium_mg: 28, cholesterol_mg: 0, omega_3_g: 0.01, omega_6_g: 0.04, potassium_mg: 194, calcium_mg: 36, iron_mg: 0.9, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 13, vitamin_c_mg: 9.2, vitamin_a_mcg: 469 },
   coffee: { calories_kcal: 2, protein_g: 0.3, carbs_g: 0, fat_g: 0, fiber_g: 0, sodium_mg: 5, cholesterol_mg: 0, omega_3_g: 0, omega_6_g: 0, potassium_mg: 116, calcium_mg: 5, iron_mg: 0, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 7, vitamin_c_mg: 0, vitamin_a_mcg: 0 },
   pasta: { calories_kcal: 131, protein_g: 5, carbs_g: 25, fat_g: 1.1, fiber_g: 1.8, sodium_mg: 1, cholesterol_mg: 0, omega_3_g: 0.01, omega_6_g: 0.2, potassium_mg: 24, calcium_mg: 7, iron_mg: 1.3, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 18, vitamin_c_mg: 0, vitamin_a_mcg: 0 },
+  /** Per 100 g — must win over "oatmeal" when name is e.g. "walnut oatmeal" (word scan used to pick oats first). */
+  walnuts: { calories_kcal: 654, protein_g: 15.2, carbs_g: 13.7, fat_g: 65.2, fiber_g: 6.7, sodium_mg: 2, cholesterol_mg: 0, omega_3_g: 9.1, omega_6_g: 38.1, potassium_mg: 441, calcium_mg: 98, iron_mg: 2.9, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 158, vitamin_c_mg: 1.3, vitamin_a_mcg: 1 },
+  walnut: { calories_kcal: 654, protein_g: 15.2, carbs_g: 13.7, fat_g: 65.2, fiber_g: 6.7, sodium_mg: 2, cholesterol_mg: 0, omega_3_g: 9.1, omega_6_g: 38.1, potassium_mg: 441, calcium_mg: 98, iron_mg: 2.9, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 158, vitamin_c_mg: 1.3, vitamin_a_mcg: 1 },
+  blueberries: { calories_kcal: 57, protein_g: 0.7, carbs_g: 14.5, fat_g: 0.3, fiber_g: 2.4, sodium_mg: 1, cholesterol_mg: 0, omega_3_g: 0.15, omega_6_g: 0.07, potassium_mg: 77, calcium_mg: 6, iron_mg: 0.3, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 6, vitamin_c_mg: 9.7, vitamin_a_mcg: 3 },
+  blueberry: { calories_kcal: 57, protein_g: 0.7, carbs_g: 14.5, fat_g: 0.3, fiber_g: 2.4, sodium_mg: 1, cholesterol_mg: 0, omega_3_g: 0.15, omega_6_g: 0.07, potassium_mg: 77, calcium_mg: 6, iron_mg: 0.3, vitamin_d_iu: 0, vitamin_b12_ug: 0, magnesium_mg: 6, vitamin_c_mg: 9.7, vitamin_a_mcg: 3 },
 };
 const GENERIC_FOOD: NutrientTotals = { calories_kcal: 150, protein_g: 10, carbs_g: 15, fat_g: 8, fiber_g: 2, sodium_mg: 200, cholesterol_mg: 30, omega_3_g: 0.1, omega_6_g: 0.5, potassium_mg: 200, calcium_mg: 30, iron_mg: 1, vitamin_d_iu: 10, vitamin_b12_ug: 0.2, magnesium_mg: 20, vitamin_c_mg: 5, vitamin_a_mcg: 50 };
 
+/** Prefer specific foods before first-word scan picks oats/oatmeal from compound names. */
+const LOCAL_FOOD_PRIORITY_KEYS = [
+  "walnuts",
+  "walnut",
+  "blueberries",
+  "blueberry",
+  "almond",
+  "almonds",
+  "cashew",
+  "cashews",
+  "pistachio",
+  "pistachios",
+  "peanut",
+  "peanuts"
+];
+
 function findLocalFoodEstimate(foodPart: string): NutrientTotals {
   const normalized = foodPart.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+  if (LOCAL_FOOD_ESTIMATES[normalized]) return LOCAL_FOOD_ESTIMATES[normalized];
+  for (const key of LOCAL_FOOD_PRIORITY_KEYS) {
+    if (normalized.includes(key) && LOCAL_FOOD_ESTIMATES[key]) {
+      return LOCAL_FOOD_ESTIMATES[key];
+    }
+  }
   const words = normalized.split(/\s+/);
   for (const w of words) {
     if (w.length >= 3 && LOCAL_FOOD_ESTIMATES[w]) {
       return LOCAL_FOOD_ESTIMATES[w];
     }
   }
-  if (LOCAL_FOOD_ESTIMATES[normalized]) return LOCAL_FOOD_ESTIMATES[normalized];
   return GENERIC_FOOD;
+}
+
+/** Oils top out ~900 kcal/100g; impossible implied values mean bad API portion totals or double-scaling. */
+const MAX_PLAUSIBLE_KCAL_PER_100G = 950;
+
+/** Convert logged portion nutrients → per 100 g for the food-nutrients cache. Falls back to local table when implied kcal/100g is absurd. */
+function portionTotalsToPer100g(item: { name: string; grams: number; nutrients: NutrientTotals }): NutrientTotals {
+  const g = item.grams;
+  const n = item.nutrients;
+  if (!g || g <= 0) return n;
+  const impliedPer100gCal = (n.calories_kcal ?? 0) * (100 / g);
+  if (impliedPer100gCal > MAX_PLAUSIBLE_KCAL_PER_100G) {
+    return findLocalFoodEstimate(item.name);
+  }
+  return scaleTotals(n, 100 / g);
+}
+
+/** Names that used to pick oats/oatmeal from word-scan; cache could store ~389 kcal/100g for actual nuts. */
+const NUT_CONFUSION_SUBSTRINGS = [
+  "walnuts",
+  "walnut",
+  "almond",
+  "almonds",
+  "cashew",
+  "cashews",
+  "pistachio",
+  "pistachios",
+  "peanut",
+  "peanuts"
+] as const;
+
+function isNutConfusionName(foodPartLower: string): boolean {
+  return NUT_CONFUSION_SUBSTRINGS.some((k) => foodPartLower.includes(k));
+}
+
+function isGrainLikeKcalPer100g(cal: number): boolean {
+  return cal >= 300 && cal <= 450;
+}
+
+function isNutLikeKcalPer100g(cal: number): boolean {
+  return cal >= 550 && cal <= 780;
+}
+
+/** Fix AsyncStorage cache: oats profile (~389) stored under a walnut-line name → use local nut table. */
+function reconcileCachedPer100gForKnownLine(foodPartLower: string, cached: NutrientTotals | undefined): NutrientTotals | undefined {
+  if (!cached) return undefined;
+  const local = findLocalFoodEstimate(foodPartLower);
+  const c = cached.calories_kcal ?? 0;
+  const l = local.calories_kcal ?? 0;
+  if (isNutConfusionName(foodPartLower) && isGrainLikeKcalPer100g(c) && isNutLikeKcalPer100g(l)) {
+    return local;
+  }
+  return cached;
+}
+
+function sanitizeCachedPer100g(foodPartLower: string, cached: NutrientTotals | undefined): NutrientTotals | undefined {
+  if (!cached) return undefined;
+  const calories = cached.calories_kcal ?? 0;
+  if (calories > MAX_PLAUSIBLE_KCAL_PER_100G) {
+    return findLocalFoodEstimate(foodPartLower);
+  }
+  return reconcileCachedPer100gForKnownLine(foodPartLower, cached);
+}
+
+function sanitizeFoodNutrientsCache(
+  cache: Record<string, NutrientTotals>
+): { cache: Record<string, NutrientTotals>; changed: boolean } {
+  let changed = false;
+  const next: Record<string, NutrientTotals> = {};
+  for (const [key, value] of Object.entries(cache)) {
+    const sanitized = sanitizeCachedPer100g(key, value) ?? value;
+    next[key] = sanitized;
+    if (JSON.stringify(sanitized) !== JSON.stringify(value)) {
+      changed = true;
+    }
+  }
+  return { cache: next, changed };
 }
 
 // --- Smarter local parser: identify foods + apply portion heuristics ---
@@ -1319,7 +1505,7 @@ function parseFoodLine(
   const canonical = normalizedKey ? nameToCanonical.get(normalizedKey) : null;
 
   if (!canonical || !normalizedKey) return null;
-  const nutrientsPer100g = foodNutrients[normalizedKey];
+  const nutrientsPer100g = sanitizeCachedPer100g(foodPart, foodNutrients[normalizedKey]);
   if (!nutrientsPer100g) return null;
   const scale = grams / 100;
   const nutrients = scaleTotals(nutrientsPer100g, scale);
@@ -3032,9 +3218,10 @@ function AppContent() {
 
   useEffect(() => {
     if (view !== "add" || isTemplateMode || addComposerTab !== "text") return;
+    if (!entryText.trim()) return;
     const timer = setTimeout(() => addInputRef.current?.focus(), 120);
     return () => clearTimeout(timer);
-  }, [view, isTemplateMode, addComposerTab]);
+  }, [view, isTemplateMode, addComposerTab, entryText]);
 
   useEffect(() => {
     // Text + barcode tabs: move the floating composer up when the keyboard opens (grams field, multiline input).
@@ -3616,13 +3803,16 @@ function AppContent() {
       try {
         const nutrientsRaw = await AsyncStorage.getItem(FOOD_NUTRIENTS_KEY);
         let nutrients: Record<string, NutrientTotals> = {};
+        let nutrientsChanged = false;
         if (nutrientsRaw) {
           const parsed = JSON.parse(nutrientsRaw);
           if (parsed && typeof parsed === "object") {
             nutrients = parsed as Record<string, NutrientTotals>;
+            const sanitized = sanitizeFoodNutrientsCache(nutrients);
+            nutrients = sanitized.cache;
+            nutrientsChanged = sanitized.changed;
           }
         }
-        const initialCount = Object.keys(nutrients).length;
         const dataRaw = await AsyncStorage.getItem(STORAGE_KEY);
         if (dataRaw && !cancelled) {
           try {
@@ -3635,13 +3825,14 @@ function AppContent() {
                     if (item?.name && item.grams > 0 && item.nutrients) {
                       const key = normalizeFoodNameForDedup(item.name);
                       if (key && !nutrients[key]) {
-                        nutrients[key] = scaleTotals(item.nutrients, 100 / item.grams);
+                        nutrients[key] = portionTotalsToPer100g(item);
+                        nutrientsChanged = true;
                       }
                     }
                   }
                 }
               }
-              if (Object.keys(nutrients).length > initialCount) {
+              if (nutrientsChanged) {
                 await AsyncStorage.setItem(FOOD_NUTRIENTS_KEY, JSON.stringify(nutrients));
               }
             }
@@ -4497,7 +4688,7 @@ function AppContent() {
               if (item && item.name && item.grams > 0 && item.nutrients) {
                 const key = normalizeFoodNameForDedup(item.name);
                 if (key) {
-                  const nutrientsPer100g = scaleTotals(item.nutrients, 100 / item.grams);
+                  const nutrientsPer100g = portionTotalsToPer100g(item);
                   nextNutrients[key] = nutrientsPer100g;
                 }
               }
@@ -5639,6 +5830,7 @@ function AppContent() {
     const currentTargets = getMacroTargets(userProfile);
 
     return (
+      <BackSwipeContainer onBack={() => setView("home")}>
       <SafeAreaView style={styles.container}>
         <View style={styles.personalHeader}>
           <TouchableOpacity style={styles.iconButton} onPress={() => setView("home")}>
@@ -6027,6 +6219,7 @@ function AppContent() {
           </TouchableOpacity>
         </ScrollView>
       </SafeAreaView>
+      </BackSwipeContainer>
     );
   }
 
@@ -6064,6 +6257,7 @@ function AppContent() {
         ? (caloriesPerServing * 100) / servingGrams
         : existingNutrients.calories_kcal;
       const newNutrients: NutrientTotals = { ...existingNutrients, calories_kcal: caloriesPer100g };
+      const sanitizedNutrients = sanitizeCachedPer100g(newName, newNutrients) ?? newNutrients;
 
       if (keyOld !== keyNew || editingSavedFoodName !== newName) {
         const nextKnown = knownFoods.filter((n) => normalizeFoodNameForKey(n) !== keyOld);
@@ -6074,9 +6268,16 @@ function AppContent() {
 
         const nextOverrides = { ...foodOverrides };
         delete nextOverrides[keyOld];
-        nextOverrides[keyNew] = newNutrients;
+        nextOverrides[keyNew] = sanitizedNutrients;
         setFoodOverrides(nextOverrides);
         await persistFoodOverrides(nextOverrides);
+
+        const nextFoodNutrients = { ...foodNutrients };
+        delete nextFoodNutrients[keyOld];
+        delete nextFoodNutrients[editingSavedFoodName];
+        nextFoodNutrients[keyNew] = sanitizedNutrients;
+        setFoodNutrients(nextFoodNutrients);
+        await persistFoodNutrients(nextFoodNutrients);
 
         const nextServing = { ...foodServingGrams };
         delete nextServing[keyOld];
@@ -6084,9 +6285,16 @@ function AppContent() {
         setFoodServingGrams(nextServing);
         await persistFoodServingGrams(nextServing);
       } else {
-        const nextOverrides = { ...foodOverrides, [keyOld]: newNutrients };
+        const nextOverrides = { ...foodOverrides, [keyOld]: sanitizedNutrients };
         setFoodOverrides(nextOverrides);
         await persistFoodOverrides(nextOverrides);
+
+        const nextFoodNutrients = {
+          ...foodNutrients,
+          [keyOld]: sanitizedNutrients
+        };
+        setFoodNutrients(nextFoodNutrients);
+        await persistFoodNutrients(nextFoodNutrients);
 
         const nextServing = { ...foodServingGrams, [keyOld]: servingGrams };
         setFoodServingGrams(nextServing);
@@ -6104,6 +6312,11 @@ function AppContent() {
       delete nextOverrides[key];
       setFoodOverrides(nextOverrides);
       await persistFoodOverrides(nextOverrides);
+      const nextFoodNutrients = { ...foodNutrients };
+      delete nextFoodNutrients[key];
+      delete nextFoodNutrients[name];
+      setFoodNutrients(nextFoodNutrients);
+      await persistFoodNutrients(nextFoodNutrients);
       const nextServing = { ...foodServingGrams };
       delete nextServing[key];
       setFoodServingGrams(nextServing);
@@ -6112,6 +6325,7 @@ function AppContent() {
     };
 
     return (
+      <BackSwipeContainer onBack={() => setView("home")}>
       <SafeAreaView style={[styles.container, { paddingTop: 8 }]}>
         <View style={styles.fixedHeader}>
           <TouchableOpacity
@@ -6281,6 +6495,7 @@ function AppContent() {
           </View>
         </Modal>
       </SafeAreaView>
+      </BackSwipeContainer>
     );
   }
 
@@ -6324,25 +6539,12 @@ function AppContent() {
             style={styles.addCameraScreen}
             behavior={undefined}
           >
-            <View style={[styles.addHeader, { paddingHorizontal: 12, paddingTop: 8 }]}>
-              <TouchableOpacity
-                style={styles.iconButton}
-                onPress={() => {
-                  setView("home");
-                  setEntryText("");
-                  setMealPhotoUri(null);
-                  setMealPhotoAnalyzing(false);
-                  setMealPhotoProgress(0);
-                  setAddComposerTab("text");
-                }}
-              >
-                <Text style={styles.iconText}>‹</Text>
-              </TouchableOpacity>
-              <Text style={styles.headerTitle}>Add item(s)</Text>
-              <View style={styles.iconButton} />
-            </View>
-
-            <View style={styles.addCameraStage}>
+            <View
+              style={[
+                styles.addCameraStage,
+                addComposerTab === "text" && styles.addCameraStageCollapsed
+              ]}
+            >
               {addComposerTab === "barcode" && isPro && cameraPermission?.granted ? (
                 barcodeLookupLoading || barcodePreview ? (
                   <View style={[styles.addCameraImage, styles.addBarcodeCameraPaused]}>
@@ -6461,7 +6663,7 @@ function AppContent() {
               )}
             </View>
 
-            {(addComposerTab === "text" || addComposerTab === "barcode") && addKeyboardOffset > 0 && (
+            {addComposerTab === "barcode" && addKeyboardOffset > 0 && (
               <View
                 pointerEvents="none"
                 style={[styles.addKeyboardUnderlay, { height: addKeyboardOffset + 36 }]}
@@ -6469,10 +6671,16 @@ function AppContent() {
             )}
 
             <View
+              key={addComposerTab === "text" ? "add-composer-text" : "add-composer-dock"}
               style={[
                 styles.addFloatingComposer,
-                addKeyboardOffset > 0 && { bottom: Math.max(-22, addKeyboardOffset - 22) },
+                addComposerTab !== "text" && styles.addFloatingComposerDocked,
+                addComposerTab === "barcode" && addKeyboardOffset > 0 && { bottom: Math.max(-22, addKeyboardOffset - 22) },
+                addComposerTab === "text" && styles.addFloatingComposerTextMode,
                 addComposerTab === "text" && styles.addFloatingComposerExpanded,
+                (addComposerTab === "photo" ||
+                  (addComposerTab === "barcode" && !barcodePreview)) &&
+                  styles.addFloatingComposerTabsOnly,
                 addComposerTab === "barcode" &&
                   !barcodePreview &&
                   styles.addFloatingComposerBarcodeScan,
@@ -6481,7 +6689,12 @@ function AppContent() {
                   styles.addFloatingComposerBarcodeWithProduct
               ]}
             >
-              <View style={styles.addComposerTabsRow}>
+              <View
+                style={[
+                  styles.addComposerTabsRow,
+                  addComposerTab === "text" && styles.addComposerTabsRowTextBelow
+                ]}
+              >
                 <TouchableOpacity
                   style={styles.addComposerTab}
                   onPress={() => {
@@ -6587,6 +6800,7 @@ function AppContent() {
                     ref={addInputRef}
                     value={entryText}
                     onChangeText={setEntryText}
+                    autoFocus
                     placeholder="Describe the food items here..."
                     placeholderTextColor="#9CA3AF"
                     style={styles.addFloatingInput}
@@ -7120,6 +7334,12 @@ function AppContent() {
     };
 
     return (
+      <BackSwipeContainer
+        onBack={() => {
+          setShowFoodUnitDropdown(false);
+          setSelectedFoodItem(null);
+        }}
+      >
       <View style={{ flex: 1, backgroundColor: "#F5F5F7" }}>
         <SafeAreaView style={{ backgroundColor: "#F5F5F7" }}>
           <View style={styles.fixedHeader}>
@@ -7469,6 +7689,7 @@ function AppContent() {
         </ScrollView>
         </KeyboardAvoidingView>
       </View>
+      </BackSwipeContainer>
     );
   }
 
@@ -7482,6 +7703,7 @@ function AppContent() {
     );
     
     return (
+      <BackSwipeContainer onBack={() => setView("home")}>
       <View style={{ flex: 1, backgroundColor: "#F5F5F7" }}>
         <SafeAreaView style={{ backgroundColor: "#F5F5F7" }}>
           <View style={styles.fixedHeader}>
@@ -7671,6 +7893,7 @@ function AppContent() {
           )}
         </ScrollView>
       </View>
+      </BackSwipeContainer>
     );
   }
 
@@ -7873,6 +8096,7 @@ function AppContent() {
     console.log(`Loading ${title} page: ${url}`);
 
     return (
+      <BackSwipeContainer onBack={() => setView("home")}>
       <SafeAreaView style={styles.container}>
         <View style={styles.addHeader}>
           <TouchableOpacity style={styles.iconButton} onPress={() => setView("home")}>
@@ -7951,11 +8175,13 @@ function AppContent() {
           )}
         </View>
       </SafeAreaView>
+      </BackSwipeContainer>
     );
   }
 
   if (view === "sources") {
     return (
+      <BackSwipeContainer onBack={() => setView(sourcesReturnViewRef.current)}>
       <SafeAreaView style={styles.container}>
         <View style={styles.addHeader}>
           <TouchableOpacity
@@ -7998,11 +8224,13 @@ function AppContent() {
           </View>
         </ScrollView>
       </SafeAreaView>
+      </BackSwipeContainer>
     );
   }
 
   if (view === "export") {
     return (
+      <BackSwipeContainer onBack={() => setView("home")}>
       <SafeAreaView style={styles.container}>
         <View style={styles.addHeader}>
           <TouchableOpacity style={styles.iconButton} onPress={() => setView("home")}>
@@ -8107,6 +8335,7 @@ function AppContent() {
           {error ? <Text style={styles.addError}>{error}</Text> : null}
         </ScrollView>
       </SafeAreaView>
+      </BackSwipeContainer>
     );
   }
 
@@ -10615,6 +10844,15 @@ const styles = StyleSheet.create({
     flex: 1,
     position: "relative"
   },
+  addCameraStageCollapsed: {
+    flex: 0,
+    height: 0,
+    overflow: "hidden"
+  },
+  addTextBackdrop: {
+    flex: 1,
+    backgroundColor: "#F5F5F7"
+  },
   addCameraImage: {
     width: "100%",
     height: "100%"
@@ -10730,17 +10968,37 @@ const styles = StyleSheet.create({
     width: 30,
     height: 30
   },
+  /** Shared chrome; pinning to the screen bottom is only for photo/barcode (see addFloatingComposerDocked). */
   addFloatingComposer: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    bottom: 0,
     backgroundColor: "#F3F4F6",
     borderTopLeftRadius: 18,
     borderTopRightRadius: 18,
     paddingHorizontal: 14,
     paddingTop: 10,
     paddingBottom: 10
+  },
+  addFloatingComposerDocked: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0
+  },
+  /** Photo / barcode-scan: only tabs in sheet — minimal gap above home indicator */
+  addFloatingComposerTabsOnly: {
+    paddingTop: 16,
+    paddingBottom: 4,
+    /** Sit slightly lower so the sheet clears the shutter / gallery row */
+    transform: [{ translateY: 18 }]
+  },
+  addFloatingComposerTextMode: {
+    position: "relative",
+    flex: 1,
+    alignSelf: "stretch",
+    justifyContent: "flex-start",
+    borderTopLeftRadius: 0,
+    borderTopRightRadius: 0,
+    backgroundColor: "#F5F5F7",
+    paddingTop: 16
   },
   addKeyboardUnderlay: {
     position: "absolute",
@@ -10754,24 +11012,33 @@ const styles = StyleSheet.create({
   },
   /** Barcode tab while scanning / loading — keep panel short so the camera preview stays large. */
   addFloatingComposerBarcodeScan: {
-    paddingBottom: 12
+    paddingBottom: 4
   },
   /** Barcode tab after product loads — room for grams, kcal, actions (scrolls if needed). */
   addFloatingComposerBarcodeWithProduct: {
     minHeight: 380,
-    paddingBottom: 18
+    paddingBottom: 12
   },
+  /** No flex:1 — after camera dock layout, a flex child here could leave a false “gap” above the field. */
   addFloatingTextContent: {
-    flex: 1,
-    minHeight: 0,
-    marginTop: 10
+    alignSelf: "stretch",
+    marginTop: 22,
+    zIndex: 0
   },
   addComposerTabsRow: {
     flexDirection: "row",
     alignItems: "stretch",
     justifyContent: "space-between",
     gap: 6,
-    paddingHorizontal: 2
+    paddingHorizontal: 2,
+    paddingBottom: 0,
+    marginBottom: 0,
+    position: "relative",
+    zIndex: 10
+  },
+  /** Fixed gap below tabs → text (avoid translateY: layout vs paint mismatch after tab switches). */
+  addComposerTabsRowTextBelow: {
+    marginBottom: 30
   },
   addComposerTab: {
     flex: 1,
@@ -10951,9 +11218,10 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8
   },
   addFloatingInput: {
-    marginTop: 0,
-    flex: 1,
-    minHeight: 260,
+    marginTop: 16,
+    height: 250,
+    flexGrow: 0,
+    flexShrink: 0,
     backgroundColor: "#FFFFFF",
     borderWidth: 1,
     borderColor: "#D1D5DB",
@@ -10964,7 +11232,7 @@ const styles = StyleSheet.create({
   },
   addFloatingActions: {
     flexDirection: "row",
-    marginTop: 10,
+    marginTop: 8,
     marginBottom: 0
   },
   addSuggestionsSlot: {
@@ -10984,12 +11252,13 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     alignItems: "center",
     justifyContent: "center",
-    paddingVertical: 12,
-    marginRight: 10
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    marginRight: 8
   },
   addFloatingCancelText: {
     color: "#6B7280",
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: "600"
   },
   addFloatingConfirm: {
@@ -10998,14 +11267,15 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     alignItems: "center",
     justifyContent: "center",
-    paddingVertical: 12
+    paddingVertical: 8,
+    paddingHorizontal: 10
   },
   addFloatingConfirmDisabled: {
     opacity: 0.55
   },
   addFloatingConfirmText: {
     color: "#FFFFFF",
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: "600"
   },
   addHeader: {
