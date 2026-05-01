@@ -3005,7 +3005,7 @@ function getContributors(
 }
 
 function AppContent() {
-  const { isPro, isLoading: subscriptionLoading, presentPaywall, presentCustomerCenter } = useSubscription();
+  const { isPro, hasPremiumAccess, isLoading: subscriptionLoading, presentPaywall, presentCustomerCenter } = useSubscription();
   const [view, setView] = useState<"home" | "add" | "meal" | "export" | "personal" | "savedFoods" | "terms" | "privacy" | "onboarding" | "sources">("home");
   const [showTermsPrivacySubmenu, setShowTermsPrivacySubmenu] = useState(false);
   const [webViewLoading, setWebViewLoading] = useState(true);
@@ -3189,7 +3189,7 @@ function AppContent() {
 
   useEffect(() => {
     if (!hydrated || subscriptionLoading) return;
-    if (isPro) return;
+    if (hasPremiumAccess) return;
     // Launch paywall should only auto-show from home, not when navigating
     // onboarding/compliance screens like Sources & methodology.
     if (view !== "home") return;
@@ -3201,7 +3201,7 @@ function AppContent() {
       });
     }, 450);
     return () => clearTimeout(timer);
-  }, [hydrated, isPro, presentPaywall, subscriptionLoading, view]);
+  }, [hasPremiumAccess, hydrated, presentPaywall, subscriptionLoading, view]);
 
   useEffect(() => {
     if (view !== "add") return;
@@ -3252,13 +3252,13 @@ function AppContent() {
   }, [addComposerTab]);
 
   useEffect(() => {
-    if (view !== "add" || addComposerTab !== "barcode" || !isPro) return;
+    if (view !== "add" || addComposerTab !== "barcode" || !hasPremiumAccess) return;
     if (!cameraPermission?.granted) {
       requestCameraPermission().catch(() => {
         setError("Camera permission is required to scan barcodes.");
       });
     }
-  }, [view, addComposerTab, isPro, cameraPermission?.granted, requestCameraPermission]);
+  }, [view, addComposerTab, hasPremiumAccess, cameraPermission?.granted, requestCameraPermission]);
 
   useEffect(() => {
     if (view !== "personal") return;
@@ -4577,7 +4577,7 @@ function AppContent() {
 
   const handleSelectPhotoTab = useCallback(async () => {
     if (mealPhotoAnalyzing) return;
-    if (isPro) {
+    if (hasPremiumAccess) {
       setAddComposerTab("photo");
       return;
     }
@@ -4585,12 +4585,12 @@ function AppContent() {
     if (purchased) {
       setAddComposerTab("photo");
     }
-  }, [isPro, mealPhotoAnalyzing, presentPaywall]);
+  }, [hasPremiumAccess, mealPhotoAnalyzing, presentPaywall]);
 
   const handleSelectBarcodeTab = useCallback(async () => {
     if (mealPhotoAnalyzing) return;
     Keyboard.dismiss();
-    if (isPro) {
+    if (hasPremiumAccess) {
       setAddComposerTab("barcode");
       return;
     }
@@ -4598,7 +4598,7 @@ function AppContent() {
     if (purchased) {
       setAddComposerTab("barcode");
     }
-  }, [isPro, mealPhotoAnalyzing, presentPaywall]);
+  }, [hasPremiumAccess, mealPhotoAnalyzing, presentPaywall]);
 
   useEffect(() => {
     if (view !== "add" || isTemplateMode || addComposerTab !== "photo") return;
@@ -5334,7 +5334,7 @@ function AppContent() {
     setUserProfile(updatedProfile);
     await persistProfile(updatedProfile);
     setView("home");
-    if (!isPro) {
+    if (!hasPremiumAccess) {
       hasShownLaunchPaywallRef.current = true;
       setTimeout(() => {
         presentPaywall().catch((err) => {
@@ -5855,7 +5855,7 @@ function AppContent() {
               <Text style={styles.subscriptionStatusText}>
                 {subscriptionLoading ? "Loading..." : isPro ? "Pro" : "Free"}
               </Text>
-              {!subscriptionLoading && !isPro ? (
+              {!subscriptionLoading && !hasPremiumAccess ? (
                 <TouchableOpacity style={styles.upgradeInlineButton} onPress={() => presentPaywall()}>
                   <Text style={styles.upgradeInlineButtonText}>Upgrade</Text>
                 </TouchableOpacity>
@@ -6545,7 +6545,7 @@ function AppContent() {
                 addComposerTab === "text" && styles.addCameraStageCollapsed
               ]}
             >
-              {addComposerTab === "barcode" && isPro && cameraPermission?.granted ? (
+              {addComposerTab === "barcode" && hasPremiumAccess && cameraPermission?.granted ? (
                 barcodeLookupLoading || barcodePreview ? (
                   <View style={[styles.addCameraImage, styles.addBarcodeCameraPaused]}>
                     {barcodeLookupLoading ? (
@@ -6582,16 +6582,16 @@ function AppContent() {
                     </TouchableOpacity>
                   </View>
                 )
-              ) : addComposerTab === "photo" && isPro && cameraPermission?.granted && !(mealPhotoAnalyzing && mealPhotoUri) ? (
+              ) : addComposerTab === "photo" && hasPremiumAccess && cameraPermission?.granted && !(mealPhotoAnalyzing && mealPhotoUri) ? (
                 <CameraView ref={cameraRef} style={styles.addCameraImage} facing="back" />
               ) : mealPhotoUri ? (
                 <Image source={{ uri: mealPhotoUri }} style={styles.addCameraImage} resizeMode="cover" />
               ) : (
                 <View style={styles.addCameraPlaceholder}>
                   <Text style={styles.addCameraPlaceholderText}>
-                    {addComposerTab === "photo" && !isPro
+                    {addComposerTab === "photo" && !hasPremiumAccess
                       ? "Take photo is available on Pro."
-                      : addComposerTab === "barcode" && !isPro
+                      : addComposerTab === "barcode" && !hasPremiumAccess
                       ? "Scan barcode is available on Pro."
                       : addComposerTab === "photo"
                       ? "Camera permission is required to capture meal photos."
@@ -6599,11 +6599,11 @@ function AppContent() {
                       ? "Allow camera access to scan product barcodes (EAN / UPC)."
                       : "Take a meal photo to start"}
                   </Text>
-                  {addComposerTab === "photo" && !isPro ? (
+                  {addComposerTab === "photo" && !hasPremiumAccess ? (
                     <TouchableOpacity style={styles.addCameraPermissionButton} onPress={() => presentPaywall()}>
                       <Text style={styles.addCameraPermissionButtonText}>Upgrade to Pro</Text>
                     </TouchableOpacity>
-                  ) : addComposerTab === "barcode" && !isPro ? (
+                  ) : addComposerTab === "barcode" && !hasPremiumAccess ? (
                     <TouchableOpacity style={styles.addCameraPermissionButton} onPress={() => presentPaywall()}>
                       <Text style={styles.addCameraPermissionButtonText}>Upgrade to Pro</Text>
                     </TouchableOpacity>
@@ -6634,7 +6634,7 @@ function AppContent() {
                 </View>
               )}
 
-              {addComposerTab === "photo" && isPro && (
+              {addComposerTab === "photo" && hasPremiumAccess && (
                 <TouchableOpacity
                   style={styles.addShutterWrap}
                   onPress={handleTakeMealPhoto}
@@ -6647,7 +6647,7 @@ function AppContent() {
                 </TouchableOpacity>
               )}
 
-              {addComposerTab === "photo" && isPro && (
+              {addComposerTab === "photo" && hasPremiumAccess && (
                 <TouchableOpacity
                   style={[styles.addGalleryButton, mealPhotoAnalyzing && styles.addPhotoButtonDisabled]}
                   onPress={handlePickMealPhotoFromGallery}
@@ -6737,7 +6737,7 @@ function AppContent() {
                       addComposerTab === "photo" && styles.addComposerTabPillActive
                     ]}
                   >
-                    {!isPro ? (
+                    {!hasPremiumAccess ? (
                       <View style={styles.addComposerProBadge}>
                         <Text style={styles.addComposerProBadgeText}>PRO</Text>
                       </View>
@@ -6769,7 +6769,7 @@ function AppContent() {
                       addComposerTab === "barcode" && styles.addComposerTabPillActive
                     ]}
                   >
-                    {!isPro ? (
+                    {!hasPremiumAccess ? (
                       <View style={styles.addComposerProBadge}>
                         <Text style={styles.addComposerProBadgeText}>PRO</Text>
                       </View>
@@ -7630,9 +7630,9 @@ function AppContent() {
                 <View style={styles.foodDetailSectionWrapper}>
                   <View style={styles.foodDetailSection}>
                     <Text style={styles.foodDetailSectionTitle}>Insights</Text>
-                    <Text style={[styles.foodDetailInsights, !isPro && styles.proFeatureBlur]}>{foodInsights.insights}</Text>
+                    <Text style={[styles.foodDetailInsights, !hasPremiumAccess && styles.proFeatureBlur]}>{foodInsights.insights}</Text>
                   </View>
-                  {!isPro && (
+                  {!hasPremiumAccess && (
                     <TouchableOpacity
                       style={styles.proFeatureOverlayContributors}
                       onPress={() => presentPaywall()}
@@ -7656,7 +7656,7 @@ function AppContent() {
                 <View style={styles.foodDetailSectionWrapper}>
                   <View style={styles.foodDetailSection}>
                     <Text style={styles.foodDetailSectionTitle}>Tips</Text>
-                    <View style={!isPro && styles.proFeatureBlur}>
+                    <View style={!hasPremiumAccess && styles.proFeatureBlur}>
                       {foodInsights.tips.map((tip, idx) => (
                         <View key={idx} style={styles.foodDetailTip}>
                           <Text style={styles.foodDetailTipBullet}>•</Text>
@@ -7665,7 +7665,7 @@ function AppContent() {
                       ))}
                     </View>
                   </View>
-                  {!isPro && (
+                  {!hasPremiumAccess && (
                     <TouchableOpacity
                       style={styles.proFeatureOverlayContributors}
                       onPress={() => presentPaywall()}
@@ -7741,7 +7741,7 @@ function AppContent() {
               : require("./assets/Orangeheart.png");
             return (
               <View key="meal-insight" style={styles.mealInsightCardWrapper}>
-                <View style={[styles.mealInsightCard, !isPro && styles.proFeatureBlur]}>
+                <View style={[styles.mealInsightCard, !hasPremiumAccess && styles.proFeatureBlur]}>
                   <Image source={heartIcon} style={styles.mealInsightHeart} resizeMode="contain" />
                   <View style={styles.mealInsightContent}>
                     <Text style={styles.mealInsightText}>{mealInsight.text}</Text>
@@ -7757,7 +7757,7 @@ function AppContent() {
                     )}
                   </View>
                 </View>
-                {!isPro && (
+                {!hasPremiumAccess && (
                   <TouchableOpacity
                     style={styles.proFeatureOverlayContributors}
                     onPress={() => presentPaywall()}
@@ -8398,7 +8398,7 @@ function AppContent() {
           )}
         </View>
         <View style={styles.headerRightContainer}>
-          {!isPro && (
+          {!hasPremiumAccess && (
             <TouchableOpacity
               style={styles.headerUpgradeButton}
               onPress={() => presentPaywall()}
@@ -8484,7 +8484,7 @@ function AppContent() {
                 }}
               >
                 <Text style={styles.menuItemText}>Export</Text>
-                {!isPro && (
+                {!hasPremiumAccess && (
                   <Image
                     source={require("./assets/Pro_Badge.png")}
                     style={styles.menuProBadge}
@@ -8647,7 +8647,7 @@ function AppContent() {
 
       {/* New User Paywall Modal */}
       <Modal
-        visible={newUserPaywallVisible}
+        visible={newUserPaywallVisible && !hasPremiumAccess}
         transparent={true}
         animationType="fade"
         onRequestClose={async () => {
@@ -8759,7 +8759,7 @@ function AppContent() {
                     <Text style={styles.yesterdayInsightDismissText}>✕</Text>
                   </TouchableOpacity>
                 </View>
-                {isPro ? (
+                {hasPremiumAccess ? (
                   <>
                     <Text style={styles.yesterdayInsightAffirmation}>{bestInsight.affirmation}</Text>
                     <Text style={styles.yesterdayInsightCategory}>{bestInsight.category}</Text>
@@ -8930,7 +8930,7 @@ function AppContent() {
                 <Text style={[styles.sectionLabel, styles.sectionLabelInRow]}>
                   MICRO-NUTRIENTS
                 </Text>
-                {!isPro && (
+                {!hasPremiumAccess && (
                   <Image
                     source={require("./assets/Pro_Badge.png")}
                     style={styles.sectionProBadge}
@@ -8939,7 +8939,7 @@ function AppContent() {
                 )}
               </View>
               <View style={styles.analysisMicroGridWrapper}>
-              <View style={[styles.analysisMicroGrid, !isPro && styles.proFeatureBlur]}>
+              <View style={[styles.analysisMicroGrid, !hasPremiumAccess && styles.proFeatureBlur]}>
                 {ANALYSIS_MICROS.map(({ label, unit, target, key }) => {
                   const raw = key ? (analysisMicroTotals[key] ?? 0) : 0;
                   const safeRaw = Number(raw) || 0;
@@ -8950,7 +8950,7 @@ function AppContent() {
                       key={label}
                       style={styles.analysisMicroCard}
                       onPress={async () => {
-                        if (!isPro) {
+                        if (!hasPremiumAccess) {
                           await presentPaywall();
                           return;
                         }
@@ -8979,7 +8979,7 @@ function AppContent() {
                   );
                 })}
               </View>
-              {!isPro && (
+              {!hasPremiumAccess && (
                 <TouchableOpacity
                   style={styles.proFeatureOverlay}
                   onPress={() => presentPaywall()}
@@ -9063,7 +9063,7 @@ function AppContent() {
               <Text style={styles.nutrientDetailContributorsLabel}>
                 Contributors
               </Text>
-              {!isPro && (
+              {!hasPremiumAccess && (
                 <Image
                   source={require("./assets/Pro_Badge.png")}
                   style={styles.contributorsProBadge}
@@ -9088,7 +9088,7 @@ function AppContent() {
                 const key = selectedNutrient.type === "micro" ? selectedNutrient.key : undefined;
                 const u = selectedNutrient.unit;
                 return (
-                  <View style={[styles.nutrientDetailContributors, !isPro && styles.proFeatureBlur]}>
+                  <View style={[styles.nutrientDetailContributors, !hasPremiumAccess && styles.proFeatureBlur]}>
                     {contributors.map(({ name, amount }, idx) => {
                       const safeAmount = Number(amount) || 0;
                       const displayAmt = key ? microDisplayValue(key, safeAmount, u) : safeAmount;
@@ -9119,7 +9119,7 @@ function AppContent() {
                   </View>
                 );
               })()}
-              {!isPro && (
+              {!hasPremiumAccess && (
                 <TouchableOpacity
                   style={styles.proFeatureOverlayContributors}
                   onPress={() => presentPaywall()}
@@ -9145,7 +9145,7 @@ function AppContent() {
 
         {activeTab === "insights" && (
           <View style={styles.insightsRoot}>
-          {!isPro && (
+          {!hasPremiumAccess && (
             <TouchableOpacity
               style={styles.proFeatureFullOverlay}
               onPress={() => presentPaywall()}
@@ -9166,7 +9166,7 @@ function AppContent() {
                 <View style={styles.insightsPaywallSpacer} />
 
                 <Text style={styles.insightsPaywallTrialText}>
-                  Start a 7-day free trial
+                  Upgrade to Pro
                 </Text>
 
                 <TouchableOpacity
@@ -9373,7 +9373,7 @@ function AppContent() {
             >
               INSIGHTS
             </Text>
-            {!isPro && (
+            {!hasPremiumAccess && (
               <Image
                 source={require("./assets/Pro_Badge.png")}
                 style={styles.tabProBadge}

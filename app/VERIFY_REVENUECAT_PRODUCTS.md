@@ -4,7 +4,7 @@
 
 Your `Joul.storekit` file has these Product IDs:
 - ✅ `joul_pro_monthly` (Monthly - $5.99)
-- ✅ `joul_pro_yearly` (Annual - $49.99 with 7-day trial)
+- ✅ `joul_pro_yearly` (Annual - $49.99)
 
 ## Check RevenueCat Dashboard
 

@@ -5,12 +5,15 @@
 
 import React, { createContext, useCallback, useContext, useEffect, useState, useRef } from "react";
 import { Platform, AppState, AppStateStatus } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import Purchases, { LOG_LEVEL } from "react-native-purchases";
 import RevenueCatUI, { PAYWALL_RESULT } from "react-native-purchases-ui";
 
 const REVENUECAT_API_KEY_IOS =
   process.env.EXPO_PUBLIC_REVENUECAT_API_KEY_IOS ?? "";
 const ENTITLEMENT_ID = "Pro";
+const INSTALL_FREE_ACCESS_STARTED_AT_KEY = "@joul_installFreeAccessStartedAt";
+const INSTALL_FREE_ACCESS_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export type SubscriptionState = {
   isPro: boolean;
@@ -24,8 +27,23 @@ const defaultState: SubscriptionState = {
   error: null
 };
 
+type InstallFreeAccessState = {
+  isLoading: boolean;
+  isInInstallFreePeriod: boolean;
+  installFreeAccessEndsAt: string | null;
+};
+
+const defaultInstallFreeAccessState: InstallFreeAccessState = {
+  isLoading: true,
+  isInInstallFreePeriod: false,
+  installFreeAccessEndsAt: null
+};
+
 const SubscriptionContext = createContext<{
   isPro: boolean;
+  hasPremiumAccess: boolean;
+  isInInstallFreePeriod: boolean;
+  installFreeAccessEndsAt: string | null;
   isLoading: boolean;
   error: string | null;
   refreshSubscription: () => Promise<void>;
@@ -37,7 +55,68 @@ const SubscriptionContext = createContext<{
 
 export function SubscriptionProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<SubscriptionState>(defaultState);
+  const [installFreeAccess, setInstallFreeAccess] = useState<InstallFreeAccessState>(defaultInstallFreeAccessState);
   const isManuallyResetRef = useRef(false);
+
+  const refreshInstallFreeAccess = useCallback(async (): Promise<number | null> => {
+    const now = Date.now();
+    try {
+      const storedStartedAt = await AsyncStorage.getItem(INSTALL_FREE_ACCESS_STARTED_AT_KEY);
+      let startedAtMs = storedStartedAt ? Number(storedStartedAt) : NaN;
+
+      if (!Number.isFinite(startedAtMs) || startedAtMs <= 0 || startedAtMs > now + 60_000) {
+        startedAtMs = now;
+        await AsyncStorage.setItem(INSTALL_FREE_ACCESS_STARTED_AT_KEY, String(startedAtMs));
+      }
+
+      const endsAtMs = startedAtMs + INSTALL_FREE_ACCESS_DURATION_MS;
+      setInstallFreeAccess({
+        isLoading: false,
+        isInInstallFreePeriod: now < endsAtMs,
+        installFreeAccessEndsAt: new Date(endsAtMs).toISOString()
+      });
+      return endsAtMs;
+    } catch (err) {
+      console.warn("Install free access check failed:", err);
+      setInstallFreeAccess({
+        isLoading: false,
+        isInInstallFreePeriod: false,
+        installFreeAccessEndsAt: null
+      });
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    let timeoutId: NodeJS.Timeout | null = null;
+    let appStateSubscription: { remove: () => void } | null = null;
+
+    const scheduleExpiryRefresh = async () => {
+      const endsAtMs = await refreshInstallFreeAccess();
+      if (!endsAtMs) return;
+
+      const msUntilExpiry = endsAtMs - Date.now();
+      if (msUntilExpiry > 0 && msUntilExpiry < 2_147_483_647) {
+        timeoutId = setTimeout(() => {
+          refreshInstallFreeAccess();
+        }, msUntilExpiry + 1000);
+      }
+    };
+
+    scheduleExpiryRefresh();
+    appStateSubscription = AppState.addEventListener("change", (nextAppState: AppStateStatus) => {
+      if (nextAppState === "active") {
+        refreshInstallFreeAccess();
+      }
+    });
+
+    return () => {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      appStateSubscription?.remove();
+    };
+  }, [refreshInstallFreeAccess]);
 
   const checkEntitlement = useCallback(async () => {
     if (Platform.OS !== "ios") {
@@ -369,6 +448,7 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
 
   const presentPaywall = useCallback(async (): Promise<boolean> => {
     if (Platform.OS !== "ios") return false;
+    if (installFreeAccess.isInInstallFreePeriod) return true;
     try {
       console.log("=== PAYWALL DEBUG START ===");
       console.log("API Key configured:", !!REVENUECAT_API_KEY_IOS);
@@ -447,10 +527,11 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
       console.error("=== END ERROR ===");
       return false;
     }
-  }, [checkEntitlement]);
+  }, [checkEntitlement, installFreeAccess.isInInstallFreePeriod]);
 
   const presentPaywallIfNeeded = useCallback(async (): Promise<boolean> => {
     if (Platform.OS !== "ios") return false;
+    if (installFreeAccess.isInInstallFreePeriod) return true;
     try {
       const result = await RevenueCatUI.presentPaywallIfNeeded({
         requiredEntitlementIdentifier: ENTITLEMENT_ID
@@ -461,7 +542,7 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
       console.warn("PaywallIfNeeded error:", err);
       return false;
     }
-  }, [checkEntitlement]);
+  }, [checkEntitlement, installFreeAccess.isInInstallFreePeriod]);
 
   const presentCustomerCenter = useCallback(async () => {
     if (Platform.OS !== "ios") return;
@@ -505,7 +586,10 @@ export function SubscriptionProvider({ children }: { children: React.ReactNode }
 
   const value = {
     isPro: state.isPro,
-    isLoading: state.isLoading,
+    hasPremiumAccess: state.isPro || installFreeAccess.isInInstallFreePeriod,
+    isInInstallFreePeriod: installFreeAccess.isInInstallFreePeriod,
+    installFreeAccessEndsAt: installFreeAccess.installFreeAccessEndsAt,
+    isLoading: state.isLoading || installFreeAccess.isLoading,
     error: state.error,
     refreshSubscription: checkEntitlement,
     presentPaywall,
