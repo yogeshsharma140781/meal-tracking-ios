@@ -1674,6 +1674,7 @@ const REMINDER_PUSH_TOKEN_KEY = "@mealtracking_expoPushToken";
 const INSIGHTS_LAST_VIEWED_KEY = "@mealtracking_insightsLastViewed";
 const HAS_LOGGED_MEAL_KEY = "@mealtracking_hasLoggedMeal";
 const NEW_USER_PAYWALL_DISMISSED_KEY = "@mealtracking_newUserPaywallDismissed";
+const FREE_ACCESS_INTRO_DISMISSED_KEY = "@mealtracking_freeAccessIntroDismissed";
 
 type MealTemplate = {
   id: string;
@@ -3005,7 +3006,14 @@ function getContributors(
 }
 
 function AppContent() {
-  const { isPro, hasPremiumAccess, isLoading: subscriptionLoading, presentPaywall, presentCustomerCenter } = useSubscription();
+  const {
+    isPro,
+    hasPremiumAccess,
+    isInInstallFreePeriod,
+    isLoading: subscriptionLoading,
+    presentPaywall,
+    presentCustomerCenter
+  } = useSubscription();
   const [view, setView] = useState<"home" | "add" | "meal" | "export" | "personal" | "savedFoods" | "terms" | "privacy" | "onboarding" | "sources">("home");
   const [showTermsPrivacySubmenu, setShowTermsPrivacySubmenu] = useState(false);
   const [webViewLoading, setWebViewLoading] = useState(true);
@@ -3103,6 +3111,8 @@ function AppContent() {
   const [feedbackRating, setFeedbackRating] = useState<number>(0);
   const [feedbackText, setFeedbackText] = useState("");
   const [newUserPaywallVisible, setNewUserPaywallVisible] = useState(false);
+  const [freeAccessIntroChecked, setFreeAccessIntroChecked] = useState(false);
+  const [freeAccessIntroVisible, setFreeAccessIntroVisible] = useState(false);
   const [editingSavedFoodName, setEditingSavedFoodName] = useState<string | null>(null);
   const [savedFoodEditName, setSavedFoodEditName] = useState("");
   const [savedFoodEditCalories, setSavedFoodEditCalories] = useState("");
@@ -3122,6 +3132,43 @@ function AppContent() {
   const cameraRef = useRef<CameraView>(null);
   const hasShownLaunchPaywallRef = useRef(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+
+  useEffect(() => {
+    if (!hydrated || subscriptionLoading) return;
+    if (isPro || !isInInstallFreePeriod) {
+      setFreeAccessIntroVisible(false);
+      setFreeAccessIntroChecked(true);
+      return;
+    }
+
+    let cancelled = false;
+    AsyncStorage.getItem(FREE_ACCESS_INTRO_DISMISSED_KEY)
+      .then((dismissed) => {
+        if (!cancelled) {
+          setFreeAccessIntroVisible(dismissed !== "true");
+          setFreeAccessIntroChecked(true);
+        }
+      })
+      .catch((err) => {
+        console.warn("Failed to check free access intro:", err);
+        if (!cancelled) {
+          setFreeAccessIntroChecked(true);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hydrated, isInInstallFreePeriod, isPro, subscriptionLoading]);
+
+  const dismissFreeAccessIntro = useCallback(async () => {
+    setFreeAccessIntroVisible(false);
+    try {
+      await AsyncStorage.setItem(FREE_ACCESS_INTRO_DISMISSED_KEY, "true");
+    } catch (err) {
+      console.warn("Failed to dismiss free access intro:", err);
+    }
+  }, []);
 
   const maybeShowNoFoodFoundAlert = useCallback((message: string) => {
     const lower = message.toLowerCase();
@@ -4002,6 +4049,7 @@ function AppContent() {
 
   useEffect(() => {
     if (!hydrated) return;
+    if (!freeAccessIntroChecked || freeAccessIntroVisible || view === "onboarding") return;
     try {
       const todayKey = toDateKey(new Date());
       const dayData = dataByDateRef.current[todayKey] ?? getDefaultDayData();
@@ -4015,12 +4063,22 @@ function AppContent() {
     } catch (err) {
       console.warn("Error in meal reminder effect:", err);
     }
-  }, [hydrated, mealReminderSettings, dataByDate, syncMealReminderStateToBackend]);
+  }, [
+    dataByDate,
+    freeAccessIntroChecked,
+    freeAccessIntroVisible,
+    hydrated,
+    mealReminderSettings,
+    syncMealReminderStateToBackend,
+    view
+  ]);
 
   useEffect(() => {
     if (!hydrated) return;
+    if (!freeAccessIntroChecked || freeAccessIntroVisible || view === "onboarding") return;
     const sub = AppState.addEventListener("change", (state) => {
       if (state !== "active") return;
+      if (!freeAccessIntroChecked || freeAccessIntroVisible || view === "onboarding") return;
       try {
         const todayKey = toDateKey(new Date());
         const dayData = dataByDateRef.current[todayKey] ?? getDefaultDayData();
@@ -4036,7 +4094,7 @@ function AppContent() {
       }
     });
     return () => sub.remove();
-  }, [hydrated, syncMealReminderStateToBackend]);
+  }, [freeAccessIntroChecked, freeAccessIntroVisible, hydrated, syncMealReminderStateToBackend, view]);
 
   // Handle notification taps - navigate to home when user taps notification
   useEffect(() => {
@@ -5343,6 +5401,54 @@ function AppContent() {
       }, 220);
     }
   };
+
+  // Show loading while deciding whether the free-access intro should be first.
+  if (!hydrated || !freeAccessIntroChecked) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.loadingContainer}>
+          <Image
+            source={require("./assets/loading-screen.png")}
+            style={{ width: "100%", height: "100%", resizeMode: "contain" }}
+            resizeMode="contain"
+          />
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (freeAccessIntroVisible) {
+    return (
+      <View style={styles.freeAccessIntroRoot}>
+        <Image
+          source={require("./assets/free-access-background.png")}
+          style={styles.freeAccessIntroBackground}
+          resizeMode="cover"
+        />
+        <View style={styles.freeAccessIntroContent}>
+          <Text style={styles.freeAccessIntroTitle}>
+            Your first 7{"\n"}days are free
+          </Text>
+          <Text style={styles.freeAccessIntroBody}>
+            Explore Joul's premium features for 7 days.
+          </Text>
+          <Text style={styles.freeAccessIntroPromise}>
+            No subscription. No payment.{"\n"}No card required.
+          </Text>
+          <TouchableOpacity
+            style={styles.freeAccessIntroButton}
+            onPress={dismissFreeAccessIntro}
+            activeOpacity={0.86}
+          >
+            <Text style={styles.freeAccessIntroButtonText}>Start using Joul</Text>
+          </TouchableOpacity>
+          <Text style={styles.freeAccessIntroFinePrint}>
+            After 7 days, some features require a Pro subscription.
+          </Text>
+        </View>
+      </View>
+    );
+  }
 
   if (view === "onboarding") {
     const goalOptions = [
@@ -12582,6 +12688,68 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: "#FFFFFF",
     fontWeight: "600"
+  },
+  freeAccessIntroRoot: {
+    flex: 1,
+    backgroundColor: "#EFECE6"
+  },
+  freeAccessIntroBackground: {
+    ...StyleSheet.absoluteFillObject,
+    width: "100%",
+    height: "100%"
+  },
+  freeAccessIntroContent: {
+    flex: 1,
+    justifyContent: "flex-end",
+    alignItems: "center",
+    paddingHorizontal: 24,
+    paddingBottom: 72
+  },
+  freeAccessIntroTitle: {
+    fontSize: 44,
+    lineHeight: 52,
+    fontWeight: "800",
+    color: "#242424",
+    textAlign: "center",
+    letterSpacing: -0.8,
+    marginBottom: 28
+  },
+  freeAccessIntroBody: {
+    fontSize: 17,
+    lineHeight: 24,
+    color: "#242424",
+    textAlign: "center",
+    marginBottom: 4
+  },
+  freeAccessIntroPromise: {
+    fontSize: 17,
+    lineHeight: 25,
+    color: "#242424",
+    textAlign: "center",
+    fontWeight: "800",
+    marginBottom: 88
+  },
+  freeAccessIntroButton: {
+    width: "100%",
+    maxWidth: 354,
+    backgroundColor: "#000000",
+    borderRadius: 28,
+    paddingVertical: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 22
+  },
+  freeAccessIntroButtonText: {
+    fontSize: 18,
+    lineHeight: 24,
+    color: "#FFFFFF",
+    fontWeight: "500"
+  },
+  freeAccessIntroFinePrint: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: "#303030",
+    textAlign: "center"
   },
   newUserPaywallOverlay: {
     flex: 1,
